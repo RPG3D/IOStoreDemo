@@ -1,0 +1,3 @@
+
+
+IasTool.exe Upload   D:\UEProject\IOStoreDemo\Saved\StagedBuilds\Windows\IOStoreDemo\Content\Paks   -ServiceUrl=http://192.168.0.101:9000  -Bucket=iostore-on-demand  -AccessKey=admin -SecretKey=00000000   -BuildVersion=1.0.0  -TargetPlatform=Windows   -HostGroupName=Windows -StreamOnDemand   -IgnoreContainerFlags  -KeepPakFiles  -KeepContainerFiles
