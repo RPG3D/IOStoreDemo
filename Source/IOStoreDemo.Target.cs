@@ -8,9 +8,10 @@ public class IOStoreDemoTarget : TargetRules
 	public IOStoreDemoTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Game;
-		DefaultBuildSettings = BuildSettingsVersion.V5;
+		DefaultBuildSettings = BuildSettingsVersion.Latest;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
 
-		ExtraModuleNames.AddRange( new string[] { "IOStoreDemo" } );
+        ExtraModuleNames.AddRange( new string[] { "IOStoreDemo" } );
 
 		bCompileIoStoreOnDemand = true;
     }

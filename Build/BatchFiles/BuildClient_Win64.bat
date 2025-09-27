@@ -15,6 +15,6 @@ set ClientConfig=Development
 
 set Param=BuildCookRun -project=%UProject% -Build ^
 -Target=%Target% -TargetPlatform=%TargetPlatform% -ClientConfig=%ClientConfig% ^
--Cook -Pak -Stage
+-Cook -Pak -Stage -CreateReleaseVersion=1.0.0  -GeneratePatch -BasedOnReleaseVersion=1.0.0
 
 call %Bat% %Param%
