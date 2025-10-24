@@ -1,6 +1,6 @@
 
 
-set EngineDir="E:\Code\UnrealEngine\Engine"
+set EngineDir=E:\Code\UE5\Engine
 
 set Bat=%EngineDir%/Build/BatchFiles/RunUAT.bat
 
@@ -13,8 +13,7 @@ set TargetPlatform=Win64
 
 set ClientConfig=Development
 
-set Param=BuildCookRun -project=%UProject% -Build ^
--Target=%Target% -TargetPlatform=%TargetPlatform% -ClientConfig=%ClientConfig% ^
--Cook -Pak -Stage -CreateReleaseVersion=1.0.0  -GeneratePatch -BasedOnReleaseVersion=1.0.0
+set Param=BuildCookRun -project=%UProject% -Build -Cook -Pak -Stage -CreateReleaseVersion=1.0.0 ^
+-Target=%Target% -TargetPlatform=%TargetPlatform% -ClientConfig=%ClientConfig%
 
 call %Bat% %Param%

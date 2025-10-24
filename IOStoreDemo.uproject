@@ -1,29 +1,27 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "{1FF09F56-4DC2-0A6C-80D1-F091F96DB9B4}",
+	"EngineAssociation": "{A0CCFD11-46F2-7974-A4F6-72A9090BE301}",
 	"Category": "",
 	"Description": "",
 	"Modules": [
 		{
 			"Name": "IOStoreDemo",
 			"Type": "Runtime",
-			"LoadingPhase": "Default",
-			"AdditionalDependencies": [
-				"Engine"
-			]
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [
 		{
 			"Name": "ModelingToolsEditorMode",
-			"Enabled": true,
-			"TargetAllowList": [
-				"Editor"
-			]
+			"Enabled": true
 		},
 		{
 			"Name": "GameplayStateTree",
 			"Enabled": true
 		}
-	]
+	],
+	"TargetPlatforms": [],
+	"AdditionalRootDirectories": [],
+	"AdditionalPluginDirectories": [],
+	"EpicSampleNameHash": ""
 }
