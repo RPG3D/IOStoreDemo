@@ -72,7 +72,21 @@ OnDemand pak 创建时传入 `bOnDemand: true`，这会在容器上设置 `EIoCo
 
 ### 3.4 关键打包参数
 
-- `ApplyIoStoreOnDemand` — 启用OnDemand时自动开启SSL证书部署
+- `ApplyIoStoreOnDemand` — 启用 OnDemand 打包，会自动：
+  1. 编译 IoStoreOnDemand 模块和 IasTool
+  2. 开启 `CompileIoStoreOnDemand`、`Manifests=true`
+  3. 自动创建 `CreateDefaultOnDemandPakRule`（无需手动在 ini 中配置）
+  4. 若未指定 `-Upload`，默认设置 `Upload="localzen"`（连接本机 Zen 服务器）
+  5. 启用 SSL 证书部署
+- `GenerateOnDemandPakForNonChunkedBuild` — 非 chunked 构建也生成 OnDemand pak
+- `-Upload=<值>` — 控制 IasTool 上传行为：
+  - 不传：默认 `"localzen"`，上传到本机 Zen 服务器（`http://127.0.0.1:8558`）
+  - `"-Upload=localzen"`：同上
+  - **自定义 S3**：传入完整的 IasTool 参数字符串，例如：
+    ```
+    -Upload="Upload E:\path\to\Paks -ServiceUrl=http://localhost:9000 -Bucket=ias-content -AccessKey=key -SecretKey=secret -StreamOnDemand -WriteTocToDisk -KeepContainerFiles -KeepPakFiles -TargetPlatform=Win64 -BuildVersion=1 -ConfigFilePath=E:\path\to\Cloud\IoStoreOnDemand.ini"
+    ```
+    注意：非 `localzen` 时，`-Upload` 的值直接作为 `IasTool.exe` 的参数传递（见源码 4648-4651 行的 `else` 分支）
 - `.ucas/.utoc/.uondemandtoc` 文件被排除不随包分发
 
 ## 四、IasTool 命令行工具
@@ -372,13 +386,21 @@ https://cdn.example.com/bucket/prefix/Chunks/3a/3a7f8b...c2.iochunk
 ```
 1. 打包配置
    DefaultGame.ini → PakFileRules → bOnDemand=true
+   （或使用 -ApplyIoStoreOnDemand 自动创建默认规则，无需手动配置）
    
 2. 项目打包
-   UAT BuildCookRun → 生成 ondemand .ucas/.utoc 容器
-                     → 容器带 EIoContainerFlags::OnDemand 标志
+   UAT BuildCookRun -ApplyIoStoreOnDemand
+   → 生成 ondemand .ucas/.utoc 容器
+   → 容器带 EIoContainerFlags::OnDemand 标志
    
-3. 上传云端
-   IasTool Upload *.utoc -Bucket=... -ServiceUrl=... -StreamOnDemand
+3. 上传云端（两种方式）
+   
+   方式A：UAT 自动上传（推荐）
+   UAT BuildCookRun -ApplyIoStoreOnDemand -Upload="Upload <PakPath> -ServiceUrl=... -Bucket=... ..."
+   → 打包完成后 UAT 自动调用 IasTool Upload
+   
+   方式B：手动上传
+   IasTool Upload *.utoc -ServiceUrl=... -Bucket=... -StreamOnDemand
    → 生成 .iochunktoc 上传到S3
    → chunk文件上传到S3
    → 生成 IoStoreOnDemand.ini 配置文件
@@ -410,3 +432,136 @@ https://cdn.example.com/bucket/prefix/Chunks/3a/3a7f8b...c2.iochunk
 | `Engine/Source/Programs/IoStoreOnDemand/Private/Tool/Upload.cpp` | Upload命令实现 |
 | `Engine/Source/Programs/IoStoreOnDemand/Private/Tool/ChunkPlugin.cpp` | ChunkPlugin命令 |
 | `Engine/Source/Programs/AutomationTool/Scripts/CopyBuildToStagingDirectory.Automation.cs` | 打包阶段OnDemand处理 |
+
+## 十、实践验证（IOStoreDemo 项目）
+
+### 10.1 项目配置
+
+**DefaultGame.ini**:
+```ini
+[/Script/UnrealEd.ProjectPackagingSettings]
+bCookAll=True
+bGenerateChunks=True
+```
+
+**DefaultDeviceProfiles.ini** (将贴图 mip0 分离到 OnDemand):
+```ini
+[GlobalDefaults DeviceProfile]
++TextureLODGroups=(Group=TEXTUREGROUP_World,OptionalLODBias=1)
++TextureLODGroups=(Group=TEXTUREGROUP_Character,OptionalLODBias=1)
+; ... 其他贴图组
+```
+
+> **注意**: `OptionalLODBias=1` 表示将最高一级 mip (mip0) 剥离到 optional bulkdata package，这些会被打包到 `OnDemandOptionalPak`。
+
+### 10.2 MinIO 本地服务
+
+使用 MinIO 作为本地 S3 兼容存储，模拟云端 CDN：
+
+| 配置 | 值 |
+|------|-----|
+| API 端口 | 9000 |
+| Console 端口 | 9001 |
+| AccessKey | minioadmin |
+| SecretKey | minioadmin |
+| Bucket | ias-content |
+
+启动命令:
+```powershell
+IoStoreServer\start.bat
+```
+
+### 10.3 打包命令
+
+```powershell
+RunUAT BuildCookRun ^
+  -project=IOStoreDemo.uproject ^
+  -platform=Win64 ^
+  -build -cook -stage -pak -archive ^
+  -archivedirectory=Archives\Windows ^
+  -ApplyIoStoreOnDemand ^
+  -GenerateOnDemandPakForNonChunkedBuild ^
+  -GenerateOptionalPakForNonChunkedBuild ^
+  -Upload="Upload E:\UEProject\IOStoreDemo\Saved\StagedBuilds\Windows\IOStoreDemo\Content\Paks -ServiceUrl=http://localhost:9000 -Bucket=ias-content -AccessKey=minioadmin -SecretKey=minioadmin -StreamOnDemand -WriteTocToDisk -KeepContainerFiles -KeepPakFiles -TargetPlatform=Win64 -BuildVersion=1 -ConfigFilePath=E:\UEProject\IOStoreDemo\Saved\StagedBuilds\Windows\Cloud\IoStoreOnDemand.ini"
+```
+
+### 10.4 打包输出
+
+生成的 OnDemand 容器：
+
+| 文件 | 内容 | 大小 | 条目数 |
+|------|------|------|--------|
+| `pakchunk0ondemand-Windows.ucas` | BulkData | ~5 MB | 140 |
+| `pakchunk0ondemandoptional-Windows.ucas` | 贴图 mip0 | ~7 MB | 35 |
+| `pakchunk1ondemand-Windows.ucas` | DLC BulkData | ~7 MB | 65 |
+
+### 10.5 运行时验证
+
+日志关键输出：
+```
+LogIoStoreOnDemand: Loading TOC from file 'Cloud/39a6885472af60eaa36ffdadda30616ee18a67ad.iochunktoc'
+LogIoStoreOnDemand: Mounting container 'pakchunk0ondemand-Windows', Entries=140, Flags='StreamOnDemand'
+LogIoStoreOnDemand: Mounting container 'pakchunk0ondemandoptional-Windows', Entries=35, Flags='StreamOnDemand'
+LogIoStoreOnDemand: Mounting container 'pakchunk1ondemand-Windows', Entries=65, Flags='StreamOnDemand'
+LogIas: Endpoint 'http://localhost:9000' latency test (ms): 7 1 0 0
+LogIas: Display: HostGroup init took 0.010 seconds (Succeeded)
+LogIas: HTTP streaming enabled 'true'
+LogIas: IAS - HttpStats: DownloadedKiB=11699, Get=172, Retry=2, Error=0
+```
+
+### 10.6 缓存目录结构
+
+```
+Saved/PersistentDownloadDir/
+├── ias/
+│   ├── ias.cache.0          # IAS 缓存数据 (~6 MB)
+│   └── ias.cache.0.jrn      # 缓存日志
+└── IoStore/InstallCache/
+    ├── blocks/              # 缓存块目录
+    └── cas.jrn              # CAS 日志 (CASJOURNALHEADER + entries + CASJOURNALFOOTER)
+```
+
+### 10.7 常见问题排查
+
+**问题**: 打包后没有生成 `pakchunk*ondemand*` 文件
+- 检查是否使用 `-ApplyIoStoreOnDemand` 参数
+- 检查 `DefaultGame.ini` 是否配置 `bGenerateChunks=True`
+
+**问题**: 运行时无法下载 OnDemand 内容
+- 检查 MinIO 服务是否运行 (`http://localhost:9000/minio/health/live`)
+- 检查 `IoStoreOnDemand.ini` 中的 `ServiceUrl` 是否正确
+- 检查 `ias-content` bucket 是否存在
+
+**问题**: 贴图 mip0 没有分离
+- 检查 `DefaultDeviceProfiles.ini` 配置是否正确
+- 注意 section 名称应为 `[GlobalDefaults DeviceProfile]`（UE 5.3+）
+
+**问题**: 运行日志出现 Warning `deprecated ini section name`
+- 将 `[/Script/Engine.TextureLODSettings]` 改为 `[GlobalDefaults DeviceProfile]`
+
+## 十一、工具
+
+### 11.1 OnDemandCacheAnalyzer
+
+解析下载缓存目录的工具：
+
+```powershell
+python Tools\OnDemandCacheAnalyzer.py "Archives\Windows\IOStoreDemo\Saved\PersistentDownloadDir" [-v]
+```
+
+输出示例：
+```
+============================================================
+IoStoreOnDemand Cache Analysis Report
+============================================================
+
+Directory: E:\UEProject\IOStoreDemo\Archives\Windows\IOStoreDemo\Saved\PersistentDownloadDir
+
+----------------Summary-----------------
+  Total Files: 3
+  Total Size:  6.36 MB
+
+---------CAS Journal Statistics---------
+  Total Entries:      0
+  ...
+```

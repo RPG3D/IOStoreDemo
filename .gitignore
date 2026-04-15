@@ -80,3 +80,6 @@ DerivedDataCache/*
 IoStoreServer/minio.exe
 IoStoreServer/mc.exe
 IoStoreServer/Data/
+
+# Build outputs
+Archives/

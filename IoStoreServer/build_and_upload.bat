@@ -15,10 +15,40 @@ setlocal enabledelayedexpansion
 ::   IasTool Upload 用法: Upload <ContainerGlob> [Options]
 ::   例如: Upload E:\path\to\Paks -ServiceUrl=http://localhost:9000 ...
 
-:: ---------- 配置区 ----------
-set ENGINE_DIR=E:\Code\UE5\Engine
-set PROJECT_DIR=E:\UEProject\IOStoreDemo
-set PROJECT_FILE=%PROJECT_DIR%\IOStoreDemo.uproject
+:: ---------- 自动检测项目目录 ----------
+set "PROJECT_DIR=%~dp0.."
+for %%I in ("%PROJECT_DIR%") do set "PROJECT_DIR=%%~fI"
+
+:: 从 .uproject 文件获取项目名称
+for %%F in ("%PROJECT_DIR%\*.uproject") do set "PROJECT_NAME=%%~nF"
+set "PROJECT_FILE=%PROJECT_DIR%\%PROJECT_NAME%.uproject"
+
+if not exist "%PROJECT_FILE%" (
+    echo [ERROR] No .uproject file found in %PROJECT_DIR%
+    pause
+    exit /b 1
+)
+
+:: ---------- 自动检测引擎目录（使用 FindUE5.ps1 查找 5.7.* 版本）----------
+echo [1/3] Detecting UE 5.7 engine...
+
+set "FINDUE5_SCRIPT=%PROJECT_DIR%\Tools\FindUE5.ps1"
+if not exist "%FINDUE5_SCRIPT%" (
+    echo [ERROR] FindUE5.ps1 not found: %FINDUE5_SCRIPT%
+    pause
+    exit /b 1
+)
+
+for /f "delims=" %%E in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%FINDUE5_SCRIPT%" -FindUE57 2^>nul') do set "ENGINE_DIR=%%E"
+
+if not defined ENGINE_DIR (
+    echo [ERROR] UE 5.7 engine not found
+    echo [INFO] Run "powershell -File Tools\FindUE5.ps1 -List" to see available engines
+    pause
+    exit /b 1
+)
+
+echo       Found: %ENGINE_DIR%
 
 :: MinIO S3 配置
 set S3_URL=http://localhost:9000
@@ -34,11 +64,17 @@ set ARCHIVE_DIR=%PROJECT_DIR%\Archives\Windows
 :: StageDirectory = ProjectDir\Saved\StagedBuilds
 :: PakPath = StageDirectory\Windows\ProjectName\Content\Paks
 set STAGE_DIR=%PROJECT_DIR%\Saved\StagedBuilds
-set PAK_PATH=%STAGE_DIR%\Windows\IOStoreDemo\Content\Paks
+set PAK_PATH=%STAGE_DIR%\Windows\%PROJECT_NAME%\Content\Paks
 set CLOUD_DIR=%STAGE_DIR%\Windows\Cloud
 
+echo.
+echo  Project:     %PROJECT_NAME%
+echo  Project Dir: %PROJECT_DIR%
+echo  Engine Dir:  %ENGINE_DIR%
+echo.
+
 :: ---------- 检查 MinIO ----------
-echo [1/2] Checking MinIO connectivity...
+echo [2/3] Checking MinIO connectivity...
 curl -s -o nul -w "%%{http_code}" %S3_URL%/minio/health/live >nul 2>&1
 if errorlevel 1 (
     echo [WARN] MinIO does not seem to be running at %S3_URL%
@@ -49,7 +85,7 @@ if errorlevel 1 (
 )
 
 :: ---------- 运行 UAT 打包（含自动上传） ----------
-echo [2/2] Running UAT BuildCookRun with auto-upload to MinIO...
+echo [3/3] Running UAT BuildCookRun with auto-upload to MinIO...
 echo.
 echo  UAT will call IasTool Upload after staging:
 echo    IasTool.exe Upload %PAK_PATH% -ServiceUrl=%S3_URL% -Bucket=%S3_BUCKET% ...
@@ -68,6 +104,7 @@ call %UAT% BuildCookRun ^
   -archivedirectory=%ARCHIVE_DIR% ^
   -ApplyIoStoreOnDemand ^
   -GenerateOnDemandPakForNonChunkedBuild ^
+  -GenerateOptionalPakForNonChunkedBuild ^
   -Upload="Upload %PAK_PATH% -ServiceUrl=%S3_URL% -Bucket=%S3_BUCKET% -AccessKey=%S3_ACCESS_KEY% -SecretKey=%S3_SECRET_KEY% -StreamOnDemand -WriteTocToDisk -KeepContainerFiles -KeepPakFiles -TargetPlatform=Win64 -BuildVersion=1 -ConfigFilePath=%CLOUD_DIR%\IoStoreOnDemand.ini"
 
 set BUILD_RESULT=%errorlevel%
