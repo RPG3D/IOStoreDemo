@@ -10,6 +10,17 @@
 - **MinIO**: 本地 S3 兼容存储服务，用于模拟云端存储
 - **IasTool**: UE 提供的上传工具，用于将 OnDemand 内容上传到 S3 服务
 
+## 两种 OnDemand 模式
+
+| 模式 | 说明 | 使用场景 |
+|------|------|----------|
+| **StreamOnDemand** | 后台静默补齐缺失资源，访问时自动下载 | 基础游戏内容、贴图 mip |
+| **InstallOnDemand** | 需主动调用命令下载，下载完成后才可用 | DLC、可选地图包 |
+
+当前实现：
+- `build_and_upload.bat` - 全部使用 StreamOnDemand
+- `build_install_ondemand.bat` - 基础游戏 StreamOnDemand，DLC 使用 InstallOnDemand
+
 ## 命令
 
 可用命令（位于 `.opencode/commands/`），所有脚本自动检测引擎和项目路径：
@@ -27,6 +38,8 @@
 | 文档 | 说明 |
 |------|------|
 | [Docs/IoStoreOnDemand.md](Docs/IoStoreOnDemand.md) | IoStoreOnDemand 完整技术文档 |
+| [Docs/Tools.md](Docs/Tools.md) | 工具使用说明 |
+| [Docs/Source.md](Docs/Source.md) | 源码实现说明 |
 | [IoStoreServer/README.txt](IoStoreServer/README.txt) | MinIO 服务快速启动指南 |
 
 ## 关键脚本
@@ -38,7 +51,8 @@
 | [Tools/run_client.bat](Tools/run_client.bat) | 启动打包后的游戏 |
 | [IoStoreServer/start.bat](IoStoreServer/start.bat) | 启动 MinIO 服务 |
 | [IoStoreServer/setup_bucket.bat](IoStoreServer/setup_bucket.bat) | 创建 IAS 内容桶 |
-| [IoStoreServer/build_and_upload.bat](IoStoreServer/build_and_upload.bat) | 打包并上传 OnDemand |
+| [IoStoreServer/build_and_upload.bat](IoStoreServer/build_and_upload.bat) | 打包并上传 OnDemand（全部 StreamOnDemand） |
+| [IoStoreServer/build_install_ondemand.bat](IoStoreServer/build_install_ondemand.bat) | 打包并上传（DLC 使用 InstallOnDemand） |
 
 所有脚本均自动：
 1. 从注册表查找 UE 5.7 引擎
@@ -57,16 +71,9 @@
 |------|------|
 | [Tools/FindUE5.ps1](Tools/FindUE5.ps1) | 查找已安装的 UE5 引擎 |
 | [Tools/OnDemandCacheAnalyzer.py](Tools/OnDemandCacheAnalyzer.py) | 解析 OnDemand 下载缓存目录 |
+| [IoStoreServer/download_minio.ps1](IoStoreServer/download_minio.ps1) | 下载 MinIO 工具（minio.exe、mc.exe） |
 
-**FindUE5.ps1 参数**:
-
-| 参数 | 说明 |
-|------|------|
-| `-List` | 显示详细列表 |
-| `-FindUE57` | 筛选 5.7.* |
-| `-FindUE56` | 筛选 5.6.* |
-| `-Json` | JSON 格式输出 |
-| `-EnginePath` | 仅输出路径（供 batch 调用） |
+详细用法参见 [Docs/Tools.md](Docs/Tools.md)。
 
 ## 打包流程
 
@@ -82,17 +89,13 @@ IoStoreServer\build_and_upload.bat
 
 ### 手动打包
 
-```powershell
-# UAT 命令（关键参数）
-RunUAT BuildCookRun ^
-  -project=IOStoreDemo.uproject ^
-  -platform=Win64 ^
-  -build -cook -stage -pak -archive ^
-  -archivedirectory=Archives\Windows ^
-  -ApplyIoStoreOnDemand ^
-  -GenerateOnDemandPakForNonChunkedBuild ^
-  -GenerateOptionalPakForNonChunkedBuild ^
-  -Upload="Upload <PakPath> -ServiceUrl=http://localhost:9000 -Bucket=ias-content -AccessKey=minioadmin -SecretKey=minioadmin -StreamOnDemand -WriteTocToDisk -KeepContainerFiles -KeepPakFiles -TargetPlatform=Win64 -BuildVersion=1 -ConfigFilePath=<CloudDir>\IoStoreOnDemand.ini"
+详细 UAT 参数参见 [Docs/IoStoreOnDemand.md](Docs/IoStoreOnDemand.md)。关键参数：
+
+```
+-ApplyIoStoreOnDemand
+-GenerateOnDemandPakForNonChunkedBuild
+-GenerateOptionalPakForNonChunkedBuild
+-Upload="Upload <PakPath> -ServiceUrl=... -Bucket=..."
 ```
 
 ## 输出目录
@@ -132,6 +135,23 @@ TocPath="ias-content/<hash>.iochunktoc"
 | AccessKey | minioadmin |
 | SecretKey | minioadmin |
 | Bucket | ias-content |
+
+## 游戏内控制台命令
+
+打包后运行游戏，可使用以下控制台命令：
+
+| 命令 | 说明 |
+|------|------|
+| `installdlc <tagset>` | 下载并安装指定标签的 DLC 内容 |
+| `ondemandstatus` | 显示 OnDemand 缓存状态 |
+| `getinstallsize <tagset>` | 获取指定标签内容的安装大小 |
+
+示例：
+```
+installdlc NewMap       # 下载 NewMap 地图
+ondemandstatus          # 查看缓存使用情况
+getinstallsize NewMap   # 查看下载大小
+```
 
 ## 常见问题
 
