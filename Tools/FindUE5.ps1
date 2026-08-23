@@ -25,9 +25,13 @@ param(
     [switch]$List,
     
     [switch]$Json,
-    
+
+    # -EnginePath must combine with the -FindUE*/-Major/-Minor version filters
+    # (build_editor.bat / package_update.bat call -FindUE57 -EnginePath), so it
+    # is a member of BOTH parameter sets.
+    [Parameter(ParameterSetName='ByVersion')]
     [switch]$EnginePath,
-    
+
     [Parameter(ParameterSetName='ByVersion')]
     [int]$MajorVersion = -1,
 
@@ -96,8 +100,11 @@ begin {
         }
     }
     
-    # Remove duplicates
-    $engines = $engines | Sort-Object Path -Unique
+    # Remove duplicates. The @(...) wrapper is required: a pipeline that
+    # emits exactly one object UNROLLS to a scalar, and the scalar has no
+    # .Count - the -EnginePath/-FindUE* guard checks would silently fail on
+    # single-engine machines.
+    $engines = @($engines | Sort-Object Path -Unique)
     
     # Determine target version from shortcuts
     $targetMajor = $MajorVersion

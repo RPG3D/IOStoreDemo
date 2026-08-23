@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "CoreMinimal.h"
+
+/**
+ * Well-known file / directory layout helpers for the patcher.
+ *
+ * Local install sidecar (one per install dir, design D5):
+ *   <install>/UnrealGamePatcher.state.json
+ */
+namespace UnrealGamePatcher::Paths
+{
+	// --- Local install sidecar --------------------------------------------
+	UNREALGAMEPATCHERCORE_API FString GetStatePath(const FString& InstallDir);
+
+	/** Atomically replaces DestPath with SrcPath (both full paths): the
+	 *  existing DestPath is first renamed aside to DestPath + ".prev", SrcPath
+	 *  is moved into place, then the .prev copy is deleted. Every step is
+	 *  recoverable - a failure moves the previous file back, so the classic
+	 *  delete-then-move window that could lose the only good copy (crash or
+	 *  transient MoveFile failure in between; UE's MoveFile cannot replace an
+	 *  existing destination) is closed. Returns false, with DestPath left
+	 *  holding its previous content, when SrcPath could not be moved in. */
+	UNREALGAMEPATCHERCORE_API bool AtomicReplaceFile(const FString& SrcPath, const FString& DestPath);
+}

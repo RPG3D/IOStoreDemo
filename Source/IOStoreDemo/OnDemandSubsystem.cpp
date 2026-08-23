@@ -122,7 +122,7 @@ void UOnDemandSubsystem::MountDLCToc(const FString& TagSet)
 	UE::IoStore::FOnDemandMountArgs MountArgs;
 	MountArgs.MountId = DLCMountId;
 	MountArgs.TocRelativeUrl = TEXT("ias-content/dlc-install.iochunktoc");
-	MountArgs.Options = UE::IoStore::EOnDemandMountOptions::InstallOnDemand;
+	//MountArgs.Options = UE::IoStore::EOnDemandMountOptions::InstallOnDemand;
 	
 	UE_LOG(LogOnDemand, Log, TEXT("Mounting DLC TOC: %s"), *MountArgs.TocRelativeUrl);
 	
@@ -150,7 +150,7 @@ void UOnDemandSubsystem::OnMountComplete(UE::IoStore::FOnDemandMountResult Resul
 		return;
 	}
 
-	DLCContentHandle = UE::IoStore::FOnDemandContentHandle::Create(TEXT("DLC_Install"));
+	DLCContentHandle = UE::IoStore::FOnDemandContentHandle::Create(FString("DLC_Install"));
 	
 	UE::IoStore::FOnDemandInstallArgs InstallArgs;
 	InstallArgs.MountId = DLCMountId;
@@ -214,7 +214,6 @@ void UOnDemandSubsystem::GetInstallSize(const FString& TagSet)
 	UE::IoStore::FOnDemandGetInstallSizeArgs Args;
 	Args.MountId = DLCMountId;
 	Args.TagSets = { TagSet };
-	Args.ContentHandle = DLCContentHandle;
 	
 	TIoStatusOr<UE::IoStore::FOnDemandInstallSizeResult> Result = OnDemandStore->GetInstallSize(Args);
 	if (Result.IsOk())
@@ -239,11 +238,11 @@ void UOnDemandSubsystem::OnDemandStatus()
 
 	UE::IoStore::FOnDemandCacheUsage Usage = OnDemandStore->GetCacheUsage({});
 	
-	UE_LOG(LogOnDemand, Log, TEXT("=== OnDemand Cache Status ==="));
+	/*UE_LOG(LogOnDemand, Log, TEXT("=== OnDemand Cache Status ==="));
 	UE_LOG(LogOnDemand, Log, TEXT("Install: %llu / %llu bytes"), 
 		Usage.InstallCache.TotalSize, Usage.InstallCache.MaxSize);
 	UE_LOG(LogOnDemand, Log, TEXT("Streaming: %llu / %llu bytes"), 
 		Usage.StreamingCache.TotalSize, Usage.StreamingCache.MaxSize);
 	UE_LOG(LogOnDemand, Log, TEXT("Referenced: %llu bytes"), Usage.InstallCache.ReferencedSize);
-	UE_LOG(LogOnDemand, Log, TEXT("Fragmented: %llu bytes"), Usage.InstallCache.FragmentedChunksSize);
+	UE_LOG(LogOnDemand, Log, TEXT("Fragmented: %llu bytes"), Usage.InstallCache.FragmentedChunksSize);*/
 }
