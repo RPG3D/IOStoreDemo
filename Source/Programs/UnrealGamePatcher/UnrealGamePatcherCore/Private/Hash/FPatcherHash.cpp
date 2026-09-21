@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Hash/FPatcherHash.h"
+#include "Stats/FIOStats.h"
 #include "String/BytesToHex.h"
 #include "String/HexToBytes.h"
 #include "HAL/FileManager.h"
@@ -86,6 +87,8 @@ namespace UnrealGamePatcher
 		}
 		FSHA1 Hasher;
 		const int64 Total = Handle->Size();
+		FIOStats::Get().AddDiskRead(Total);
+		FIOStats::Get().AddHashed(Total);
 		constexpr int64 WindowSize = 1 << 20;
 		TArray<uint8> Buffer;
 		Buffer.SetNumUninitialized(WindowSize);

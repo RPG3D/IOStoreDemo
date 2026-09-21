@@ -17,8 +17,8 @@ REM Usage:
 REM   publish_update.bat -Staged <staged dir> -App <name> -Version <v> -CdnRoot <CDN root> [-BaseIndex <prev index.json> -NewIndex <new index.json> -DeltaOut <delta dir>]
 REM
 REM Examples:
-REM   publish_update.bat -Staged Saved/StagedBuilds/Windows -App IOStoreDemo -Version 1.0.0 -CdnRoot cdn
-REM   publish_update.bat -Staged ... -App ... -Version ... -CdnRoot cdn -BaseIndex cdn/1.0.0/UnrealGamePatcher.index.json -NewIndex cdn/1.0.1/UnrealGamePatcher.index.json -DeltaOut deltas
+REM   publish_update.bat -Staged Saved/StagedBuilds/Windows -App IOStoreDemo -Version 1.0.0 -CdnRoot Saved/UGP_Package/CloudDir
+REM   publish_update.bat -Staged ... -App ... -Version ... -CdnRoot ... -BaseIndex cdn/index/1.0.0/UnrealGamePatcher.index.json -NewIndex cdn/index/1.0.1/UnrealGamePatcher.index.json -DeltaOut deltas
 REM ============================================================================
 
 setlocal

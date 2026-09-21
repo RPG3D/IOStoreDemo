@@ -12,6 +12,24 @@ namespace UnrealGamePatcher
 	// Largest footer version we can parse (UE 5.8).
 	static constexpr uint32 PakFileVersionMax = 12;
 
+	/** Serialized size of the fixed part of the footer for a given pak version
+	 *  (mirrors engine FPakInfo::GetSerializedSize). Shared by reader, writer
+	 *  and the recovery scanner — all three must agree on footer geometry. */
+	inline int64 GetPakFooterFixedSize(uint32 Version)
+	{
+		int64 Size = 0;
+		if (Version >= 7) Size += 16; // EncryptionKeyGuid
+		Size += 1;                    // bEncryptedIndex
+		Size += 4;                    // Magic
+		Size += 4;                    // Version
+		Size += 8;                    // IndexOffset
+		Size += 8;                    // IndexSize
+		Size += 20;                   // IndexHash
+		if (Version == 9) Size += 1;  // bIndexIsFrozen
+		if (Version >= 8) Size += 160; // CompressionMethods (5 x FName)
+		return Size;
+	}
+
 	/** One compression block of a compressed pak entry. Offsets are raw bytes
 	 *  within the pak file. With RelativeChunkOffsets (version >= 5) the stored
 	 *  start is relative to the entry start and must be offset by FPakEntry::Offset

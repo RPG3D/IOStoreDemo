@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Formats/Index/FIndexManifest.h"
+#include "Formats/JsonIo.h"
 #include "UnrealGamePatcherLog.h"
 #include "UnrealGamePatcherPaths.h"
 #include "Hash/FPatcherHash.h"
@@ -16,57 +17,6 @@ namespace UnrealGamePatcher
 {
 	namespace
 	{
-		// Strict field readers: wrong type or missing field => false, so a
-		// damaged manifest is rejected instead of silently defaulted.
-		// (Same contract as FPatcherState.cpp.)
-		bool ReadInt64Field(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, int64& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::Number)
-			{
-				return false;
-			}
-			Out = (int64)(*Value)->AsNumber();
-			return true;
-		}
-
-		bool ReadStringField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, FString& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::String)
-			{
-				return false;
-			}
-			Out = (*Value)->AsString();
-			return true;
-		}
-
-		bool ReadObjectField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, TSharedPtr<FJsonObject>& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::Object)
-			{
-				return false;
-			}
-			Out = (*Value)->AsObject();
-			return true;
-		}
-
-		bool IsHex40(const FString& Str)
-		{
-			if (Str.Len() != 40) return false;
-			for (const TCHAR C : Str)
-			{
-				if (!(C >= TEXT('0') && C <= TEXT('9')) &&
-					!(C >= TEXT('a') && C <= TEXT('f')) &&
-					!(C >= TEXT('A') && C <= TEXT('F')))
-				{
-					return false;
-				}
-			}
-			return true;
-		}
-
 		/** Builds the canonical JSON body for a manifest. The key order is
 		 *  fixed here, so the XXH3-64 self-check hash is deterministic and
 		 *  both Save and Load use this exact same function to (re)compute it. */
@@ -168,8 +118,7 @@ namespace UnrealGamePatcher
 				Root->SetStringField(TEXT("selfCheck"), SelfCheckHex);
 			}
 
-			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutJson);
-			return FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+			return SerializeJsonCompact(Root.ToSharedRef(), OutJson);
 		}
 	}
 
@@ -182,7 +131,7 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: failed to serialize body"));
 			return false;
 		}
-		const FString SelfCheckHex = FPatcherHash::XXH64ToHex(Body.GetCharArray().GetData(), Body.Len() * sizeof(TCHAR));
+		const FString SelfCheckHex = JsonSelfCheckHex(Body);
 
 		FString Full;
 		if (!SerializeBody(Manifest, true, SelfCheckHex, Full))
@@ -191,25 +140,7 @@ namespace UnrealGamePatcher
 			return false;
 		}
 
-		// Atomic write: temp + recoverable replace (Paths::AtomicReplaceFile),
-		// so a crash mid-write cannot corrupt or lose a previously good index.
-		const FString TempPath = Path + TEXT(".tmp");
-		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-		if (PF.FileExists(*TempPath))
-		{
-			PF.DeleteFile(*TempPath);
-		}
-		if (!FFileHelper::SaveStringToFile(Full, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: failed writing '%s'"), *TempPath);
-			return false;
-		}
-		if (!Paths::AtomicReplaceFile(TempPath, Path))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: failed moving '%s' to '%s'"), *TempPath, *Path);
-			return false;
-		}
-		return true;
+		return WriteJsonFileAtomic(Path, Full, TEXT("FIndexManifest"));
 	}
 
 	bool FIndexManifestFile::Load(const FString& Path, FIndexManifest& OutManifest)
@@ -451,7 +382,7 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: failed to re-serialize body for self-check"));
 			return false;
 		}
-		const FString Recomputed = FPatcherHash::XXH64ToHex(Body.GetCharArray().GetData(), Body.Len() * sizeof(TCHAR));
+		const FString Recomputed = JsonSelfCheckHex(Body);
 		if (!Recomputed.Equals(SelfCheckHex, ESearchCase::IgnoreCase))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: '%s' FAILED self-check (tampered or corrupt; embedded %s, recomputed %s)"),
@@ -477,10 +408,9 @@ namespace UnrealGamePatcher
 			Root->SetStringField(TEXT("currentVersion"), Latest.Version);
 			if (!Latest.MinVersion.IsEmpty()) { Root->SetStringField(TEXT("minVersion"), Latest.MinVersion); }
 			if (Latest.bForce) { Root->SetBoolField(TEXT("force"), true); }
-			if (!Latest.Channel.IsEmpty()) { Root->SetStringField(TEXT("channel"), Latest.Channel); }
-			const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutJson);
-			return FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
-		}
+		if (!Latest.Channel.IsEmpty()) { Root->SetStringField(TEXT("channel"), Latest.Channel); }
+		return SerializeJsonCompact(Root.ToSharedRef(), OutJson);
+	}
 	}
 
 	FString FLatestVersionFile::GetPath(const FString& CdnDir)
@@ -496,23 +426,7 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FLatestVersion: failed to serialize '%s'"), *Path);
 			return false;
 		}
-		const FString TempPath = Path + TEXT(".tmp");
-		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-		if (PF.FileExists(*TempPath))
-		{
-			PF.DeleteFile(*TempPath);
-		}
-		if (!FFileHelper::SaveStringToFile(Full, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FLatestVersion: failed writing '%s'"), *TempPath);
-			return false;
-		}
-		if (!Paths::AtomicReplaceFile(TempPath, Path))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FLatestVersion: failed moving '%s' to '%s'"), *TempPath, *Path);
-			return false;
-		}
-		return true;
+		return WriteJsonFileAtomic(Path, Full, TEXT("FLatestVersion"));
 	}
 
 	bool FLatestVersionFile::Load(const FString& Path, FLatestVersion& OutLatest)

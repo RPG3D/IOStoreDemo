@@ -8,8 +8,10 @@
 #include "IO/IoHash.h"
 #include "Formats/Diff/FLocalTruthExtractor.h"
 #include "Formats/Chunk/FChunkDataLoader.h"
+#include "Formats/Pak/FPakRecovery.h"
 #include "Download/FDownloadManager.h"
 #include "State/FPatcherState.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherPaths.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
@@ -85,6 +87,7 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed fetching '%s'"), *Url);
 				return false;
 			}
+			FIOStats::Get().AddNetDownload(Bytes.Num());
 			if (Bytes.Num() > Options.MaxManifestBytes)
 			{
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: '%s' is %lld bytes, over the %lld-byte metadata cap (hostile or misconfigured CDN?)"),
@@ -136,6 +139,10 @@ namespace UnrealGamePatcher
 			const bool bOk = Size == 0 ||
 				(Handle->Seek(Offset) && Handle->Read(OutBytes.GetData(), Size));
 			delete Handle;
+			if (bOk)
+			{
+				FIOStats::Get().AddDiskRead(Size);
+			}
 			return bOk;
 		}
 
@@ -189,6 +196,7 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: short write to '%s' (disk full?)"), *TempPath);
 				return EPatcherError::WriteNoSpace;
 			}
+			FIOStats::Get().AddDiskWrite(Bytes.Num());
 			if (PF.FileExists(*Path))
 			{
 				PF.SetReadOnly(*Path, false);
@@ -451,6 +459,12 @@ namespace UnrealGamePatcher
 			return false;
 		}
 
+		// Per-run I/O accounting (review 2026-10-09): everything this run
+		// reads/writes/downloads/compresses accumulates in the global stats
+		// until the end-of-run report below. Reset FIRST so the numbers
+		// describe exactly this run.
+		FIOStats::Get().Reset();
+
 		// The CDN root is ONE base, either an HTTP(S) URL or a local directory
 		// (file://... or a bare path). Every resource - latest.json, the
 		// version index, chunk bytes - resolves against this same base.
@@ -551,6 +565,17 @@ namespace UnrealGamePatcher
 			for (int32 I = Txn.Transaction.Targets.Num() - 1; I >= 0; --I)
 			{
 				const FTransactionTarget& T = Txn.Transaction.Targets[I];
+				if (T.File.EndsWith(TEXT(".pak"), ESearchCase::IgnoreCase))
+				{
+					// CoW v2 (ROADMAP §5.2b): pak containers are never backed
+					// up and never rolled back. A crash mid-CoW leaves a torn
+					// tail that FPakRecovery truncates back to the last
+					// committed footer - the container is a complete old or
+					// new version either way. Restoring or deleting it here
+					// would only destroy that guarantee (and an added pak has
+					// no backup to restore from by design).
+					continue;
+				}
 				if (T.Op == EApplyOp::Delete)
 				{
 					// Removed file: bring it back from its backup.
@@ -609,6 +634,33 @@ namespace UnrealGamePatcher
 				TEXT("FUpdateOrchestrator: recovering interrupted transaction (version %s, %d targets)"),
 				*State.Transaction.ContentVersion, State.Transaction.Targets.Num());
 			Rollback(State);
+		}
+
+		// --- 1c. CoW v2 container recovery (ROADMAP §5.2): truncate any torn
+		// pak tail back to the last committed footer BEFORE anything opens a
+		// container. Crash-safe by construction: a pak interrupted mid-CoW is
+		// a complete old version once the tail is gone. An unrecoverable pak
+		// (no valid footer at all) is deleted so the diff below re-fetches it
+		// whole - it is unmountable anyway (the engine fails closed).
+		if (bApply)
+		{
+			TArray<FString> PakPaths;
+			PF.FindFilesRecursively(PakPaths, *InstallDir, TEXT("pak"));
+			for (const FString& PakPath : PakPaths)
+			{
+				const FPakRecovery::FOutcome Outcome = FPakRecovery::ScanAndRepair(PakPath);
+				if (Outcome.Result == FPakRecovery::EResult::Truncated)
+				{
+					UE_LOG(LogUnrealGamePatcher, Warning, TEXT("FUpdateOrchestrator: recovered torn pak tail '%s' (truncated to %lld bytes)"),
+						*PakPath, Outcome.TruncatedToBytes);
+				}
+				else if (Outcome.Result == FPakRecovery::EResult::Unrecoverable)
+				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: pak '%s' has no valid footer - deleting for the whole-file rebuild"), *PakPath);
+					PF.SetReadOnly(*PakPath, false);
+					PF.DeleteFile(*PakPath);
+				}
+			}
 		}
 
 		// --- 2. Local truth. Trust mode (the default) lets the committed local
@@ -798,6 +850,9 @@ namespace UnrealGamePatcher
 				OutStats.NumFilesSame, OutStats.NumFilesChanged, OutStats.NumFilesAdded, OutStats.NumFilesRemoved,
 				SameChunks.Num(), Remote.Chunks.Num(),
 				bHaveLocalIndex ? TEXT("") : TEXT(" (no local state: full fetch)"));
+			OutStats.IOStats = FIOStats::Get().Snapshot();
+			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: check I/O %s"),
+				*FIOStats::Get().FormatSummary(TEXT("check")));
 			return true;
 		}
 
@@ -1251,8 +1306,10 @@ namespace UnrealGamePatcher
 
 			if (T.Op == EApplyOp::Delete)
 			{
-				// Backup the original so rollback can restore it.
-				if (PF.FileExists(*T.File))
+				// Backup the original so rollback can restore it. CoW v2: paks
+				// are exempt - rollback never restores them either (the next
+				// replay re-adds a removed pak).
+				if (!T.File.EndsWith(TEXT(".pak"), ESearchCase::IgnoreCase) && PF.FileExists(*T.File))
 				{
 					const FString BackupPath = FPaths::Combine(BackupDir,
 						FString::Printf(TEXT("%s.%d.bak"), *FileId, TI));
@@ -1293,7 +1350,10 @@ namespace UnrealGamePatcher
 				const FString FileIdKey = FileIdPtr ? *FileIdPtr : FPaths::GetCleanFilename(T.File);
 
 				// Back up the original bytes (if any) before touching it.
-				if (PF.FileExists(*T.File))
+				// CoW v2: pak containers are exempt (ROADMAP §5.2b) - the
+				// in-pak old version is the backup, so the 1x-container copy
+				// is pure write amplification. Rollback skips paks likewise.
+				if (!T.File.EndsWith(TEXT(".pak"), ESearchCase::IgnoreCase) && PF.FileExists(*T.File))
 				{
 					const FString BackupPath = FPaths::Combine(BackupDir,
 						FString::Printf(TEXT("%s.%d.bak"), *FileId, TI));
@@ -1408,19 +1468,16 @@ namespace UnrealGamePatcher
 				if (!bPatchedInPlace && FileIdKey.EndsWith(TEXT(".pak")))
 				{
 					FInPlacePakStats PatchStats;
-					// Backfill: see the ucas call site above.
-					TArray<FHole> PakHoles = State.Holes.FilterByPredicate(
-						[&FileIdKey](const FHole& H) { return H.File == FileIdKey; });
-					if (FInPlacePakPatcher::Patch(Remote, ChunkRoot, FileIdKey, T.File, PatchStats, bVerify, PakHoles))
+					// CoW v2 (ROADMAP §5.3): placement holes are recomputed from
+					// the committed container inside the patcher; the pak's
+					// sidecar hole list is retired (dropped here, never
+					// re-added).
+					if (FInPlacePakPatcher::Patch(Remote, ChunkRoot, FileIdKey, T.File, PatchStats, bVerify))
 					{
 						bPatchedInPlace = true;
 						OutStats.BytesWritten += PatchStats.BytesWritten;
 						ReplacedFiles.Add(FileIdKey);
 						State.Holes.RemoveAll([&FileIdKey](const FHole& H) { return H.File == FileIdKey; });
-						for (const FHole& H : PatchStats.UpdatedHoles)
-						{
-							State.Holes.Add(H);
-						}
 						if (!SaveTransactionState())
 						{
 							bOk = false;
@@ -1428,10 +1485,10 @@ namespace UnrealGamePatcher
 						}
 						++WritesApplied;
 						UE_LOG(LogUnrealGamePatcher, Display,
-							TEXT("FUpdateOrchestrator: in-place patched '%s' (%d entries: %d same, %d overwritten, %d appended; %lld bytes written, %d holes filled, %d recorded)"),
-							*FileIdKey, PatchStats.NumSame + PatchStats.NumOverwritten + PatchStats.NumAppended,
-							PatchStats.NumSame, PatchStats.NumOverwritten, PatchStats.NumAppended, PatchStats.BytesWritten,
-							PatchStats.NumHolesFilled, State.Holes.FilterByPredicate([&FileIdKey](const FHole& H) { return H.File == FileIdKey; }).Num());
+							TEXT("FUpdateOrchestrator: CoW patched '%s' (%d entries: %d same, %d appended; %lld bytes written, %d holes filled)"),
+							*FileIdKey, PatchStats.NumSame + PatchStats.NumAppended,
+							PatchStats.NumSame, PatchStats.NumAppended, PatchStats.BytesWritten,
+							PatchStats.NumHolesFilled);
 					}
 				}
 
@@ -1501,6 +1558,9 @@ namespace UnrealGamePatcher
 		{
 			Rollback(State);
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: update to %s failed - transaction rolled back"), *Version);
+			OutStats.IOStats = FIOStats::Get().Snapshot();
+			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: failed-run I/O %s"),
+				*FIOStats::Get().FormatSummary(TEXT("update-failed")));
 			Emit(EUpdatePhase::Failed, (LastError != EPatcherError::Ok) ? LastError : EPatcherError::ApplyFailed, true,
 				WritesApplied, NumTargets, TEXT("apply failed, rolled back"));
 			return false;
@@ -1571,10 +1631,18 @@ namespace UnrealGamePatcher
 			TEXT("FUpdateOrchestrator: update to %s complete: %d chunks fetched (%lld bytes), %d chunks reused (%lld bytes), %lld bytes written"),
 			*Version, OutStats.NumChunksFetched, OutStats.BytesFetched, OutStats.NumChunksReused, OutStats.BytesReused, OutStats.BytesWritten);
 
+		// End-of-run I/O report (the stat line a single test run can be read
+		// from): a small delta MUST show small read/write/net numbers - any
+		// container-sized volume on a byte-sized change means a silent
+		// fallback happened (review H1).
+		OutStats.IOStats = FIOStats::Get().Snapshot();
+		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: update I/O %s"),
+			*FIOStats::Get().FormatSummary(*FString::Printf(TEXT("update %s"), *Version)));
+
 		return true;
 	}
 
-	int32 FUpdateOrchestrator::Compact(
+		int32 FUpdateOrchestrator::Compact(
 		const FString& CdnDir,
 		const FString& Version,
 		const FString& InstallDir,
@@ -1582,6 +1650,7 @@ namespace UnrealGamePatcher
 		FUpdateStats& OutStats)
 	{
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+		FIOStats::Get().Reset();
 
 		// --- 1. Remote manifest (metadata lives under <base>/index/<version>/).
 		// Compact/check/repair are local maintenance commands: the CDN root is a
@@ -1653,6 +1722,9 @@ namespace UnrealGamePatcher
 		}
 
 		OutStats.NumChunksReused = OutStats.ReusedChunkGuids.Num();
+		OutStats.IOStats = FIOStats::Get().Snapshot();
+		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: compact I/O %s"),
+			*FIOStats::Get().FormatSummary(TEXT("compact")));
 		return Rebuilt;
 	}
 

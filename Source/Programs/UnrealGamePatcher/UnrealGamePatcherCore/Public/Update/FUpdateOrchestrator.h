@@ -6,6 +6,7 @@
 #include "Formats/Index/FIndexManifest.h"
 #include "Formats/Diff/FDiffAnalyzer.h"
 #include "Download/IChunkDownloader.h"
+#include "Stats/FIOStats.h"
 #include "Update/FUpdateEvent.h"
 
 namespace UnrealGamePatcher
@@ -70,6 +71,13 @@ namespace UnrealGamePatcher
 		/** Distinct guids reused this run (committed only for successful
 		 *  rebuilds; NumChunksReused is this set's size at the end). */
 		TSet<FString> ReusedChunkGuids;
+		/** I/O accounting of THIS run (FIOStats): disk read/write volume,
+		 *  network bytes, compression/decompression passes, chunk-store loads
+		 *  and hash volume. This is the regression net the write-only stats
+		 *  above never were: a CoW patch silently degrading into a full
+		 *  container fetch + rebuild shows up here as container-sized disk
+		 *  reads / downloads / writes for a byte-sized delta (review H1). */
+		FIOStatsSnapshot IOStats;
 	};
 
 	/**

@@ -109,8 +109,8 @@ contentVersion、改 chunk size、删除 selfCheck 字段——全部拒收；�
 
 ## 5. buildtest — 构建侧 ingest
 
-**解决什么问题**：`FBuildIngestor` 把标准 UAT 输出（staged 目录）切成自研 1MiB
-窗口 chunk 并导出扩展清单，必须确定、一致、幂等。
+**解决什么问题**：`FBuildIngestor` 把标准 UAT 输出（staged 目录）用 FastCDC 内容定义切分
+（Gear + 归一化，256KB/1MB/4MB 三档）切成自研 chunk 并导出扩展清单，必须确定、一致、幂等。
 
 **怎么做**：同一 staged fixture（真实 pak/ucas/utoc + 一个普通文件）两次 ingest
 到不同 CDN 根；比较输出（1）两次 ingest 的 index **字节一致**（确定性）；
@@ -120,7 +120,9 @@ contentVersion、改 chunk size、删除 selfCheck 字段——全部拒收；�
 
 **预期效果**：两次 ingest 字节级一致；清单与 staged 一致；重复 ingest 不破坏。
 另含 **C6/M5 回归**：空 staged 目录拒收（发布空清单 = 客户端删光安装）、
-`-staged=` 尾部分隔符不破坏文件 id。
+`-staged=` 尾部分隔符不破坏文件 id；**cdcshift 小节**：大文件起始插 1 字节后
+重 ingest，FastCDC 切分漂移必须极小——断言新增 chunk ≤ 2 且 v2 与 v1 共享
+≥90% chunk（切分常量 + Gear 种子为格式契约，2026-09-17 FastCDC 升级的回归锁）。
 
 ---
 
@@ -143,7 +145,7 @@ contentVersion、改 chunk size、删除 selfCheck 字段——全部拒收；�
 损坏修复、chunk 复用、信任/验证双模式、崩溃恢复。
 
 **怎么做**（真实 IOStoreDemo 打包产物 ingest 进本地 CDN）：
-1. **空目录全量安装**：4 文件（pak/ucas/utoc/boot.txt）、13 chunk 全取、逐文件 hash==清单、写入字节数
+1. **空目录全量安装**：4 文件（pak/ucas/utoc/boot.txt）、9 chunk 全取、逐文件 hash==清单、写入字节数
    精确；
 2. **pak 完整性交叉验证**：安装后 pak 每条目内置 hash 匹配 payload；
 3. **no-op**：再次更新 0 取 0 写；
@@ -189,13 +191,22 @@ repair 只修损坏。
 **解决什么问题**：真实 HTTP 传输（外部 python CDN 服务器）下的 range/
 续传/并发/重试/自定义后端/占用文件回滚。
 
-**怎么做**（起 `../Scripts/cdn_server.py`，故障注入经 `__ctl` 控制端点）：
+**怎么做**（起 `Scripts/cdn_server.py`，故障注入经 `__ctl` 控制端点）：
 - A/B/D-H（C 已并入 A 的并发断言）：range 下载、journal 位图续传（缺 N 段只重下
   N 段，含非连续位图）、并发（Peak ≥ 2）、重试、`__ctl` 故障注入（500/404/截断）、
   执行器级 H 组（分段/公平/取消/SHA1 终验/上限/探测回退/真 HTTP 段 0 的 206）；
 - E：**端到端网络更新**——全量装（每 chunk 走 HTTP）→ no-op（命中缓存）→
   删一个缓存 chunk + 损坏 ucas → **强制验证更新**（`bForceVerify`）→ 缺失
   chunk 重新拉取（服务端请求数增加）、修复 ucas+utoc；
+- **netdelta 小节**：容器级增量走真实 HTTP——v2 只改 pak 内一条目，断言
+  恰好该 pak Changed、**只取变化条目覆盖的窗口**（服务端只见 ~1 index +
+  ~1 chunk 请求）——网络模式乐观预取窗口与本地模式必须一致；
+- **bigpak 小节（H1 回归锁）**：xorshift64 合成多窗口 pak（2MB 级随机数据
+  触发 FastCDC 切分）改 1 条 + 追加 2 条 → 断言 `NumFilesChanged==1`、
+  **BytesWritten < 256KB**（H1 修复前是整 pak 全量重写）、
+  `IOStats.ChunkLoads <= 3`（FIOStats 刻度）→ 逻辑等价 + 重跑 no-op。
+  939B 单窗口 fixture 免疫 H1（Same 判断顺序错误时全量重写结果仍"正确"），
+  必须用多窗口容器才暴露；
 - F：自定义后端（文件映射）驱动全流程，证明传输与管线解耦；
 - G：**占用文件**——翻转 pak 条目 payload 并锁文件（只读共享）→ 强制验证
   更新写失败 → 事务回滚（文件保持原样）→ 解锁后同更新成功（逻辑等价）；
@@ -251,18 +262,18 @@ repair 只修损坏。
 **解决什么问题**：**不同点**——只写变化条目，避免整 pak 重写（Steam/Wegame
 弊端）。
 
-**怎么做**：构造两个 pak 版本（一条目原地改、一条目追加），走真实管线 ingest
-（带条目元数据）→ 装 v1 → 对 v2 做 `FInPlacePakPatcher::Patch` → 断言只写
-了变化条目（统计：same 零搬动 / overwrite 原地 / append 追加）→ **逐条目
+**怎么做**：构造两个 pak 版本（一条目重追加（CoW v2：变化条目永不原地覆盖）+ 一条目追加），
+走真实管线 ingest（带条目元数据）→ 装 v1 → 对 v2 做 `FInPlacePakPatcher::Patch` → 断言
+`NumSame==1 / NumAppended==2`（统计：same 零搬动 / 变化条目全部重追加）→ **逐条目
 逻辑等价**（每远端条目本地存在且 hash 匹配；不要求整文件字节一致）。
 压缩多块小节另含 **C7 回归**：v2 追加一个**新的 Oodle 压缩条目** → 原地
 patcher 必须 bail 整文件重建（method-0 追加压缩字节 = 引擎读垃圾，且逐条目
 hash 校验抓不住）→ 断言走重建路径且新条目在盘上保持压缩形态、解码正确。
 
-**预期效果**：939B pak 改 1 条目+增 1 条目只写 ~91B（5.4%）；结果逻辑等价。
-**4c 空洞回填回归**：4b 的原地 patch 把死区记入 sidecar → 1.2 再追加一个
-新条目 → 断言新条目被放置在**旧 EOF 之下**（物理证据：落进了记录的空洞）
-且解码正确、重跑 no-op。
+**预期效果**：939B pak 改 1 条目+增 1 条目只写 91B（经编排器断言精确值）；结果逻辑等价。
+**4c 空洞回填回归**：4b 的 CoW patch 留下死区（由已提交 index 补集重算空洞，
+非 sidecar 记账）→ 1.2 再追加一个新条目 → 断言新条目被放置在**旧 EOF 之下**
+（物理证据：落进了重算出的空洞）且解码正确、重跑 no-op。
 
 ---
 
@@ -289,7 +300,7 @@ id-only 判据说 Same、更新永不下发）→ 原地 patch 保 id 换数据 
 - **真实打包产物 fixture**：`.manifesttest/chunkinstall/Windows/1.0.0/pakchunk1`
   （真实小容器 pak/ucas/utoc，作 staged 输入）——buildtest/difftest/updatetest/
   maintest/downloadtest/e2etest/perftest/pakinplace/iostoreinplace 共用；
-- **外部 CDN 服务器**：`../Scripts/cdn_server.py`（downloadtest）；
+- **外部 CDN 服务器**：`Scripts/cdn_server.py`（downloadtest）；
 - **测试工作目录**：`Saved/<suite>`（Program 的 ProjectDir 下），测完清理。
 
 ## 新增测试时

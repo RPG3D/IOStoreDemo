@@ -17,7 +17,7 @@ REM                            [-WithRustfs] [-Build] [-Config Development]
 REM
 REM   -Project     target project root (the dir containing the .uproject).
 REM                Required.
-REM   -WithRustfs  also copy rustfs.exe (the 297MB S3 server binary) into Scripts\
+REM   -WithRustfs  also copy rustfs.exe (the 1.4MB S3 server binary) into Scripts\
 REM   -Build       rebuild UnrealGamePatcher for the TARGET project (engine
 REM                path hardcoded below) instead of copying the prebuilt exe -
 REM                use this when the target uses a different engine version.
@@ -89,7 +89,7 @@ if %errorlevel% GEQ 8 (
   exit /b 1
 )
 
-REM Drop rustfs.exe unless explicitly requested (297MB third-party binary).
+REM Drop rustfs.exe unless explicitly requested (1.4MB third-party binary).
 if "%WITH_RUSTFS%"=="0" (
   if exist "%DST_MODULE%\Scripts\rustfs.exe" del "%DST_MODULE%\Scripts\rustfs.exe"
 )

@@ -4,10 +4,16 @@
 > 本文描述"接下来做什么、为什么这么做"。
 > 来源：2026-08-30 全面 review（5 路并行审查，96 项发现，42 项已修复）+
 > 下载器专项设计讨论（统一分段模型、元数据上限、模块独立、开源库取舍）。
-> 状态：**Phase 0 已实施（2026-08-30）；Phase 1 unified-downloader 已实施（2026-09-02，openspec 23/23）；Phase 2 未实施**。
-> **2026-09-08 全面 review（见 REVIEW.md）**：发现 7 critical（含 C1 ucas 判据前提错误、
+> 状态：**Phase 0 已实施（2026-08-30）；Phase 1 unified-downloader 已实施（2026-09-02）；Phase 2 未实施**。
+> **2026-09-08 全面 review（见 review-2026-10-09-0206.md）**：发现 7 critical（含 C1 ucas 判据前提错误、
 > C5 journal 续传主路径失效），P0（C1-C7 + M1/M2/M3 + M5/M11/M12）已当日修复，
 > 15/15 套件全绿；P1/P2 待排期。
+> **2026-10-09 盲评（review-2026-10-09-0206.md §二）**：H1（pak CoW 在真实规模 pak 的
+> 网络模式下因"先取数后判 Same"整体静默退化为全容器重下+重写）+ H2（下载执行器
+> 丢弃取消句柄、协作取消为空操作）已修复；新增全局 I/O 统计系统（FIOStats：磁盘
+> 读/写、网络下行、压缩/解压、chunk 库加载、哈希量——orchestrator 与原地 patcher
+> 均打印，FUpdateStats::IOStats 可断言）与 downloadtest bigpak 多窗口回归
+> （断言 CoW 只写变化条目 + 只读其覆盖窗口）；13/13 套件全绿。
 > 实施按 Phase 顺序，每项带验收标准。
 
 ---
@@ -243,7 +249,7 @@ struct FDownloadExecutor
 | 5 | **退出码碰撞**：`EPatcherError::ManifestMissing=2` 与 CLI `Usage=2` 冲突 | CI 无法区分"清单缺失"和"参数错误" | 错误码空间重排（需拍板） | 设计决策 |
 | 6 | ~~**FIoHash 未验证**~~ **已完成（2026-09-08 前落地，review 确认）**：Reader 对每个解码 chunk 比对 TOC meta hash（`FIoStoreReader.cpp` ReadChunk），损坏 chunk 即读失败 | 已闭环 | — | 无 |
 | 7 | **XXH3 自校验可伪造**：防损坏不防恶意改写 | 安全边界 | 发布侧签名（Ed25519 对 index 正文） | 无 |
-| 8 | **openspec 失真**：design.md D3"官方 manifest 底座"等与自研格式实现矛盾 | 文档可信度 | Phase 1 开 change 时顺带 sync specs | Phase 1 |
+| 8 | ~~**openspec 失真**~~ **已处置（2026-10-09）**：design.md D3"官方 manifest 底座"等与自研格式实现矛盾——openspec 目录（含 archive）整体删除，避免历史设计文档干扰后续开发 | 已闭环 | — | 无 |
 | 9 | ~~**发布侧定长 1MiB 窗口位移全量重切**~~ **已完成（2026-09-17）**：ingest 升级 FastCDC 内容定义切分（Gear + 归一化，256KB/1MB/4MB）；起始插 1 字节 = 20 chunk 新增 1（buildtest cdcshift）；切分常量+Gear 种子为格式契约 | 已闭环 | — | 无 |
 
 ---
@@ -252,6 +258,140 @@ struct FDownloadExecutor
 
 - **顺序**：Phase 0 全部 → Phase 1（先模块骨架+原语迁移，再执行器，再调度/journal，每步 14/14 全绿）→ Phase 2 逐项
 - **Phase 0 各项相互独立**（§1.1-1.7 无依赖），可单独落地单独提交；唯一交叉：§1.6 的错误码重排与 Phase 2 #5 合并拍板、§1.3 与 §1.2 的上限常量同处 `FHttpChunkDownloader`
-- **每个 Phase 开工前**：Phase 1 需开正式 openspec change（`unified-downloader`），顺带完成第 8 项 specs 同步
+- **每个 Phase 开工前**：以 `review-2026-10-09-0206.md` 的开放项清单为准做影响面评估（历史 openspec specs 已于 2026-10-09 删除）
 - **回归底线**：14 套测试全绿 + 真实包（54 files / 3256 chunks / 3.37GB）端到端无回归
 - **性能基线**：perftest 现值 0.1%/0.2%（下载 9.4KB / 写 20KB）不得劣化；Phase 1 后补大文件分段的吞吐基准
+
+---
+
+## 5. Phase 3 —— pak 全 CoW v2：空洞复用 + footer 提交点（方向已确认，2026-09-19）
+
+> 来源：index/数据一致性专项（review-2026-10-09-0206.md §五时间线）+ 设计讨论。
+> 动机：现 in-place 方案为"同尺寸覆写"配了全量容器备份，备份拷贝使本地写放大
+> ≈ 1x 容器——in-place 相对 FastCDC 整文件重建的成本优势被抵消，且引入 C8/C9/C10
+> 一类回滚破口。**回退的本质不是"撤销改动"，而是"改动从未破坏旧版本"。**
+
+### 5.1 核心不变式（唯一安全条件）
+
+> **任何时刻，只允许写"当前已提交 footer 的 index 不引用的字节"——洞里的或文件尾的。**
+
+- "标记空洞"与"复用空洞"必须间隔一次 index commit：死区只有被新 footer 提交后，
+  才对下一代更新成为安全写入空间（v2 追加的 a.lua(v1) 区域，v3 才能覆写）。
+- footer 是 pak 天然的**提交记录点**：最后写、单扇区原子写。注意 FPakInfo 布局
+  引擎要解析，**不能加 CRC 字段**——完整性靠 magic + version + IndexOffset 边界
+  检查 + **IndexHash（index 的 SHA1）** 校验；扫描器必须**验证候选 footer 而不能
+  只匹配 magic**（payload 中可能出现 magic 字节型，GB 级尾部扫描必有假命中，
+  全靠后续校验过滤）。
+  任意断电时刻，盘上存在一个完整自洽的版本，由"最后一个合法 footer"选出。
+
+### 5.2 写序与崩溃语义（三级写，级间 flush）
+
+```
+payload(追加,优先回填洞) → flush → 新 index blob(追加) → flush → footer(单扇区原子写)→ flush
+```
+
+| 断电时刻 | 盘上状态 | 恢复动作 |
+|---|---|---|
+| payload/index 写毕前 | 尾部多出半截垃圾，F1 完好 | 无（F1 视角即完整旧版） |
+| footer 写花 | F2 CRC/magic 不过 | 从文件尾向前按扇区扫描，找回 F1 → 截断到 F1 |
+| footer 落盘后 | F2 有效，其引用的一切已先于它持久化 | 无（新版完整） |
+
+恢复 = WAL 式向后扫描合法 footer + 截断，**无需备份目录、无需回滚拷贝**。
+
+> 引擎侧行为（已对照 UE 源码定案，`PakFile.cpp:271-308` `FPakFile::Initialize`）：
+> 引擎按 `FileSize - GetSerializedSize(版本)` 从最新版本起**定点探测** footer
+> （magic 不匹配就降一个版本尺寸再试，只覆盖历代已知 footer 尺寸），**不做扫描**；
+> footer 不在物理末尾 = `Fatal "Trailing magic number ... Verify your installation"`。
+> 即写入中途的瞬态对引擎是 **fail-closed 拒绝挂载**（非静默错数据）——瞬态不可读
+> 可接受的依据；更新器职责 = 启动后、做任何事前先跑恢复扫描。
+
+### 5.2b 跨容器一致性模型（2026-09-19 review 修订 #1，原方案缺口）
+
+单容器原子性只保证**每个 pak 各自**完整；一次更新动多个文件，v2 把 pak 摘出
+事务后必然出现"pakchunk0 已 v3、pakchunk1 仍 v2"的混合版本中间态。模型显式化：
+
+- **sidecar（版本完成标记）永远最后写**：更新完成 = sidecar 翻转，此前任何
+  容器先提交都不算数；
+- **恢复 = 扫描器（无条件、O(1)/pak）+ 幂等重放**：无 pending 标记；下轮运行
+  对 sidecar(old) vs remote(new) 重放 diff，已提交的容器因条目全 Same 零写收敛。
+  重放幂等性：CoW patch / WriteAtomic / 删除均天然幂等；
+- **接受的风险**：更新被放弃时安装目录停留混合版本，引擎无法察觉——由
+  "更新器是唯一启动门"把守（与 §5.2 引擎 fail-closed 同一道门）；
+- 失败（非崩溃，如网络错误）路径：不回滚容器，报失败留待下轮重放。
+- check/repair/compact 入口同样先跑扫描器（"尾部不可解析"交 repair 判定）。
+
+### 5.3 方案要点
+
+- **永不覆写 payload**：同尺寸变更条目与变尺寸一律"追加优先回填洞、EOF 兜底"，
+  删除现有 `Overwrite` 路径。回退依赖从"全量备份"变为"旧版本在带内天然完整"。
+- **洞清单从容器重算，sidecar holes 直接删除**（2026-09-19 review 修订 #2）：
+  权威来源 = 当前 footer index 未引用区间的补集（解析 index + 区间排序即可，
+  每次更新本来就要解析 index）；不再有累计簿记，重复记账无从发生。
+  → **C10 与 C12 双双结构性根除**（原 5.4 把 C12 列为"仍保留"系旧"簿记保留"
+  假设的残留，已纠正）；事后校验对本轮写入条目一律重算 payload 哈希。
+- **compact 保留**（= LFS cleaning），语义不变。
+- **已知限制（同尺寸大条目）**：pak 条目是连续存储 blob，2 GB 条目改 1 字节 =
+  追加 2 GB（下载亦然）。未来优化方向：大条目走 NTFS 式数据 journal（覆写前
+  journal 旧字节，∝ 条目大小，仍无需全量备份）——优化项，不是本期必需。
+- **加密 index / 签名 pak 门控**：CoW 重写 index+footer 必然破坏签名/加密，
+  检测到即拒绝 CoW → 走整文件重建或维持不支持，写入验收标准。
+- FastCDC 整文件重建继续作为终极兜底路径（现成回退路径，零额外工作）。
+
+### 5.4 被根除 / 仍保留的存量问题
+
+- **根除**：C8 类（备份失败 → utoc 失配，备份整个机制消失）、C9 大半（无回滚拷贝）、
+  **C10 + C12**（洞改从容器重算 + 写入条目重算哈希，记账失配与校验盲区双双消失，
+  见 5.3 修订 #2）；全量备份的 I/O 与磁盘峰值开销。
+- **仍保留**：M20（V10/11 文件名编码）等格式层问题不受影响，照旧排期。
+- **ucas 不在本期**：同构但更简单（Commit 本就只追加 + utoc 原子替换），pak 落地后照搬。
+
+### 5.5 实现任务（2026-09-19 review 修订 #6：扫描器提前，测试补幂等重放）
+
+> **状态（2026-09-21）：1–4 已完成，5 已完成（9 套件全绿：pakinplace 含恢复
+> 测试 5a–5f、selftest、statetest、indextest、difftest、buildtest、updatetest、
+> maintest、iostoreinplace）。** 实现期修出两个计划外 bug：① `AppendEntry`
+> 同路径必须替换旧目录项（否则重复目录记录污染 index）；② 扫描器打开 pak
+> 必须 `OpenWrite(Path, true, true)`——引擎默认参数走 CREATE_ALWAYS 打开即
+> 截断（已记入 AiAgentKB `ue-openwrite-default-truncates`）。downloadtest /
+> benchtest / e2etest 属网络/性能重型，本轮未跑。
+>
+> **测试审计轮（2026-09-21，12 套件全绿）**：全量测试用例审计（重复/过期/
+> 遗漏）后补齐——pakinplace 新增 5b2（>64KB 多窗口扫描）、section 6（失败
+> 注入：pak 不备份不回滚、CoW 提交存活、重放零写收敛）、section 7（零字节
+> 容器 → Unrecoverable → 整文件重建）、section 8（**删除 pak 条目 → patcher
+> 拒绝 CoW → 整重建收敛**，审计发现的真实产品缺口：就地追加路径不表达删
+> 除，原实现会留下旧条目且永不收敛，已在 `FInPlacePakPatcher` 加"本地多出
+> 条目 → 整文件重建"守卫）；e2etest 去重、footer 512 对齐断言、benchtest
+> 清场。加密/签名 gating 测试按用户决定暂缓。过期断言：零。
+>
+> **JSON 解析层结论（2026-09-21 spike 实测后）**：评估过"USTRUCT 反射 +
+> FJsonObjectConverter 重写 Load"（UHT 对 Program 默认生效、JsonUtilities
+> 零负担，均实测通过），但**放弃**：① selfCheck 绑定手写 `SerializeBody`
+> 的紧凑字节，规范层必须保留；② wire 键与成员名语义错位（`offset` 在
+> parts/entries/ioChunks 三个上下文分别映射 Offset/RawOffset/OffsetInFile），
+> 反射导入需要按上下文的键重写表 + 递归 walker；③ converter 缺字段静默取
+> 默认，严格必填/格式校验层（storedSize 改名拒绝等，indextest 钉死）无论如何
+> 要对原始 JSON 手写。实测估算 ~280 行新代码换 ~230 行提取代码，净增。
+> 已落地的真实简化：手写 JSON 的公共机械集中到单一头
+> `Formats/JsonIo.h`——严格字段读取（ReadInt64Field 等，原三份重复）、紧凑
+> 序列化样板（原 6 处）、原子落盘 temp+UTF8+replace（原 4 份逐字重复）、
+> selfCheck 的 XXH3-64 计算方案（index/delta 共用）；各格式的契约
+> （SerializeBody 键序 + 逐字段校验）留在各自 loader。Load/Save 语义零改动，
+> 12 套件全绿。
+
+1. ✅ **恢复扫描器**（新增，最优先）：候选 footer 校验 = magic + version +
+   IndexOffset/Size 边界 + IndexHash（不能只匹配 magic）；扫描器是 update /
+   check / repair / compact 的公共前置。
+2. ✅ `FPakWriter`：删除 `Overwrite`；Commit 三级写序 + 级间 `FlushFileBuffers`；
+   footer 尾部扇区对齐、单扇区一次写。
+3. ✅ `FInPlacePakPatcher`：全 CoW（同尺寸变更走追加）；洞从当前 index 重算；
+   本轮写入条目事后重算 payload 哈希；加密/签名容器显式拒绝。
+4. ✅ `FUpdateOrchestrator`：pak 目标不再纳入备份/回滚（容器自回退）；更新启动先跑
+   扫描器；sidecar 仍最后写；`TestCrashAfterWrites` 等注入钩子适配。
+5. ✅ 测试：footer 写前/写花/写后三态崩溃注入；**容器提交后崩溃 → 重放更新 →
+   零写收敛**（幂等重放端到端）；洞复用跨代断言（v2 追加 → v3 覆用 v1 死区）；
+   14 套件全绿 + 真实包端到端。
+
+**验收**：断电三态恢复后容器可挂载且版本正确；本地写放大 = 变化条目字节级
+（不再含 1x 容器备份写）；perftest 基线不回退；FastCDC 重建回退路径行为不变；
+加密/签名 pak 被显式拒绝而非写出损坏容器。

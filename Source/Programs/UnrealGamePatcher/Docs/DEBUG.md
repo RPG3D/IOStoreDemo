@@ -4,7 +4,7 @@
 > 所有命令在仓库根目录（`D:\UEProject\IOStoreDemo`）执行，**均为单行**——cmd /
 > PowerShell / Git Bash 直接整段粘贴即可（本文不使用续行符；如需折行，cmd 用 `^`、
 > PowerShell 用反引号 `` ` `` 且行尾不能有空格）。示例 CDN = ElectricDreamsEnv
-> 真·HTTP（rustfs S3，7.3GB / 61 文件 / 10006 chunks，v1+v2 双版本）。
+> 真·HTTP（rustfs S3：CDN 目录 7.3GB = v1+v2 双版本全部 chunk 对象；安装体积 7.78GB 见 §1）。
 > **代理无需处理**：程序入口自带 `NO_PROXY=127.0.0.1,localhost`（loopback 直连，远程 CDN 走代理不受影响）。
 
 ## 0. 起环境（仅首次 / rustfs 未运行时）
@@ -29,8 +29,9 @@ Binaries\Win64\UnrealGamePatcher.exe -cli update -cdn="http://127.0.0.1:9000/ugp
 - 装完可直接启动 `player5\ElectricDreamsSample.exe` 验证引擎加载。
 - 日志：`LogUnrealGamePatcher Verbose` = diff/事务/stage 进度；`LogUnrealGamePatcherDownload`
   = 原语层 settle 日志（Verbose；执行器本身只有 Warning 级重试/验证失败日志）。
-  落盘日志在 **`<引擎根>\Engine\Programs\UnrealGamePatcher\Saved\Logs\UnrealGamePatcher.log`**
-  （Program 的 ProjectDir 指向引擎内 Program 目录；`-StdOut` 直出控制台）。
+  落盘日志实测在 **`D:\UEProject\Engine\Programs\UnrealGamePatcher\Saved\Logs\UnrealGamePatcher.log`**
+  （Program 的 ProjectDir 解析到引擎侧 Program 目录，非 `<引擎根>\Engine\...` 直推；
+  2026-10-09 实测验证；`-StdOut` 直出控制台）。
 
 ## 2. 复跑 = no-op（信任模式零磁盘内容读取）
 
@@ -71,7 +72,7 @@ Binaries\Win64\UnrealGamePatcher.exe -cli check -cdn="http://127.0.0.1:9000/ugp-
 ## 6. 下载层专项（自测 + 基准，无需 rustfs）
 
 ```bat
-Binaries\Win64\UnrealGamePatcher.exe -cli downloadtest   :: 90+ 项：range/续传（含自然 journal）/并发/重试/上限/探测回退/自定义后端
+Binaries\Win64\UnrealGamePatcher.exe -cli downloadtest   :: 127 项：range/续传（含自然 journal）/并发/重试/上限/探测回退/自定义后端
 Binaries\Win64\UnrealGamePatcher.exe -cli benchtest      :: 吞吐（限速下窗口 vs 单连接）+ 内存峰值
 ```
 

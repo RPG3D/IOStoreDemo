@@ -2,6 +2,7 @@
 
 #include "Formats/Chunk/FChunkAssembler.h"
 #include "Formats/Chunk/FChunkDataLoader.h"
+#include "Stats/FIOStats.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -111,6 +112,11 @@ namespace UnrealGamePatcher
 		{
 			return false;
 		}
-		return FFileHelper::SaveArrayToFile(Bytes, *OutPath);
+		const bool bOk = FFileHelper::SaveArrayToFile(Bytes, *OutPath);
+		if (bOk)
+		{
+			FIOStats::Get().AddDiskWrite(Bytes.Num());
+		}
+		return bOk;
 	}
 }

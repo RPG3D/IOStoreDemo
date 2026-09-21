@@ -1,7 +1,6 @@
 # UnrealGamePatcher 技术方案（实现版）
 
-> 本文档描述**当前实现的真实流程与格式细节**（对照代码与测试），
-> 与 openspec（`openspec/changes/unreal-game-patcher/`，设计意图与需求）互补。
+> 本文档描述**当前实现的真实流程与格式细节**（对照代码与测试）。
 > README.md 是概念介绍；本文是技术细节。所有命令与路径以本仓库实测为准。
 
 ---
@@ -33,14 +32,14 @@
   模块：`UnrealGamePatcher`（前端：WinMain + CLI 分发与测试 + Slate GUI）、
   `Core`（格式/下载/事务/状态，无 UI）、`Build`（ingest/diff，发布侧）、`Download`（传输原语 + 执行器）。
 - **自研格式层**，不依赖引擎 PakFile / BuildPatchServices / IoStore 模块（仅用 FCompression/FPaths 等底层能力）。
-- **工程内不含 HTTP 服务器**：CDN 服务器用 `../Scripts/cdn_server.py`（Python 标准库）提供，测试拉起它打真实网络。
+- **工程内不含 HTTP 服务器**：CDN 服务器用 `Scripts/cdn_server.py`（Python 标准库）提供，测试拉起它打真实网络。
 
 ---
 
 ## 2. 构建侧（发布）：ingest / diff
 
 ### 2.1 输入：标准 UAT 输出（staged build）
-`UAT BuildCookRun -build -cook -stage -pak`（`../Scripts/package_update.bat`）的 staged 输出目录直接喂给
+`UAT BuildCookRun -build -cook -stage -pak`（`Scripts/package_update.bat`）的 staged 输出目录直接喂给
 `UGP build`。**没有官方 manifest / BPT chunk**——不跑 `-createchunkinstall`、不跑 BuildPatchTool，
 ingest 直接从 staged 文件解析：
 
@@ -93,7 +92,7 @@ ingest 直接从 staged 文件解析：
 - 支持任意两版本 diff（含 v1→v3 跳版本，`diffbuild` 验证 delta == 各步 delta 并集）。
 - 拒绝 AppId 不匹配。
 
-### 2.4 发布管线（`../Scripts/publish_update.bat`）
+### 2.4 发布管线（`Scripts/publish_update.bat`）
 `-Staged <staged dir> -App <name> -Version <v> -CdnRoot <cdn> [-BaseIndex <旧index> -NewIndex <新index> -DeltaOut <dir>]`。
 cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败传播退出码（CI 可接）。
 
@@ -149,7 +148,9 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 1. **整文件重建**（默认/回退）：按 parts 从 chunk 组装（同 chunk 优先从本地文件切片复用）→ 临时文件 → whole-file hash 校验 → 原子替换。
    网络模式：先对全部目标需要的 chunk 做下载阶段（缺失缓存自动补下），下载失败整体中止不落盘。
 2. **pak 条目级原地**（`FInPlacePakPatcher`）：仅当该 pak 有 `entries[]` 元数据且本地可读。
-   同条目零搬动；同尺寸变更条目原地覆盖；新增/变尺寸条目末尾追加（目录/footer 重建）。
+   同条目零搬动；变化条目**重追加**（CoW v2：永不原地覆写 payload，优先回填由已提交
+   index 补集重算出的空洞），目录/footer 随新 payload 在尾部重写（512 扇区对齐单写 =
+   提交点）。
    修补后按**逐条目内容 hash** 验证（虚拟磁盘模型，不要求整文件字节一致），否则回退整文件重建。
    验证模式（`bVerifyLocalData`）重算本地条目 payload hash——同尺寸损坏的存储 hash 头没变，
    必须重算才抓得到。
@@ -167,11 +168,11 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 - 逐目标**先备份原文件**到 `.ugp/backup/` 再操作；每步写日志（崩溃恢复可定位进度）。
 - 任一失败 → **回滚**：按目标逆序恢复备份（Added 无备份则删除），备份目录清除，状态 `rolled-back`。
 - 下次启动读到 `pending` → **先回滚恢复**，再应用新版本（模拟 kill 后 rerun 结果正确，`updatetest` 验证）。
-- **空洞回填（2026-09-12）**：原地 patch 把自己产生的死区（pak 被替换条目的旧数据 + 旧
-  目录/footer 区；ucas 被替换 chunk 的旧块区间）记入 sidecar 的 Holes；**下一次更新的追加
-  优先回填**这些空洞（pak 32B 对齐 / ucas 块对齐，best-fit；逻辑块序保持稠密，物理写进死区，
-  引擎按块表 FileOffset 读取不受影响）——填充后空洞被消费（余量保留）。整文件重建（CDN 布局）
-  会清空该文件的空洞记录；`compact` 仍是手动兜底（临时文件 + 原子替换，回收全部死重）。
+- **空洞回填（CoW v2，2026-09-21 起）**：pak 死区不再记入 sidecar——由**已提交 index 的
+  补集**实时重算（`ComputePlacementHoles`）；**下一次更新的追加优先回填**这些空洞
+  （pak 32B 对齐 / ucas 块对齐，best-fit；逻辑块序保持稠密，物理写进死区，
+  引擎按块表 FileOffset 读取不受影响）。ucas 侧被替换 chunk 的旧块区间同理。
+  整文件重建（CDN 布局）天然无死区；`compact` 仍是手动兜底（临时文件 + 原子替换，回收全部死重）。
   `check` 报告的膨胀率基于真实空洞记录（阈值：>10% 或 >512MB）。
 
 ### 3.5 本地状态布局
@@ -192,7 +193,7 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 容器字节排序每台机器不同，但**窗口是内容寻址的（SHA1）**，匹配完全不看顺序。
 
 > 注意区分两个"复用"：本节的**容器内窗口复用**（从已安装 pak/ucas 切片拷贝）；
-> openspec 里"复用已下载 chunk"指**下载断点续传**（journal 位图段粒度续传，另一概念，见 §4）。
+> `FDownloadManager` 的"复用已下载 chunk"指**下载断点续传**（journal 位图段粒度续传，另一概念，见 §4）。
 
 **算法**（`RebuildFileFromChunks`，~90 行）：
 
@@ -225,7 +226,7 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
   （零专用线程，HTTP 链路/超时全交给引擎）、journal 位图续传（只补缺段）、
   **校验通过才改名落盘**（损坏绝不落盘）、任一失败整体失败并报告失败 id。
 - **`FDownloadManager`**：业务薄壳（cache 检查 → 组装 Job 提交执行器 → 聚合等待 → 统计）。
-- **外部 CDN 服务器**（`../Scripts/cdn_server.py`，纯标准库）：Range 支持、运行时故障注入
+- **外部 CDN 服务器**（`Scripts/cdn_server.py`，纯标准库）：Range 支持、运行时故障注入
   （`__ctl/fail_next`、`__ctl/truncate_next?bytes=N`）、可观测（`__ctl/stats`：file/ranges/errors/peak/maxrange）。
 
 ---
@@ -247,7 +248,7 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 ### 5.2 pak（`FPakReader` / `FPakWriter`）
 - footer/目录解析（多版本分发）；V10+ 需要 PathHashIndex 或 FullDirectoryIndex 才能挂载。
 - **内置每文件 SHA1 在 payload header（53B）**，不在编码索引里；未压缩条目 = 原始数据 SHA1。
-- 写：原地覆盖（同存储尺寸+同压缩布局）/ 末尾追加（32B 对齐）/ 目录+footer 重建。
+- 写：CoW 重追加（目录+footer 尾部重写，footer 512 扇区对齐单写 = 提交点）。
 - 坑：`FString` 写盘长度含 null 终止符，必须显式补 0（曾修 OOB 导致输出不确定）。
 
 ### 5.3 IoStore（`FIoStoreReader` / `FIoStoreWriter`）
@@ -273,14 +274,23 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 
 ## 7. 验证与测试
 
-15 项自测（perftest 为 e2etest 的别名，benchtest 为性能基准）（`UnrealGamePatcher.exe -cli <suite>`，全过 = 退出码 0）：
+自测入口 15 个 = 13 套功能套件 + `benchtest`（性能基准）+ `perftest`（`e2etest` 的别名）（`UnrealGamePatcher.exe -cli <suite>`，全过 = 退出码 0）：
 
 `selftest / statetest / indextest / difftest / buildtest / diffbuild / updatetest / maintest / downloadtest / benchtest / iostoretest / e2etest / perftest / pakinplace / iostoreinplace`
 
 每套的**解决什么问题/怎么做/预期效果**见 `TESTCASES.md`（测试刻度尺文档）。
 
+**I/O 统计（FIOStats，2026-10-09）**：进程级 I/O 记账——磁盘读/写（字节+次数）、网络
+下行/上行、压缩/解压（入/出+次数）、chunk 库加载次数、哈希字节数。update / compact 结束
+打印全量摘要（`FUpdateOrchestrator: update I/O update <v>: disk read ... | chunk loads ...`）
+并写入 `FUpdateStats::IOStats`（测试可断言）；pak/ucas 原地 patcher 各自打印本次 patch 的
+增量。用途：**让静默回退可见**——一次小增量若出现容器级读/下/写体积，说明命中
+了回退路径（H1 案例：修复前 pak CoW 在网络模式静默退化为全容器重下+重写，写量统计
+完全看不出来）。downloadtest 的 bigpak 场景以断言钉死该契约（CoW 只写变化条目 +
+只读其覆盖窗口）。
+
 实测性能（真实 IOStoreDemo 打包产物）：
-- fixture 全量安装 10.4MB（13 chunk）。单文件变更：下载 9.4KB（0.1%）、写入 20KB（0.2%）；
+- fixture 全量安装 10.4MB（9 chunk）。单文件变更：下载 9.4KB（0.1%）、写入 20KB（0.2%）；
   窗口内容寻址 + 本地容器复用（§3.6）后，未变窗口零下载。
 - pak 原地：939B 包改 1 条目 + 增 1 条目 → 只写 91B（5.4%）。
 - ucas 原地：10.3MB 容器换 1 chunk + 增 1 chunk → 只追加 12KB（0.12%），重跑收敛为 no-op。

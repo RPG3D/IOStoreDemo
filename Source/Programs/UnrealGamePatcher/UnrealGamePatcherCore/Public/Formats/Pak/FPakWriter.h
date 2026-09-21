@@ -9,17 +9,22 @@
 namespace UnrealGamePatcher
 {
 	/**
-	 * Incremental pak writer: modifies an existing pak in place with zero data
-	 * relocation (design D4):
+	 * Incremental pak writer: modifies an existing pak copy-on-write (design
+	 * D4 / Phase 3 CoW v2, ROADMAP §5):
 	 *
-	 *   [ data region ][ old directory ][ old footer ][ new data (32B aligned) ][ new directory ][ new footer ]
+	 *   [ data region ][ old index ][ old footer ][ new data (32B aligned, holes first) ][ new index ][ pad ][ new footer ]
 	 *
-	 * - Overwrite(): the new stored payload has the same size and compression
-	 *   layout as the existing entry -> pwrite over the old data, nothing moves.
-	 * - AppendEntry(): new/changed entries are appended after the old footer,
-	 *   aligned to 32 bytes; the old directory/footer region becomes a hole.
-	 * - Commit(): rebuilds an unencoded (V10+) primary index from all entries
-	 *   (old + new) and appends it with a fresh footer at the end of the file.
+	 * - Payload bytes are NEVER overwritten in place: new/changed entries go
+	 *   into dead ranges (SetPlacementHoles) or are appended after the old
+	 *   footer. The invariant "only write bytes the committed footer's index
+	 *   does not reference" is what makes any crash safe — the old version
+	 *   stays complete in-band until the new footer lands.
+	 * - Commit(): three-stage write with a full flush between stages —
+	 *   payloads (already written by AppendEntry) -> Flush -> index +
+	 *   FullDirectoryIndex blob -> Flush -> footer (sector-aligned, single
+	 *   write, itself sector-atomic) -> Flush. The footer is the commit
+	 *   point: FPakRecovery scans backwards for the last valid footer and
+	 *   truncates any torn tail.
 	 *
 	 * The writer is chunk-oriented: the caller hands in the final stored bytes
 	 * per compression block (this is exactly what a CDN chunk delivers for the
@@ -57,17 +62,6 @@ namespace UnrealGamePatcher
 		 *  footer and directory (reusing FPakReader). Returns false on failure. */
 		UNREALGAMEPATCHERCORE_API bool Open(const FString& PakFilePath);
 
-		/** Overwrites an existing entry in place. Requires:
-		 *    - the entry exists in the parsed directory
-		 *    - NewEntry has the same stored Size and the same compression
-		 *      layout (same method, same block count) as the existing entry
-		 *      so the payload header keeps its size
-		 *  Data must point at Size bytes of the new stored payload. */
-		UNREALGAMEPATCHERCORE_API bool Overwrite(const FString& PathInPak, const FPakEntry& NewEntry, const uint8* Data, int64 Size);
-
-		/** Appends a new entry (or a size-changed replacement) at the end of
-		 *  the file. Entry.Offset is assigned by the writer (32-byte aligned,
-		 *  after the current end of file). Returns false on I/O failure. */
 		/** Returns the pak-serialization index of a compression method,
 		 *  registering it into the footer's method table on first use (the
 		 *  table is empty for paks that never compressed anything). Index 0
@@ -75,11 +69,18 @@ namespace UnrealGamePatcher
 		 *  full (5 file slots max, engine format limit). */
 		UNREALGAMEPATCHERCORE_API int32 RegisterCompressionMethod(FName Method);
 
+		/** Appends a new entry (new file or new generation of an existing one)
+		 *  into a dead range or at the end of the file. Entry.Offset is
+		 *  assigned by the writer (32-byte aligned). Returns false on I/O
+		 *  failure. The new entry only becomes visible to readers once
+		 *  Commit() lands the footer. */
 		UNREALGAMEPATCHERCORE_API bool AppendEntry(const FEntryToWrite& InEntry, FPakEntry& OutEntry);
 
-		/** Rebuilds the directory index and footer, appending them at the end
-		 *  of the file. After Commit() the pak is fully valid; a subsequent
-		 *  AppendEntry() may still be called and Commit() again. */
+		/** Commits the new generation: flushes pending payloads, appends the
+		 *  rebuilt index + FullDirectoryIndex blob, flushes, then writes the
+		 *  footer sector-aligned as a single write and flushes again. After
+		 *  Commit() the pak is fully valid; a subsequent AppendEntry() may
+		 *  still be called and Commit() again. */
 		UNREALGAMEPATCHERCORE_API bool Commit();
 
 		/** Number of bytes appended so far (new data + directory + footer),

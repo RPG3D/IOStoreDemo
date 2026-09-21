@@ -3,6 +3,7 @@
 #include "Download/FDownloadManager.h"
 #include "Download/FDownloadExecutor.h"
 #include "Download/FHttpRangeRequest.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -27,6 +28,8 @@ namespace UnrealGamePatcher
 			TArray<uint8> Buffer;
 			Buffer.SetNumUninitialized(1 << 20);
 			int64 Remaining = Handle->Size();
+			FIOStats::Get().AddDiskRead(Remaining);
+			FIOStats::Get().AddHashed(Remaining);
 			while (Remaining > 0)
 			{
 				const int32 ToRead = (int32)FMath::Min<int64>(Remaining, Buffer.Num());
@@ -153,6 +156,13 @@ namespace UnrealGamePatcher
 		OutStats.Retries = Retries.load(std::memory_order_acquire);
 		OutStats.BytesDownloaded = BytesDownloaded.load(std::memory_order_acquire);
 		OutStats.Failed = OutFailedIds.Num();
+
+		// Global I/O accounting: wire bytes that actually crossed the network,
+		// plus the executor's staging-file writes (approximately the same
+		// bytes - the retry re-transfers overwrite the same staging offsets,
+		// and the whole-file verify reads are not counted here).
+		FIOStats::Get().AddNetDownload(OutStats.BytesDownloaded);
+		FIOStats::Get().AddDiskWrite(OutStats.BytesDownloaded);
 
 		return OutFailedIds.Num() == 0;
 	}

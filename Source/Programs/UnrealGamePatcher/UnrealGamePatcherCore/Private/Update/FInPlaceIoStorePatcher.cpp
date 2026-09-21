@@ -6,6 +6,7 @@
 #include "Formats/IoStore/FIoStoreWriter.h"
 #include "Hash/FPatcherHash.h"
 #include "IO/IoHash.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -24,6 +25,7 @@ namespace UnrealGamePatcher
 		const TArray<FHole>& InAvailableHoles)
 	{
 		OutStats = FInPlaceIoStoreStats();
+		const FIOStatsSnapshot IOStart = FIOStats::Get().Snapshot();
 
 		const FIndexFileEntry* RemoteFile = Remote.Files.Find(UcasId);
 		if (!RemoteFile || RemoteFile->IoStoreChunks.Num() == 0)
@@ -326,6 +328,12 @@ namespace UnrealGamePatcher
 		UE_LOG(LogUnrealGamePatcher, Display,
 			TEXT("FInPlaceIoStorePatcher: '%s': %d same (zero movement), %d replaced, %d appended; %lld raw bytes written"),
 			*UcasId, OutStats.NumSame, OutStats.NumReplaced, OutStats.NumAppended, OutStats.BytesWritten);
+		// Per-patch I/O report (same purpose as the pak patcher's): a chunk-
+		// level patch must read only the changed chunks' spans plus the small
+		// remote utoc - read volume near the container size means the delta
+		// path silently degraded.
+		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FInPlaceIoStorePatcher: '%s' I/O: %s"),
+			*UcasId, *FIOStats::FormatDelta(IOStart, FIOStats::Get().Snapshot()));
 		return true;
 	}
 }

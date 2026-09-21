@@ -4,19 +4,19 @@
 
 传统 Steam/Wegame 类平台对 1 GB 的 pak 只更新 1 字节也要整体重写；本项目**客户端对比 pak 条目 / ucas chunk → 按 range 下载差异字节 → 原地写入**：
 - **pak**：index 携带每个 pak 条目的元数据（路径/偏移/存储大小/内置 SHA1）；客户端用本地 pak 的内置哈希逐条对比，
-  未变条目**零搬动**，同尺寸变更条目**原地覆盖**，新增/变尺寸条目**末尾追加**（目录/footer 重写）——只写差异字节，绝不整写文件。
+  未变条目**零搬动**，变化条目**重追加**（优先回填由已提交 index 补集重算出的空洞），目录/footer 随新 payload 在尾部重写（512 扇区对齐）——只写差异字节，绝不整写文件。
 - **ucas**：chunk id（内容 hash）判据，变化 chunk 追加 + utoc 整体重建（原子替换），未变 chunk 零搬动。
 - 整文件重建路径（临时文件 + 原子替换）仍作为**回退**与普通文件更新方式存在，两者共用同一事务/回滚框架。
 
-> 重要：**本工程不包含任何 HTTP 服务器实现**。CDN 服务器用 Python 提供（`../Scripts/cdn_server.py`，
+> 重要：**本工程不包含任何 HTTP 服务器实现**。CDN 服务器用 Python 提供（`Scripts/cdn_server.py`，
 > 仅用标准库，带 Range 支持 + 运行时故障注入 `__ctl/fail_next`、`__ctl/truncate_next`、`__ctl/stats`），
 > 测试通过拉起外部 CDN 服务器打真实网络。
 > **不需要 Node 版**：客户端只走 HTTP，服务器实现语言对其不可见；Python 标准库已覆盖 Range/并发/故障注入/可观测，
 > 且本机 Python 必然可用，Node 只会多引入一个运行时依赖而无任何功能增益。
 
 - 输入 = **标准 UAT 输出**（staged build：pak/ucas/utoc 等打包产物），**不依赖 BuildPatchServices / 官方 manifest /
-  BPT chunk 文件**——`FBuildIngestor` 直接从 staged 目录切出我们自己的 1 MiB 窗口 chunk（内容寻址 SHA1，Oodle/raw
-  压缩），并导出**自研扩展清单** `UnrealGamePatcher.index.json`（XXH3-64 自校验，防篡改）。
+  BPT chunk 文件**——`FBuildIngestor` 直接用 FastCDC 内容定义切分（Gear + 归一化，256KB/1MB/4MB 三档）出自研
+  chunk（内容寻址 SHA1，Oodle/raw 压缩），并导出**自研扩展清单** `UnrealGamePatcher.index.json`（XXH3-64 自校验，防篡改）。
 - 自研格式层：pak 读写（FPakReader/FPakWriter）、自研 chunk 格式（FChunkDataLoader）、IoStore utoc/ucas 读写。
 - 可插拔下载层：`IChunkDownloader` 抽象 + 默认 HTTP 后端——传输原语 `FHttpRangeRequest`
   （Range v2 语义 / 传输上限 / probe）+ 窗口执行器 `FDownloadExecutor`（journal 断点续传 /
@@ -32,7 +32,7 @@
 - **`DOWNLOAD.md`**：通用下载器组件规格——传输原语语义、内存安全边界、分段模型与公平调度、
   断点续传、使用方式与设计决策（Phase 1 拆为独立模块后即其 README）。
 - **`TESTCASES.md`**：全部测试套件的权威刻度尺（每套解决什么问题/怎么做/预期效果）。
-- **openspec（`openspec/changes/unreal-game-patcher/`）**：需求规格与设计意图（design.md 的 D1-D10、specs.md、tasks.md）。
+- **`review-2026-10-09-0206.md`**：最新完整 code review（发现 / 当前状态 / 修复记录；整合全部历史轮次）。
 
 ## 构建
 
@@ -74,7 +74,7 @@ GUI：不带 `-cli` 即打开 Slate 窗口（更新按钮 + 进度条 + 完成�
     latest.json                    # 版本公告：客户端无 -version= 时解析目标版本
     1.0.0/UnrealGamePatcher.index.json   # 自研扩展清单（自校验 XXH3-64）
     1.0.1/...                      # 元数据按版本独立目录
-  chunks/<h0><h1>/<h2><h3>/<rest>.chunk  # 自研 chunk 实体：1MiB 窗口，内容寻址 SHA1
+  chunks/<h0><h1>/<h2><h3>/<rest>.chunk  # 自研 chunk 实体：FastCDC 内容定义切分，内容寻址 SHA1
                                          # 2/2/36 hex 分片（防单目录海量文件），Oodle/raw
 ```
 
@@ -113,28 +113,28 @@ GUI：不带 `-cli` 即打开 Slate 窗口（更新按钮 + 进度条 + 完成�
 
 ## 打包管线接入（构建脚本）
 
-`../Scripts/package_update.bat`：官方 UAT BuildCookRun（build + cook + stage + pak）→ UGP `build`（staged → CDN）。
+`Scripts/package_update.bat`：官方 UAT BuildCookRun（build + cook + stage + pak）→ UGP `build`（staged → CDN）。
 失败传播退出码（CI 可直接调用）。引擎路径写死（本机 `D:\Code\UE5`），.uproject 自动探测。
 
 ```bat
-..\Scripts\package_update.bat -Version 1.0.1 [-CloudDir <cdn根>]
+Scripts\package_update.bat -Version 1.0.1 [-CloudDir <cdn根>]
 ```
 
-`../Scripts/publish_update.bat`：只做"已打包输出 → CDN"（跳过 cook/stage），可选的版本 diff 增量产物。
+`Scripts/publish_update.bat`：只做"已打包输出 → CDN"（跳过 cook/stage），可选的版本 diff 增量产物。
 
 ```bat
-..\Scripts\publish_update.bat -Staged <staged dir> -App <name> -Version <v> -CdnRoot <cdn根>
-..\Scripts\publish_update.bat -Staged ... -App ... -Version ... -CdnRoot ... -BaseIndex <上一版本index.json> -NewIndex <本版本index.json> -DeltaOut <增量目录>
+Scripts\publish_update.bat -Staged <staged dir> -App <name> -Version <v> -CdnRoot <cdn根>
+Scripts\publish_update.bat -Staged ... -App ... -Version ... -CdnRoot ... -BaseIndex <上一版本index.json> -NewIndex <本版本index.json> -DeltaOut <增量目录>
 ```
 
-**把整个更新模块装进另一个 UE 工程**（一键）：`../Scripts/install_update_module.bat` 把
+**把整个更新模块装进另一个 UE 工程**（一键）：`Scripts/install_update_module.bat` 把
 `Source\Programs\UnrealGamePatcher\`（C++ 模块 + 全部脚本 + 文档）和 `UnrealGamePatcher.exe`
 复制到目标工程。所有脚本用自身位置推导工程根（装进去即可定位新工程）；注意 `package_update.bat` / `install_update_module.bat` 的引擎路径 `ENGINE_ROOT` 是写死的，跨机器需改一行。
 
 ```bat
-..\Scripts\install_update_module.bat -Project <目标UE工程根目录>   REM 复制预编译 exe
-..\Scripts\install_update_module.bat -Project <目标UE工程> -Build   REM 为目标工程重新编译
-..\Scripts\install_update_module.bat -Project <目标UE工程> -WithRustfs   REM 连带 rustfs.exe
+Scripts\install_update_module.bat -Project <目标UE工程根目录>   REM 复制预编译 exe
+Scripts\install_update_module.bat -Project <目标UE工程> -Build   REM 为目标工程重新编译
+Scripts\install_update_module.bat -Project <目标UE工程> -WithRustfs   REM 连带 rustfs.exe
 ```
 
 ## 发布到 S3 兼容存储（rustfs / MinIO / 云厂商）
@@ -142,11 +142,11 @@ GUI：不带 `-cli` 即打开 Slate 窗口（更新按钮 + 进度条 + 完成�
 CDN 是纯静态的，S3 API 是对象存储的事实标准（rustfs / MinIO / AWS S3 / 阿里 OSS / 腾讯 COS
 都兼容）。**客户端只做无签名的 HTTP GET + Range**，所以桶设为公开读即可直接服务。
 
-本地开发用 rustfs（`../Scripts/rustfs.exe`，Rust 写的 MinIO 级 S3 服务端）：
+本地开发用 rustfs（`Scripts/rustfs.exe`，Rust 写的 MinIO 级 S3 服务端）：
 
 ```bat
-..\Scripts\start_rustfs.bat                     # 启动 :9000（数据在 Saved\rustfs-data）
-python ..\Scripts\s3_sync.py --endpoint http://127.0.0.1:9000 --access-key ugpadmin --secret-key ugpadmin123 --bucket ugp-cdn --create --public --sync Saved\UGP_Package\CloudDir        # 建桶+公开读+上传（零依赖 SigV4）
+Scripts\start_rustfs.bat                     # 启动 :9000（数据在 Saved\rustfs-data）
+python Scripts\s3_sync.py --endpoint http://127.0.0.1:9000 --access-key ugpadmin --secret-key ugpadmin123 --bucket ugp-cdn --create --public --sync Saved\UGP_Package\CloudDir        # 建桶+公开读+上传（零依赖 SigV4）
 ```
 
 客户端接入——`-cdn` 是唯一数据源，本地目录或 HTTP 基址二选一：
@@ -165,16 +165,20 @@ UnrealGamePatcher.exe -cli update -cdn=http://127.0.0.1:9000/ugp-cdn -install=<�
 
 ## 性能参考（perftest）
 
-以 IOStoreDemo 真实打包输出（fixture 安装体积 ~10.4 MB，13 个 chunk）为例：
+以 IOStoreDemo 真实打包输出（fixture 安装体积 ~10.4 MB，9 个 chunk）为例：
 - 小版本变更（单文件 readme 增量）：下载 9.4 KB（**全量的 0.1%**）、写入 20 KB（**0.2%**），
   对比全量重装的 10 MB。未变化窗口直接从本地容器复用（见 TECHNICAL.md §3.6），这是比值
   远低于早期版本（8.7%/2.4%）的原因。
 - 未变化 chunk 从本地容器复用（同 hash ⇒ 同内容），零下载零搬动——机制详见 `TECHNICAL.md` §3.6。
+- **刻度条件**：上述数字来自 IOStoreDemo fixture（10.4MB 级）；每次 update/compact/
+  原地 patch 结束都会打印 I/O 统计（FIOStats：磁盘读写 / 网络 / 压缩解压 / chunk 加载 /
+  哈希量）。**小增量必须是小数字**——出现容器级体积即发生了静默回退（见
+  `review-2026-10-09-0206.md` §二 H1 案例与 downloadtest bigpak 回归）。
 
 ## 性能参考（pakinplace / iostoreinplace）
 
-- **pak**（真实 pak 939 B，2 条目 → 改 1 条目 + 增 1 条目）：**只写 91 字节（整包的 5.4%）**，
-  1 条同尺寸条目原地覆盖 + 1 条追加，1 条未变条目零搬动；结果与目标字节完全一致。
+- **pak**（真实 pak 939 B，2 条目 → 改 1 条目 + 增 1 条目）：**只写 91 字节（编排器精确断言）**，
+  1 条变化条目 CoW 重追加 + 1 条追加，1 条未变条目零搬动；结果与目标字节完全一致。
 - **ucas**（真实 10.3 MB 容器，135 chunk → 换 1 chunk + 增 1 chunk）：**只追加 12 KB**（全量的 0.12%），
   134 个未变 chunk 零搬动；utoc 原子重写，结果按 chunk id 逻辑等价；重跑收敛为 no-op（chunk-id 判据）。
 

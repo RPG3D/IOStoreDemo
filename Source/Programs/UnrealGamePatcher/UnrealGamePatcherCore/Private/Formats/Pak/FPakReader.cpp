@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Formats/Pak/FPakReader.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -81,21 +82,8 @@ namespace UnrealGamePatcher
 			return true;
 		}
 
-		// --- Serialized size helpers (mirrors engine FPakInfo::GetSerializedSize) --
-		int64 GetFooterFixedSize(uint32 Version)
-		{
-			int64 Size = 0;
-			if (Version >= 7) Size += 16; // EncryptionKeyGuid
-			Size += 1;                    // bEncryptedIndex
-			Size += 4;                    // Magic
-			Size += 4;                    // Version
-			Size += 8;                    // IndexOffset
-			Size += 8;                    // IndexSize
-			Size += 20;                   // IndexHash
-			if (Version == 9) Size += 1;  // bIndexIsFrozen
-			if (Version >= 8) Size += 160; // CompressionMethods (5 x FName)
-			return Size;
-		}
+		// Footer geometry lives in FPakReader.h (GetPakFooterFixedSize) so the
+		// writer and recovery scanner share one definition.
 
 		int64 GetEntrySerializedSizeInternal(const FPakEntry& Entry, uint32 Version)
 		{
@@ -151,7 +139,7 @@ namespace UnrealGamePatcher
 		ReaderHandle = Handle;
 
 		const int64 FileSize = Handle->Size();
-		if (FileSize < GetFooterFixedSize(1))
+		if (FileSize < GetPakFooterFixedSize(1))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: '%s' too small (%lld bytes)"), *PakFilePath, FileSize);
 			return false;
@@ -160,16 +148,17 @@ namespace UnrealGamePatcher
 		// Read the largest possible footer window and locate the version by
 		// trying each known footer layout, newest first. The magic lives at a
 		// fixed offset from the end for every version.
-		const int64 MaxFooter = GetFooterFixedSize(PakFileVersionMax);
+		const int64 MaxFooter = GetPakFooterFixedSize(PakFileVersionMax);
 		const int64 FooterStart = FMath::Max((int64)0, FileSize - MaxFooter);
 		const int64 FooterBytes = FileSize - FooterStart;
-		TArray64<uint8> FooterBuf;
-		FooterBuf.SetNumUninitialized(FooterBytes);
-		if (!Handle->Seek(FooterStart) || !Handle->Read(FooterBuf.GetData(), FooterBytes))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading footer of '%s'"), *PakFilePath);
-			return false;
-		}
+	TArray64<uint8> FooterBuf;
+	FooterBuf.SetNumUninitialized(FooterBytes);
+	if (!Handle->Seek(FooterStart) || !Handle->Read(FooterBuf.GetData(), FooterBytes))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading footer of '%s'"), *PakFilePath);
+		return false;
+	}
+	FIOStats::Get().AddDiskRead(FooterBytes);
 		const uint8* Base = FooterBuf.GetData();
 		const int64 DataEnd = FooterBuf.Num();
 
@@ -178,7 +167,7 @@ namespace UnrealGamePatcher
 		bool bFound = false;
 		for (int32 V = PakFileVersionMax; V >= 1 && !bFound; --V)
 		{
-			const int64 Fixed = GetFooterFixedSize(V);
+			const int64 Fixed = GetPakFooterFixedSize(V);
 			if (Fixed > DataEnd) continue;
 			const uint8* P = Base + DataEnd - Fixed;
 
@@ -276,13 +265,14 @@ namespace UnrealGamePatcher
 				Info.IndexOffset, Info.IndexOffset + Info.IndexSize, Handle->Size(), *PakFilePath);
 			return false;
 		}
-		TArray64<uint8> IndexData;
-		IndexData.SetNumUninitialized(Info.IndexSize);
-		if (!Handle->Seek(Info.IndexOffset) || !Handle->Read(IndexData.GetData(), Info.IndexSize))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading index of '%s'"), *PakFilePath);
-			return false;
-		}
+	TArray64<uint8> IndexData;
+	IndexData.SetNumUninitialized(Info.IndexSize);
+	if (!Handle->Seek(Info.IndexOffset) || !Handle->Read(IndexData.GetData(), Info.IndexSize))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading index of '%s'"), *PakFilePath);
+		return false;
+	}
+	FIOStats::Get().AddDiskRead(Info.IndexSize);
 
 		// Verify the index hash (SHA1 of the index data, engine computes it on
 		// write). A mismatch means the index - which drives every entry offset
@@ -419,12 +409,13 @@ namespace UnrealGamePatcher
 		const uint8* DirEnd = nullptr;
 		if (DirIndexOffset >= 0 && DirIndexSize > 0)
 		{
-			DirData.SetNumUninitialized(DirIndexSize);
-			if (!Handle->Seek(DirIndexOffset) || !Handle->Read(DirData.GetData(), DirIndexSize))
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading FullDirectoryIndex of '%s'"), *PakFilePath);
-				return false;
-			}
+		DirData.SetNumUninitialized(DirIndexSize);
+		if (!Handle->Seek(DirIndexOffset) || !Handle->Read(DirData.GetData(), DirIndexSize))
+		{
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading FullDirectoryIndex of '%s'"), *PakFilePath);
+			return false;
+		}
+		FIOStats::Get().AddDiskRead(DirIndexSize);
 			DirP = DirData.GetData();
 			DirEnd = DirP + DirData.Num();
 		}
@@ -757,6 +748,7 @@ bool FPakReader::ReadPayloadHash(const FPakEntry& Entry, uint8 OutHash[20]) cons
 	{
 		return false;
 	}
+	FIOStats::Get().AddDiskRead(HeaderSize);
 	const uint8* P = Raw.GetData();
 	const uint8* End = P + Raw.Num();
 	FPakEntry Header;
@@ -792,9 +784,11 @@ bool FPakReader::ComputePayloadHash(const FPakEntry& Entry, uint8 OutHash[20]) c
 		{
 			return false;
 		}
+		FIOStats::Get().AddDiskRead(Entry.Size);
 		if (Entry.Size > 0)
 		{
 			Hasher.Update(Raw.GetData(), Entry.Size);
+			FIOStats::Get().AddHashed(Entry.Size);
 		}
 	}
 	else
@@ -814,9 +808,11 @@ bool FPakReader::ComputePayloadHash(const FPakEntry& Entry, uint8 OutHash[20]) c
 			{
 				return false;
 			}
+			FIOStats::Get().AddDiskRead(BlockBytes);
 			if (BlockBytes > 0)
 			{
 				Hasher.Update(Compressed.GetData(), BlockBytes);
+				FIOStats::Get().AddHashed(BlockBytes);
 			}
 		}
 	}
@@ -856,6 +852,7 @@ bool FPakReader::ReadEntryData(const FPakEntry& Entry, TArray64<uint8>& OutData)
 			OutData.Reset();
 			return false;
 		}
+		FIOStats::Get().AddDiskRead(Entry.Size);
 		return true;
 	}
 
@@ -889,6 +886,7 @@ bool FPakReader::ReadEntryData(const FPakEntry& Entry, TArray64<uint8>& OutData)
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakReader: failed reading compression block %d at %lld"), BlockIndex, BlockOffset);
 			return false;
 		}
+		FIOStats::Get().AddDiskRead(BlockBytes);
 
 		// Uncompress into the output (the last block may decompress short).
 		const int32 UncompressedCapacity = (int32)FMath::Min<int64>(CompressedBlockSize, Entry.UncompressedSize - TotalWritten);
@@ -900,6 +898,7 @@ bool FPakReader::ReadEntryData(const FPakEntry& Entry, TArray64<uint8>& OutData)
 			OutData.Reset();
 			return false;
 		}
+		FIOStats::Get().AddDecompress(BlockBytes, UncompressedCapacity);
 		TotalWritten += UncompressedCapacity;
 	}
 

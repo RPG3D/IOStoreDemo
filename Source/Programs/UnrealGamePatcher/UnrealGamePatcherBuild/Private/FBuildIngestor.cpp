@@ -5,6 +5,7 @@
 #include "Formats/IoStore/FIoStoreReader.h"
 #include "Formats/Pak/FPakReader.h"
 #include "Hash/FPatcherHash.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -242,6 +243,10 @@ namespace UnrealGamePatcher
 						bChunkOk = false;
 						break;
 					}
+					if (Need > 0)
+					{
+						FIOStats::Get().AddDiskRead(Need);
+					}
 					BufBase = Off;
 				}
 
@@ -341,6 +346,10 @@ namespace UnrealGamePatcher
 		UE_LOG(LogUnrealGamePatcher, Display,
 			TEXT("FBuildIngestor: ingested %s -> %s (%d files, %d chunks, %lld chunk bytes)"),
 			*StagedDir, *IndexPath, OutResult.NumFiles, OutResult.NumChunks, OutResult.NumChunkBytesWritten);
+		// Publish-side I/O report: staged bytes read (incl. the SHA1 passes),
+		// chunk files written, compression volume.
+		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FBuildIngestor: ingest I/O %s"),
+			*FIOStats::Get().FormatSummary(*FString::Printf(TEXT("ingest %s"), *ContentVersion)));
 		return true;
 	}
 }

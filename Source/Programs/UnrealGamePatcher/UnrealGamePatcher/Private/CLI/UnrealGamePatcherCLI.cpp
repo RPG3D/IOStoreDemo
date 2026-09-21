@@ -8,6 +8,7 @@
 #include "Hash/FPatcherHashSelfTest.h"
 #include "Formats/Pak/FPakReader.h"
 #include "Formats/Pak/FPakWriter.h"
+#include "Formats/Pak/FPakRecovery.h"
 #include "State/FPatcherState.h"
 #include "Formats/Index/FIndexManifest.h"
 #include "Formats/Diff/FDiffAnalyzer.h"
@@ -1792,8 +1793,9 @@ namespace
 
 			if (Op == TEXT("O"))
 			{
-				// In-place overwrite: the new content must keep the same stored
-				// size and compression layout as the existing entry.
+				// CoW v2: "O" no longer overwrites payload in place (the writer
+				// has no overwrite path at all). The new generation is appended
+				// - dead ranges first, EOF fallback - which is size-agnostic.
 				const UnrealGamePatcher::FPakReader::FPakEntryLocation* Existing = Writer.FindEntry(PakEntryPath);
 				if (!Existing)
 				{
@@ -1806,27 +1808,16 @@ namespace
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("pakpatch: cannot read '%s'"), *SrcFile);
 					return ExitFailure;
 				}
-				if (Data.Num() != Existing->Entry.Size)
+				UnrealGamePatcher::FPakWriter::FEntryToWrite W;
+				W.Path = PakEntryPath;
+				W.CompressionMethodIndex = 0;
+				W.UncompressedSize = Data.Num();
+				W.Blocks.AddDefaulted();
+				W.Blocks[0].Bytes = MoveTemp(Data);
+				UnrealGamePatcher::FPakEntry OutEntry;
+				if (!Writer.AppendEntry(W, OutEntry))
 				{
-					UE_LOG(LogUnrealGamePatcher, Error, TEXT("pakpatch: overwrite of '%s' needs %lld bytes, source has %lld (in-place requires equal stored size)"),
-						*PakEntryPath, Existing->Entry.Size, Data.Num());
-					return ExitFailure;
-				}
-				// Build the new entry inheriting the existing compression layout.
-				UnrealGamePatcher::FPakEntry NewEntry = Existing->Entry;
-				NewEntry.UncompressedSize = Existing->Entry.UncompressedSize;
-				if (Existing->Entry.CompressionMethodIndex != 0)
-				{
-					UE_LOG(LogUnrealGamePatcher, Error, TEXT("pakpatch: in-place overwrite of compressed entry '%s' not supported by this harness"), *PakEntryPath);
-					return ExitFailure;
-				}
-				// Recompute the built-in hash (uncompressed: SHA1 of the data).
-				FSHA1 Hasher;
-				Hasher.Update(Data.GetData(), Data.Num());
-				Hasher.Final();
-				Hasher.GetHash(NewEntry.Hash);
-				if (!Writer.Overwrite(PakEntryPath, NewEntry, Data.GetData(), Data.Num()))
-				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("pakpatch: cannot re-append '%s'"), *PakEntryPath);
 					return ExitFailure;
 				}
 				++OpsApplied;
@@ -3674,6 +3665,125 @@ namespace
 			}
 		}
 
+		// --- Network pak delta at REALISTIC scale (review 2026-10-09 H1
+		// regression). The netdelta scenario above runs on the 939B fixture
+		// pak, which is a SINGLE CDC window: same and changed entries share
+		// that one chunk, so the fetch-before-same-check bug was invisible
+		// there (the same entries' "fetch" hit the cached window and the CoW
+		// patch looked healthy). This scenario crafts a multi-window pak and
+		// pins the CoW contract with I/O stats:
+		//   (a) a changed 100KB entry of a ~4.3MB pak must be written CoW
+		//       (append + index/footer), never a whole-container rewrite;
+		//   (b) the chunk store must be read ONLY for the changed entry's
+		//       covering windows (the old order fetched every SAME entry's
+		//       bytes - in network mode those windows are deliberately not
+		//       prefetched, so the patch aborted and silently fell back to a
+		//       full-container download + rebuild).
+		{
+			const FString InstallBig = FPaths::Combine(WorkDir, TEXT("installbigpak"));
+			// Own options (E's went out of scope with its block): HTTP-served
+			// CDN, trust mode - the same shape the netdelta scenario used.
+			FUpdateOptions BigOptions;
+			BigOptions.Downloader = &Http;
+			BigOptions.BaseUrl = BaseUrl;
+			BigOptions.ChunkCacheDir = FPaths::Combine(WorkDir, TEXT("bigpakcache"));
+			const FString BigPakName = TEXT("pakchunk1-Windows.pak");
+
+			// Deterministic pseudo-random bytes (xorshift64) - random content
+			// is what makes FastCDC split the pak into several windows (a
+			// structured pattern could fail to cut at all).
+			auto MakeRandomBytes = [](int64 Size, uint64 Seed)
+			{
+				TArray64<uint8> Bytes;
+				Bytes.SetNumUninitialized(Size);
+				uint64 S = Seed ? Seed : 0x9E3779B97F4A7C15ull;
+				for (int64 I = 0; I < Size; ++I)
+				{
+					S ^= S << 13; S ^= S >> 7; S ^= S << 17;
+					Bytes[(int32)I] = (uint8)(S >> 32);
+				}
+				return Bytes;
+			};
+			auto AddBigEntry = [&MakeRandomBytes](FPakWriter& W, const TCHAR* Path, int64 Size, uint64 Seed) -> bool
+			{
+				FPakWriter::FEntryToWrite Item;
+				Item.Path = Path;
+				FPakWriter::FStoredBlock Block;
+				Block.Bytes = MakeRandomBytes(Size, Seed);
+				Item.Blocks.Add(MoveTemp(Block));
+				FPakEntry Out;
+				return W.AppendEntry(Item, Out);
+			};
+
+			// v1: seed from the installed 939B fixture pak (2 entries) + the
+			// 100KB entry v2 will change + two 2MB entries that stay identical.
+			const FString BigV1 = FPaths::Combine(WorkDir, TEXT("bigpak_v1.pak"));
+			PF.CopyFile(*BigV1, *FPaths::Combine(Install, BigPakName));
+			{
+				FPakWriter W;
+				Check(W.Open(BigV1), TEXT("bigpak: v1 writer opens"));
+				Check(AddBigEntry(W, TEXT("Content/big_a.bin"), 100 << 10, 1), TEXT("bigpak: v1 entry a"));
+				Check(AddBigEntry(W, TEXT("Content/big_b.bin"), 2 << 20, 2), TEXT("bigpak: v1 entry b"));
+				Check(AddBigEntry(W, TEXT("Content/big_c.bin"), 2 << 20, 3), TEXT("bigpak: v1 entry c"));
+				Check(W.Commit(), TEXT("bigpak: v1 committed"));
+			}
+
+			const FString StagedV1 = FPaths::Combine(WorkDir, TEXT("bigpak_staged_v1"));
+			PF.CreateDirectoryTree(*StagedV1);
+			PF.CopyFile(*FPaths::Combine(StagedV1, BigPakName), *BigV1);
+			FIngestResult RBig1;
+			Check(FBuildIngestor::Ingest(StagedV1, TEXT("DownloadTest"), TEXT("1.2.0"), Cdn, RBig1),
+				TEXT("bigpak: 1.2.0 ingested"));
+
+			FUpdateStats SBig1;
+			Check(FUpdateOrchestrator::UpdateWithOptions(Cdn, TEXT("1.2.0"), InstallBig, true, BigOptions, SBig1),
+				TEXT("bigpak: baseline install over HTTP"));
+			Check(SBig1.NumFilesAdded == 1, TEXT("bigpak: single-file install"));
+
+			// v2: 'big_a' re-appended with DIFFERENT content (the CoW replace-
+			// generation path, same path); b/c and the two seed entries stay
+			// byte-identical - they are the SAME majority the buggy order
+			// would have tried to fetch.
+			const FString BigV2 = FPaths::Combine(WorkDir, TEXT("bigpak_v2.pak"));
+			PF.CopyFile(*BigV2, *BigV1);
+			{
+				FPakWriter W;
+				Check(W.Open(BigV2), TEXT("bigpak: v2 writer opens"));
+				Check(AddBigEntry(W, TEXT("Content/big_a.bin"), 100 << 10, 0xDEADBEEFull), TEXT("bigpak: v2 changed entry"));
+				Check(W.Commit(), TEXT("bigpak: v2 committed"));
+			}
+			const FString StagedV2 = FPaths::Combine(WorkDir, TEXT("bigpak_staged_v2"));
+			PF.CreateDirectoryTree(*StagedV2);
+			PF.CopyFile(*FPaths::Combine(StagedV2, BigPakName), *BigV2);
+			FIngestResult RBig2;
+			Check(FBuildIngestor::Ingest(StagedV2, TEXT("DownloadTest"), TEXT("1.3.0"), Cdn, RBig2),
+				TEXT("bigpak: 1.3.0 ingested"));
+
+			FUpdateStats SBig2;
+			Check(FUpdateOrchestrator::UpdateWithOptions(Cdn, TEXT("1.3.0"), InstallBig, true, BigOptions, SBig2),
+				TEXT("bigpak: container delta over HTTP succeeds"));
+			Check(SBig2.NumFilesChanged == 1 && SBig2.NumFilesSame == 0, TEXT("bigpak: exactly the pak changed"));
+			Check(SBig2.BytesWritten < (256 << 10),
+				TEXT("bigpak: CoW wrote only the changed entry + index/footer (no whole-container rewrite)"));
+			Check(SBig2.IOStats.ChunkLoads <= 3,
+				TEXT("bigpak: chunk-store loads limited to the changed entry's covering windows"));
+			{
+				FIndexManifest BigIdx2;
+				Check(FIndexManifestFile::Load(
+					FPaths::Combine(Cdn, TEXT("index"), TEXT("1.3.0"), TEXT("UnrealGamePatcher.index.json")), BigIdx2),
+					TEXT("bigpak: 1.3.0 index loads"));
+				Check(CheckContainerLogicallyEqual(BigIdx2, InstallBig, BigPakName),
+					TEXT("bigpak: patched pak logically equals 1.3.0"));
+			}
+			{
+				FUpdateStats SBig3;
+				Check(FUpdateOrchestrator::UpdateWithOptions(Cdn, TEXT("1.3.0"), InstallBig, true, BigOptions, SBig3),
+					TEXT("bigpak: rerun converges"));
+				Check(SBig3.NumFilesSame == 1 && SBig3.BytesWritten == 0 && SBig3.NumChunksFetched == 0,
+					TEXT("bigpak: rerun is a no-op"));
+			}
+		}
+
 		// --- F. Custom downloader backend drives the full update (6.6) -----
 		{
 			// A file-backed backend: ignores the transport, maps the URL path
@@ -4367,6 +4477,22 @@ namespace
 					});
 					Check(Backend.Pending.Num() > 0, TEXT("H5: segments issued before the cancel"));
 					Executor.Cancel(Handle);
+					// Review H2: the cancel must reach the TRANSPORT - the
+					// executor has to store the backend's cancel handle and
+					// hand it to CancelDownload. With the dropped-return-value
+					// bug this stayed bookkeeping-only and every pending
+					// request kept transferring to completion.
+					{
+						int32 NumTransportCanceled = 0;
+						for (const TSharedPtr<FDeferredBackend::FPending>& P : Backend.Pending)
+						{
+							if (P->bCanceled)
+							{
+								++NumTransportCanceled;
+							}
+						}
+						Check(NumTransportCanceled > 0, TEXT("H5: the in-flight transport request received CancelDownload"));
+					}
 					Backend.Flush(Cdn);
 
 					Check(DoneCount.load() == 1, TEXT("H5: OnDone fired exactly once after cancel"));
@@ -4607,6 +4733,7 @@ namespace
 		using namespace UnrealGamePatcher;
 
 		const FString WorkDir = GetTestWorkDir(TEXT("benchtest"));
+		ResetWorkDir(WorkDir);
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
 		const FString Cdn = FPaths::Combine(WorkDir, TEXT("cdn"));
 		PF.CreateDirectoryTree(*Cdn);
@@ -5035,28 +5162,20 @@ namespace
 			Check(S.NumFilesAdded == 4 && S.NumChunksFetched == Index.Chunks.Num(), TEXT("e2e: full install fetched every chunk"));
 		}
 
-		// Every file hash-matches the manifest and is structurally loadable.
+		// Engine-loadability of the installed containers. Whole-file hash
+		// equality is pinned by updatetest section 1 and the entry-hash
+		// cross-check by section 2 (same fixture) - here only the unique
+		// value is asserted, once.
 		{
-			bool bHashOk = true;
-			for (const TPair<FString, FIndexFileEntry>& Pair : Index.Files)
-			// Whole-file hash equality is pinned by updatetest section 1 on
-			// the same fixture - here the unique value is engine-loadability.
-
-			// The updated pak opens in engine format (entry-hash cross-check is
-			// pinned by updatetest section 2 on the same fixture).
-			{
-				FPakReader Reader;
-				Check(Reader.Open(FPaths::Combine(Install, TEXT("pakchunk1-Windows.pak"))) && Reader.ReadIndex(),
-					TEXT("e2e: updated pak loads (engine-format)"));
-			}
+			FPakReader Reader;
+			Check(Reader.Open(FPaths::Combine(Install, TEXT("pakchunk1-Windows.pak"))) && Reader.ReadIndex(),
+				TEXT("e2e: updated pak loads (engine-format)"));
 
 			// The updated IoStore container parses.
-			{
-				FIoStoreReader Io;
-				const FString Utoc = FPaths::Combine(Install, TEXT("pakchunk1-Windows.utoc"));
-				const FString Ucas = FPaths::Combine(Install, TEXT("pakchunk1-Windows.ucas"));
-				Check(Io.Open(Utoc, Ucas) && Io.GetChunkCount() > 0, TEXT("e2e: updated utoc/ucas parses (engine-format)"));
-			}
+			FIoStoreReader Io;
+			const FString Utoc = FPaths::Combine(Install, TEXT("pakchunk1-Windows.utoc"));
+			const FString Ucas = FPaths::Combine(Install, TEXT("pakchunk1-Windows.ucas"));
+			Check(Io.Open(Utoc, Ucas) && Io.GetChunkCount() > 0, TEXT("e2e: updated utoc/ucas parses (engine-format)"));
 		}
 
 		// --- Incremental delta (9.3) ----------------------------------------
@@ -5223,7 +5342,7 @@ namespace
 			return true;
 		};
 
-		// --- 1. v1 = the real staged pak; v2 = overwrite entry[0] in place + append.
+		// --- 1. v1 = the real staged pak; v2 = re-append entry[0] (CoW) + append.
 		const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
 		const FString SrcPak = FPaths::Combine(ProjectRoot, TEXT(".manifesttest"), TEXT("chunkinstall"), TEXT("Windows"), TEXT("1.0.0"), TEXT("pakchunk1"), TEXT("pakchunk1-Windows.pak"));
 		Check(PF.FileExists(*SrcPak), TEXT("inplace: source pak present"));
@@ -5234,8 +5353,7 @@ namespace
 
 		int64 Entry0Size = 0;
 		FString Entry0Path;
-		FPakEntry Entry0Copy;
-		TArray64<uint8> OverwriteBytes;
+		TArray64<uint8> ReappendBytes;
 		{
 			// Read the entry info first; the reader must be destroyed before
 			// the writer opens the file for writing (handle share flags).
@@ -5244,30 +5362,23 @@ namespace
 			Check(R.GetFiles().Num() >= 1, TEXT("inplace: source pak has entries"));
 			Entry0Path = R.GetFiles()[0].Path;
 			Entry0Size = R.GetFiles()[0].Entry.Size;
-			Entry0Copy = R.GetFiles()[0].Entry;
 		}
 		{
 			FPakWriter W;
 			Check(W.Open(V2Pak), TEXT("inplace: writer opens v2"));
-			OverwriteBytes.SetNumUninitialized(Entry0Size);
-			for (int32 I = 0; I < OverwriteBytes.Num(); ++I) { OverwriteBytes[I] = (uint8)(0xA0 + (I & 0x0F)); }
-			FPakEntry NewEntry = Entry0Copy;
-			{
-				const FString HashHex = Sha1HexOfBytes(OverwriteBytes);
-				for (int32 I = 0; I < 20; ++I)
-				{
-					const auto Nib = [](TCHAR C) -> uint8
-					{
-						if (C >= TCHAR('0') && C <= TCHAR('9')) { return C - TCHAR('0'); }
-						if (C >= TCHAR('a') && C <= TCHAR('f')) { return 10 + (C - TCHAR('a')); }
-						if (C >= TCHAR('A') && C <= TCHAR('F')) { return 10 + (C - TCHAR('A')); }
-						return 0;
-					};
-					NewEntry.Hash[I] = Nib(HashHex[I * 2]) * 16 + Nib(HashHex[I * 2 + 1]);
-				}
-			}
-			Check(W.Overwrite(Entry0Path, NewEntry, OverwriteBytes.GetData(), OverwriteBytes.Num()),
-				TEXT("inplace: v2 overwrites entry[0] in place"));
+			ReappendBytes.SetNumUninitialized(Entry0Size);
+			for (int32 I = 0; I < ReappendBytes.Num(); ++I) { ReappendBytes[I] = (uint8)(0xA0 + (I & 0x0F)); }
+			// CoW v2: the changed entry is re-appended (never overwritten in
+			// place); the writer computes the fresh built-in hash.
+			FPakWriter::FEntryToWrite Replaced;
+			Replaced.Path = Entry0Path;
+			Replaced.CompressionMethodIndex = 0;
+			Replaced.UncompressedSize = ReappendBytes.Num();
+			FPakWriter::FStoredBlock ReplacedBlock;
+			ReplacedBlock.Bytes = ReappendBytes; // copy: the test asserts on these bytes later
+			Replaced.Blocks.Add(MoveTemp(ReplacedBlock));
+			FPakEntry ReplacedOut;
+			Check(W.AppendEntry(Replaced, ReplacedOut), TEXT("inplace: v2 re-appends entry[0] (CoW)"));
 			FPakWriter::FEntryToWrite Appended;
 			Appended.Path = TEXT("patched.txt");
 			Appended.CompressionMethodIndex = 0;
@@ -5280,6 +5391,11 @@ namespace
 			FPakEntry OutEntry;
 			Check(W.AppendEntry(Appended, OutEntry), TEXT("inplace: v2 appends patched.txt"));
 			Check(W.Commit(), TEXT("inplace: v2 committed"));
+			// The commit pads to a 512-byte sector boundary and writes the
+			// footer as one single-sector (<=221B) write - the crash-model
+			// requirement. File size == FooterEnd, so the size itself pins it.
+			Check(IFileManager::Get().FileSize(*V2Pak) % 512 == 0,
+				TEXT("inplace: committed pak is 512-sector aligned (single-sector footer write)"));
 		}
 
 		// --- 2. Ingest both versions (entry metadata extracted by the ingestor).
@@ -5311,8 +5427,8 @@ namespace
 		const FString InstalledPak = FPaths::Combine(Install, TEXT("game.pak"));
 		Check(FInPlacePakPatcher::Patch(Remote, Cdn, TEXT("game.pak"), InstalledPak, PStats),
 			TEXT("inplace: in-place patch succeeds"));
-		Check(PStats.NumSame == 1 && PStats.NumOverwritten == 1 && PStats.NumAppended == 1,
-			TEXT("inplace: 1 same (zero movement), 1 overwritten, 1 appended"));
+		Check(PStats.NumSame == 1 && PStats.NumAppended == 2,
+			TEXT("inplace: 1 same (zero movement), 2 appended (CoW: changed entry re-append + new file)"));
 
 		// The exact byte count is pinned below by the orchestrator-path run
 		// (BytesWritten == 91); keep the ratio as log-only context.
@@ -5336,16 +5452,16 @@ namespace
 			FPakReader R;
 			Check(R.Open(InstalledPak) && R.ReadIndex(), TEXT("inplace: patched pak re-opens"));
 			Check(R.GetFiles().Num() == 3, TEXT("inplace: patched pak has 3 entries"));
-			bool bOverwriteOk = false, bAppendOk = false;
+			bool bReappendOk = false, bAppendOk = false;
 			for (const FPakReader::FPakEntryLocation& Loc : R.GetFiles())
 			{
 				if (Loc.Path == Entry0Path)
 				{
 					TArray64<uint8> Payload;
-					if (R.ReadEntryData(Loc.Entry, Payload) && Payload.Num() == OverwriteBytes.Num() &&
-						FMemory::Memcmp(Payload.GetData(), OverwriteBytes.GetData(), Payload.Num()) == 0)
+					if (R.ReadEntryData(Loc.Entry, Payload) && Payload.Num() == ReappendBytes.Num() &&
+						FMemory::Memcmp(Payload.GetData(), ReappendBytes.GetData(), Payload.Num()) == 0)
 					{
-						bOverwriteOk = true;
+						bReappendOk = true;
 					}
 				}
 				if (Loc.Path == TEXT("/patched.txt") || Loc.Path == TEXT("patched.txt"))
@@ -5358,7 +5474,7 @@ namespace
 					}
 				}
 			}
-			Check(bOverwriteOk, TEXT("inplace: overwritten entry has the new bytes"));
+			Check(bReappendOk, TEXT("inplace: re-appended (CoW) entry has the new bytes"));
 			Check(bAppendOk, TEXT("inplace: appended entry present with the expected bytes"));
 		}
 
@@ -5380,6 +5496,10 @@ namespace
 				FLocalTruthExtractor::HashWholeFile(InstalledPak, Sha1, Size);
 				Check(Sha1.Equals(Remote.Files[TEXT("game.pak")].SHA1, ESearchCase::IgnoreCase),
 					TEXT("inplace: update-flow result is byte-exact vs the target"));
+				// The patcher commits through FPakWriter, so the sector-alignment
+				// invariant holds for orchestrator-produced containers too.
+				Check(IFileManager::Get().FileSize(*InstalledPak) % 512 == 0,
+					TEXT("inplace: orchestrator-patched pak is 512-sector aligned"));
 			}
 		}
 
@@ -5403,9 +5523,10 @@ namespace
 		}
 
 		// --- 4c. Backfill: the next update places new entries INTO the dead
-		// ranges the previous patch recorded (superseded entry data + the old
-		// directory/footer) instead of growing the file. The state.json holes
-		// from section 4b's in-place patch are the backfill supply.
+		// ranges the previous patch left behind (superseded entry data + the
+		// old index/footer) instead of growing the file. CoW v2 recomputes the
+		// holes from the committed container, so the previous patch recorded
+		// nothing - the dead ranges are visible by construction.
 		{
 			// v3 = v2 + one more small appended entry.
 			const FString V3Pak = FPaths::Combine(WorkDir, TEXT("v3.pak"));
@@ -5460,6 +5581,178 @@ namespace
 				TEXT("backfill: rerun converges"));
 			Check(SBackfill2.NumFilesChanged == 0 && SBackfill2.BytesWritten == 0,
 				TEXT("backfill: rerun is a no-op"));
+		}
+
+		// --- 5. Crash recovery (CoW v2, ROADMAP §5.2): the recovery scanner
+		// is the WAL replay - truncate the torn tail back to the last valid
+		// footer (magic + version + geometry + index SHA1, not magic alone),
+		// then converge by replay.
+		{
+			auto AppendRaw = [&](const FString& Path, int64 Num, uint8 Fill) -> bool
+			{
+				IFileHandle* H = PF.OpenWrite(*Path, true, true);
+				if (!H) { return false; }
+				H->SeekFromEnd(0);
+				TArray64<uint8> Garbage;
+				Garbage.SetNumUninitialized(Num);
+				FMemory::Memset(Garbage.GetData(), Fill, Num);
+				const bool bWrote = H->Write(Garbage.GetData(), Num);
+				delete H;
+				return bWrote;
+			};
+			auto CorruptTail = [&](const FString& Path, int64 Num) -> bool
+			{
+				IFileHandle* H = PF.OpenWrite(*Path, true, true);
+				if (!H) { return false; }
+				H->SeekFromEnd(-Num);
+				TArray64<uint8> Garbage;
+				Garbage.SetNumUninitialized(Num);
+				FMemory::Memset(Garbage.GetData(), 0xBB, Num);
+				const bool bWrote = H->Write(Garbage.GetData(), Num);
+				delete H;
+				return bWrote;
+			};
+
+			const int64 V1Size = IFileManager::Get().FileSize(*V1Pak);
+			const FString V1Sha = FPatcherHash::FileSHA1Hex(V1Pak);
+
+			// 5a. Committed pak: Clean fast path, validated footer returned.
+			const FString RecClean = FPaths::Combine(WorkDir, TEXT("rec_clean.pak"));
+			PF.CopyFile(*RecClean, *V2Pak);
+			{
+				const FPakRecovery::FOutcome O = FPakRecovery::ScanAndRepair(RecClean);
+				Check(O.Result == FPakRecovery::EResult::Clean, TEXT("recovery: committed pak scans Clean"));
+				Check(O.Info.Version >= 10 && O.Info.IndexOffset > 0, TEXT("recovery: Clean carries the validated footer"));
+			}
+
+			// 5b. Torn tail (crash before the footer commit write): the v1
+			// footer below the garbage is still valid - truncate to it.
+			const FString RecTail = FPaths::Combine(WorkDir, TEXT("rec_tail.pak"));
+			PF.CopyFile(*RecTail, *V1Pak);
+			Check(AppendRaw(RecTail, 5000, 0xA5), TEXT("recovery: torn tail appended"));
+			{
+				const FPakRecovery::FOutcome O = FPakRecovery::ScanAndRepair(RecTail);
+				Check(O.Result == FPakRecovery::EResult::Truncated && O.TruncatedToBytes == V1Size,
+					TEXT("recovery: torn tail truncated to the last committed footer"));
+				Check(FPatcherHash::FileSHA1Hex(RecTail) == V1Sha,
+					TEXT("recovery: truncation restores the byte-exact v1"));
+			}
+
+			// 5b2. Multi-window scan: a >64KB pak whose torn tail spans several
+			// 64KB scan windows. Every other fixture here is tiny, so only this
+			// case exercises the backward window-walk loop - it must cross the
+			// window boundary and find the committed footer in an interior
+			// window.
+			const FString BigPak = FPaths::Combine(WorkDir, TEXT("rec_window.pak"));
+			PF.CopyFile(*BigPak, *V2Pak);
+			{
+				FPakWriter W;
+				Check(W.Open(BigPak), TEXT("recovery: multi-window writer opens"));
+				FPakWriter::FEntryToWrite Big;
+				Big.Path = TEXT("bigblob.bin");
+				Big.CompressionMethodIndex = 0;
+				Big.UncompressedSize = 200ll * 1024;
+				FPakWriter::FStoredBlock BigBlock;
+				BigBlock.Bytes.SetNumUninitialized(200ll * 1024);
+				for (int64 I = 0; I < BigBlock.Bytes.Num(); ++I)
+				{
+					BigBlock.Bytes[(int32)I] = (uint8)((I * 131 + (I >> 7)) & 0xFF);
+				}
+				Big.Blocks.Add(MoveTemp(BigBlock));
+				FPakEntry BigOut;
+				Check(W.AppendEntry(Big, BigOut) && W.Commit(), TEXT("recovery: 200KB entry committed"));
+			}
+			// Hash AFTER the writer handle is closed: the writer holds WRITE
+			// access with FILE_SHARE_READ only, and OpenRead (which does not
+			// share WRITE by default) then fails with a sharing violation -
+			// FileSHA1Hex would silently return an empty string.
+			const int64 BigCommitted = IFileManager::Get().FileSize(*BigPak);
+			const FString BigSha = FPatcherHash::FileSHA1Hex(BigPak);
+			Check(BigCommitted > 64 * 1024, TEXT("recovery: multi-window fixture exceeds one scan window"));
+			Check(!BigSha.IsEmpty(), TEXT("recovery: fixture hash captured"));
+			Check(AppendRaw(BigPak, 150 * 1024, 0xA5), TEXT("recovery: 150KB torn tail appended"));
+			{
+				const FPakRecovery::FOutcome O = FPakRecovery::ScanAndRepair(BigPak);
+				Check(O.Result == FPakRecovery::EResult::Truncated && O.TruncatedToBytes == BigCommitted,
+					TEXT("recovery: multi-window walk truncates to the committed footer"));
+				Check(FPatcherHash::FileSHA1Hex(BigPak) == BigSha,
+					TEXT("recovery: multi-window truncation is byte-exact"));
+			}
+
+			// 5c. Torn footer (crash during the sector-atomic footer write):
+			// the v2 footer is unreadable, the v1 footer below still is.
+			const FString RecFooter = FPaths::Combine(WorkDir, TEXT("rec_footer.pak"));
+			PF.CopyFile(*RecFooter, *V2Pak);
+			Check(CorruptTail(RecFooter, 256), TEXT("recovery: footer corrupted"));
+			{
+				const FPakRecovery::FOutcome O = FPakRecovery::ScanAndRepair(RecFooter);
+				Check(O.Result == FPakRecovery::EResult::Truncated && O.TruncatedToBytes == V1Size,
+					TEXT("recovery: torn footer falls back to the previous generation"));
+				Check(FPatcherHash::FileSHA1Hex(RecFooter) == V1Sha,
+					TEXT("recovery: previous generation is byte-exact"));
+			}
+
+			// 5d. A footer-SHAPED byte string inside an entry payload must not
+			// be mistaken for a footer: magic + version + plausible geometry
+			// all present, only the index SHA1 gives it away.
+			const FString RecFake = FPaths::Combine(WorkDir, TEXT("rec_fake.pak"));
+			PF.CopyFile(*RecFake, *V1Pak);
+			{
+				TArray64<uint8> FakeFooter;
+				auto Le32 = [&FakeFooter](uint32 V) { FakeFooter.Append((const uint8*)&V, 4); };
+				auto Le64 = [&FakeFooter](uint64 V) { FakeFooter.Append((const uint8*)&V, 8); };
+				FakeFooter.AddZeroed(16);  // EncryptionKeyGuid
+				FakeFooter.Add(0);         // bEncryptedIndex
+				Le32(PakFileMagic);        // magic
+				Le32(12);                  // version
+				Le64(0);                   // IndexOffset (claims the file start)
+				Le64(1024);                // IndexSize
+				FakeFooter.AddZeroed(20);  // IndexHash (will NOT match)
+				FakeFooter.AddZeroed(160); // CompressionMethods
+
+				FPakWriter W;
+				Check(W.Open(RecFake), TEXT("recovery: fake-footer pak opens"));
+				FPakWriter::FEntryToWrite FE;
+				FE.Path = TEXT("fakefooter.bin");
+				FPakWriter::FStoredBlock FB;
+				FB.Bytes = FakeFooter;
+				FB.Bytes.Append(FakeFooter); // payload carries 3 copies of the fake
+				FB.Bytes.Append(FakeFooter);
+				FE.UncompressedSize = FB.Bytes.Num();
+				FE.Blocks.Add(MoveTemp(FB));
+				FPakEntry Out;
+				Check(W.AppendEntry(FE, Out) && W.Commit(), TEXT("recovery: fake-footer entry committed"));
+			}
+			Check(CorruptTail(RecFake, 256), TEXT("recovery: real footer corrupted"));
+			{
+				const FPakRecovery::FOutcome O = FPakRecovery::ScanAndRepair(RecFake);
+				Check(O.Result == FPakRecovery::EResult::Truncated && O.TruncatedToBytes == V1Size,
+					TEXT("recovery: footer-shaped payload bytes are rejected (index SHA1 is the filter)"));
+				Check(FPatcherHash::FileSHA1Hex(RecFake) == V1Sha,
+					TEXT("recovery: the real previous generation survives"));
+			}
+
+			// 5e. No valid footer anywhere: Unrecoverable (the orchestrator
+			// deletes such files so the diff re-fetches them whole).
+			const FString RecDead = FPaths::Combine(WorkDir, TEXT("rec_dead.pak"));
+			Check(AppendRaw(RecDead, 8192, 0x00), TEXT("recovery: garbage file written"));
+			{
+				const FPakRecovery::FOutcome O = FPakRecovery::ScanAndRepair(RecDead);
+				Check(O.Result == FPakRecovery::EResult::Unrecoverable, TEXT("recovery: garbage file is Unrecoverable"));
+			}
+
+			// 5f. End to end: a torn tail on the INSTALLED pak is repaired by
+			// the update's startup scan, and the run converges with zero
+			// writes to the identical committed bytes.
+			const FString InstalledV3Sha = FPatcherHash::FileSHA1Hex(InstalledPak);
+			Check(AppendRaw(InstalledPak, 3000, 0xC3), TEXT("recovery: torn tail appended to the installed pak"));
+			FUpdateStats SRec;
+			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.2"), Install, true, SRec),
+				TEXT("recovery: update runs after the torn tail"));
+			Check(SRec.NumFilesChanged == 0 && SRec.BytesWritten == 0,
+				TEXT("recovery: replay converges with zero writes"));
+			Check(FPatcherHash::FileSHA1Hex(InstalledPak) == InstalledV3Sha,
+				TEXT("recovery: the installed pak is byte-identical to the committed v3"));
 		}
 
 		// --- Compressed multi-block entry: write / read / hash / ingest / update
@@ -5692,6 +5985,180 @@ namespace
 					FMemory::Memcmp(Data.GetData(), ContentB.GetData(), TotalBytes) == 0,
 					TEXT("zcomp: the added entry is COMPRESSED on disk and decodes correctly"));
 			}
+		}
+
+		// --- 6. Fail-after-pak-patch (ROADMAP §5.3): the footer flip is the
+		// commit point - once it lands, the container IS the new version even
+		// if the update fails afterwards. The orchestrator must not back up or
+		// roll back the .pak (the container is its own WAL): no .pak backup on
+		// disk, the patched container survives the rollback intact, and the
+		// rerun converges without re-writing container bytes.
+		FString IndexV13;
+		FIndexManifest Remote13;
+		{
+			auto ReadStatus = [&]() -> ETransactionStatus
+			{
+				FPatcherState S;
+				if (!FPatcherStateFile::Load(Paths::GetStatePath(Install), S))
+				{
+					return ETransactionStatus::None;
+				}
+				return S.Transaction.Status;
+			};
+
+			// 1.3 = v2 + backfilled.txt (so the entry set is a superset of the
+			// installed 1.2 - no deletions) + one more appended entry. A
+			// version that REMOVES a pak entry takes the rebuild path instead
+			// (section 8); here the in-place CoW path is the one under test.
+			const FString V4Pak = FPaths::Combine(WorkDir, TEXT("v4.pak"));
+			PF.CopyFile(*V4Pak, *V2Pak);
+			{
+				FPakWriter W;
+				Check(W.Open(V4Pak), TEXT("failpak: v4 writer opens"));
+				FPakWriter::FEntryToWrite Backfill;
+				Backfill.Path = TEXT("backfilled.txt");
+				Backfill.CompressionMethodIndex = 0;
+				Backfill.UncompressedSize = 12;
+				FPakWriter::FStoredBlock BackfillBlock;
+				BackfillBlock.Bytes.SetNumUninitialized(12);
+				FMemory::Memcpy(BackfillBlock.Bytes.GetData(), "backfilled!!", 12);
+				Backfill.Blocks.Add(MoveTemp(BackfillBlock));
+				FPakEntry BackfillOut;
+				Check(W.AppendEntry(Backfill, BackfillOut), TEXT("failpak: backfill entry appended"));
+				FPakWriter::FEntryToWrite Extra;
+				Extra.Path = TEXT("failtest.txt");
+				Extra.CompressionMethodIndex = 0;
+				Extra.UncompressedSize = 8;
+				FPakWriter::FStoredBlock Block;
+				Block.Bytes.SetNumUninitialized(8);
+				FMemory::Memcpy(Block.Bytes.GetData(), "failtest", 8);
+				Extra.Blocks.Add(MoveTemp(Block));
+				FPakEntry Out;
+				Check(W.AppendEntry(Extra, Out) && W.Commit(), TEXT("failpak: v4 committed"));
+			}
+			Check(CraftAndIngest(TEXT("1.3"), V4Pak, TEXT("game.pak"), IndexV13), TEXT("failpak: ingest v4 as 1.3"));
+			Check(FIndexManifestFile::Load(IndexV13, Remote13), TEXT("failpak: 1.3 index loads"));
+
+			FUpdateOrchestrator::TestFailAfterWrites = 1;
+			FUpdateStats SFail;
+			const bool bFailed = !FUpdateOrchestrator::Update(Cdn, TEXT("1.3"), Install, true, SFail);
+			FUpdateOrchestrator::TestFailAfterWrites = 0;
+			Check(bFailed, TEXT("failpak: injected failure after the pak patch makes update fail"));
+			Check(ReadStatus() == ETransactionStatus::RolledBack, TEXT("failpak: sidecar reports rolled-back"));
+			{
+				// No .pak ever lands in the backup dir: the container is its
+				// own rollback mechanism (footer commit + recovery scanner).
+				bool bPakBackup = false;
+				const FString BackupDir = FPaths::Combine(Install, TEXT(".ugp"), TEXT("backup"));
+				TArray<FString> BackupFiles;
+				PF.FindFilesRecursively(BackupFiles, *BackupDir, TEXT("*.pak"));
+				if (PF.DirectoryExists(*BackupDir))
+				{
+					bPakBackup = BackupFiles.Num() > 0;
+				}
+				Check(!bPakBackup, TEXT("failpak: the patched pak was never backed up"));
+			}
+			{
+				// The CoW commit survived the rollback: the container on disk
+				// already carries the 1.3 entry set and parses cleanly.
+				FPakReader R;
+				Check(R.Open(InstalledPak) && R.ReadIndex(), TEXT("failpak: patched container survived the rollback"));
+				bool bHasNew = false;
+				for (const FPakReader::FPakEntryLocation& L : R.GetFiles())
+				{
+					if (L.Path.Contains(TEXT("failtest.txt"))) { bHasNew = true; }
+				}
+				Check(bHasNew, TEXT("failpak: the committed entry is in the surviving container"));
+			}
+
+			// Rerun (as the next launch): the disk container already matches
+			// the 1.3 metadata, so the rerun converges with zero writes and
+			// the sidecar commits the new version.
+			FUpdateStats SRetry;
+			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.3"), Install, true, SRetry), TEXT("failpak: rerun after rollback succeeds"));
+			Check(SRetry.BytesWritten == 0, TEXT("failpak: rerun re-writes nothing (container already committed)"));
+			Check(CheckContainerLogicallyEqual(Remote13, Install, TEXT("game.pak")), TEXT("failpak: container logically equal to 1.3"));
+			Check(ReadStatus() == ETransactionStatus::Committed, TEXT("failpak: sidecar committed after the rerun"));
+		}
+
+		// --- 7. Unrecoverable container: no valid footer anywhere, so the
+		// scanner reports Unrecoverable, the orchestrator deletes the pak for
+		// the whole-file rebuild, and the rebuilt file is byte-identical to
+		// the CDN copy.
+		{
+			// A zero-length file is the degenerate Unrecoverable case (the
+			// real-world "container zeroed by a failing disk / crashed writer").
+			IFileHandle* Truncate = PF.OpenWrite(*InstalledPak); // CREATE_ALWAYS: 0 bytes
+			Check(Truncate != nullptr, TEXT("zeropak: opened for truncation"));
+			delete Truncate;
+			Check(IFileManager::Get().FileSize(*InstalledPak) == 0, TEXT("zeropak: container is zero bytes"));
+
+			FUpdateStats SZero;
+			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.3"), Install, true, SZero), TEXT("zeropak: update over a zeroed pak succeeds"));
+			Check(SZero.NumFilesAdded + SZero.NumFilesChanged == 1, TEXT("zeropak: exactly the pak rebuilt"));
+			Check(SZero.BytesWritten == Remote13.Files[TEXT("game.pak")].Size, TEXT("zeropak: the whole container was re-written"));
+			Check(FPatcherHash::FileSHA1Hex(InstalledPak) == Remote13.Files[TEXT("game.pak")].SHA1,
+				TEXT("zeropak: rebuilt container is byte-identical to the CDN copy"));
+
+			// Convergence: the rerun is a no-op.
+			FUpdateStats SZero2;
+			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.3"), Install, true, SZero2), TEXT("zeropak: rerun converges"));
+			Check(SZero2.NumFilesChanged == 0 && SZero2.BytesWritten == 0, TEXT("zeropak: rerun is a no-op"));
+		}
+
+		// --- 8. Removed pak entry: the CoW append path cannot express a
+		// deletion (the re-committed index would still carry the stale
+		// entry), so the patcher must refuse and the orchestrator must take
+		// the whole-file rebuild - otherwise the container never converges to
+		// the target metadata while every update reports success.
+		{
+			// 1.4 = v2 + backfilled.txt only: vs the installed 1.3 (v2 +
+			// backfilled.txt + failtest.txt) the failtest entry is GONE.
+			const FString V5Pak = FPaths::Combine(WorkDir, TEXT("v5.pak"));
+			PF.CopyFile(*V5Pak, *V2Pak);
+			{
+				FPakWriter W;
+				Check(W.Open(V5Pak), TEXT("entryremove: v5 writer opens"));
+				FPakWriter::FEntryToWrite Backfill;
+				Backfill.Path = TEXT("backfilled.txt");
+				Backfill.CompressionMethodIndex = 0;
+				Backfill.UncompressedSize = 12;
+				FPakWriter::FStoredBlock BackfillBlock;
+				BackfillBlock.Bytes.SetNumUninitialized(12);
+				FMemory::Memcpy(BackfillBlock.Bytes.GetData(), "backfilled!!", 12);
+				Backfill.Blocks.Add(MoveTemp(BackfillBlock));
+				FPakEntry Out;
+				Check(W.AppendEntry(Backfill, Out) && W.Commit(), TEXT("entryremove: v5 committed"));
+			}
+			FString IndexV14;
+			Check(CraftAndIngest(TEXT("1.4"), V5Pak, TEXT("game.pak"), IndexV14), TEXT("entryremove: ingest v5 as 1.4"));
+			FIndexManifest Remote14;
+			Check(FIndexManifestFile::Load(IndexV14, Remote14), TEXT("entryremove: 1.4 index loads"));
+
+			FUpdateStats SRemoveEntry;
+			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.4"), Install, true, SRemoveEntry), TEXT("entryremove: removal update succeeds"));
+			Check(SRemoveEntry.NumFilesChanged == 1, TEXT("entryremove: exactly the pak changed"));
+			// The rebuild rewrites the whole container; the CoW path would
+			// have written only the changed bytes (here: none).
+			Check(SRemoveEntry.BytesWritten == Remote14.Files[TEXT("game.pak")].Size,
+				TEXT("entryremove: the whole container was rebuilt (CoW cannot remove entries)"));
+			Check(CheckContainerLogicallyEqual(Remote14, Install, TEXT("game.pak")),
+				TEXT("entryremove: container logically equal to 1.4"));
+			{
+				FPakReader R;
+				Check(R.Open(InstalledPak) && R.ReadIndex(), TEXT("entryremove: container opens"));
+				bool bHasRemoved = false;
+				for (const FPakReader::FPakEntryLocation& L : R.GetFiles())
+				{
+					if (L.Path.Contains(TEXT("failtest.txt"))) { bHasRemoved = true; }
+				}
+				Check(!bHasRemoved, TEXT("entryremove: the removed entry is gone from the live index"));
+			}
+
+			// Convergence: the rerun is a no-op.
+			FUpdateStats SRemoveEntry2;
+			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.4"), Install, true, SRemoveEntry2), TEXT("entryremove: rerun converges"));
+			Check(SRemoveEntry2.NumFilesChanged == 0 && SRemoveEntry2.BytesWritten == 0, TEXT("entryremove: rerun is a no-op"));
 		}
 
 				if (bAllPassed)

@@ -2,6 +2,7 @@
 
 #include "Formats/IoStore/FIoStoreWriter.h"
 #include "Hash/FPatcherHash.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -96,16 +97,17 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot open '%s'"), *UtocPath);
 			return false;
 		}
-		const int64 UtocSize = Handle->Size();
-		OriginalUcasSize = IFileManager::Get().FileSize(*UcasPath);
-		TArray<uint8> Toc;
-		Toc.SetNumUninitialized(UtocSize);
-		if (!Handle->Read(Toc.GetData(), UtocSize))
-		{
-			delete Handle;
-			return false;
-		}
+	const int64 UtocSize = Handle->Size();
+	OriginalUcasSize = IFileManager::Get().FileSize(*UcasPath);
+	TArray<uint8> Toc;
+	Toc.SetNumUninitialized(UtocSize);
+	if (!Handle->Read(Toc.GetData(), UtocSize))
+	{
 		delete Handle;
+		return false;
+	}
+	delete Handle;
+	FIOStats::Get().AddDiskRead(UtocSize);
 
 		const uint8* P = Toc.GetData();
 		if (UtocSize < HeaderSize || FMemory::Memcmp(P, TocMagic, 16) != 0)
@@ -479,13 +481,14 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot append to '%s'"), *UcasPath);
 				return false;
 			}
-			const bool bOk = Ucas->Write(AppendedUcasData.GetData(), AppendedUcasData.Num());
-			delete Ucas;
-			if (!bOk)
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: failed appending to '%s'"), *UcasPath);
-				return false;
-			}
+		const bool bOk = Ucas->Write(AppendedUcasData.GetData(), AppendedUcasData.Num());
+		delete Ucas;
+		if (!bOk)
+		{
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: failed appending to '%s'"), *UcasPath);
+			return false;
+		}
+		FIOStats::Get().AddDiskWrite(AppendedUcasData.Num());
 		}
 
 		// 1b. Backfilled blocks: pwrite into the recorded dead regions (the
@@ -498,14 +501,15 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot open '%s' for backfill"), *UcasPath);
 				return false;
 			}
-			const bool bWrote = W.Data.Num() == 0 ||
-				(Ucas->Seek(W.PhysicalOffset) && Ucas->Write(W.Data.GetData(), W.Data.Num()));
-			delete Ucas;
-			if (!bWrote)
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: failed backfilling '%s' at %lld"), *UcasPath, W.PhysicalOffset);
-				return false;
-			}
+		const bool bWrote = W.Data.Num() == 0 ||
+			(Ucas->Seek(W.PhysicalOffset) && Ucas->Write(W.Data.GetData(), W.Data.Num()));
+		delete Ucas;
+		if (!bWrote)
+		{
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: failed backfilling '%s' at %lld"), *UcasPath, W.PhysicalOffset);
+			return false;
+		}
+		FIOStats::Get().AddDiskWrite(W.Data.Num());
 		}
 
 		// 2. Rebuild the .utoc completely.
@@ -596,12 +600,13 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot create dir for '%s'"), *OutUtocPath);
 			return false;
 		}
-		const FString TempPath = OutUtocPath + TEXT(".tmp");
-		if (!FFileHelper::SaveArrayToFile(Out, *TempPath))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot write '%s'"), *TempPath);
-			return false;
-		}
+	const FString TempPath = OutUtocPath + TEXT(".tmp");
+	if (!FFileHelper::SaveArrayToFile(Out, *TempPath))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot write '%s'"), *TempPath);
+		return false;
+	}
+	FIOStats::Get().AddDiskWrite(Out.Num());
 		if (PF.FileExists(*OutUtocPath))
 		{
 			PF.DeleteFile(*OutUtocPath);

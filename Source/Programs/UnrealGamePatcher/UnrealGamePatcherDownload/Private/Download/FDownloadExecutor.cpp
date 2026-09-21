@@ -435,7 +435,14 @@ namespace UnrealGamePatcher
 			const bool bWholeResource = S.bWholeFile || (S.Offset == 0 && S.Size >= J.Total);
 			const int64 WireSize = bWholeResource ? -1 : S.Size;
 			TSharedRef<FExecutorState> State = SharedThis(this);
-			Backend.DownloadRangeAsync(J.Job.Url, S.Offset, WireSize,
+			// The handle MUST be stored: Cancel() and ~FDownloadExecutor abort
+			// in-flight requests through it. Dropping the return value (review
+			// 2026-10-09 H2) left S.CancelHandle forever null, so "cancel" was
+			// bookkeeping-only and the HTTP transfer ran to completion.
+			// (Safe even for the synchronous fallback backends, which fire
+			// OnDone inline before the assignment lands - the settle does not
+			// read the handle, and a completed request ignores CancelDownload.)
+			S.CancelHandle = Backend.DownloadRangeAsync(J.Job.Url, S.Offset, WireSize,
 				[State, JobPtr, SegIndex](bool bOk, const TArray64<uint8>& Data, const FString& Error)
 			{
 				// Engine HTTP thread, serialized with every other settle. The

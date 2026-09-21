@@ -3,6 +3,7 @@
 #include "Formats/IoStore/FIoStoreReader.h"
 #include "Hash/FPatcherHash.h"
 #include "IO/IoHash.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -95,6 +96,7 @@ namespace UnrealGamePatcher
 			return false;
 		}
 		delete UtocHandle;
+		FIOStats::Get().AddDiskRead(UtocSize);
 
 		const uint8* P = Toc.GetData();
 		if (UtocSize < HeaderSize || FMemory::Memcmp(P, TocMagic, 16) != 0)
@@ -281,6 +283,7 @@ namespace UnrealGamePatcher
 		{
 			return false;
 		}
+		FIOStats::Get().AddDiskRead(Size);
 		OutData.SetNumUninitialized(Size);
 		return Size == 0 || (UcasHandle->Seek(Offset) && UcasHandle->Read(OutData.GetData(), Size));
 	}
@@ -329,6 +332,7 @@ namespace UnrealGamePatcher
 						*CompressionMethods[B.MethodIndex].Name, *C.Id, I);
 					return false;
 				}
+				FIOStats::Get().AddDecompress(B.CompressedSize, B.UncompressedSize);
 				OutData.Append(Uncompressed);
 			}
 		}
@@ -345,6 +349,7 @@ namespace UnrealGamePatcher
 		// never handed back as success (fulfills the header contract).
 		{
 			const FString HashHex = FPatcherHash::FIoHashToHex(FIoHash::HashBuffer(OutData.GetData(), OutData.Num()));
+			FIOStats::Get().AddHashed(OutData.Num());
 			if (!C.Hash.Equals(HashHex, ESearchCase::IgnoreCase))
 			{
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreReader: chunk '%s' meta hash mismatch (utoc %s, data %s)"),
@@ -429,6 +434,7 @@ namespace UnrealGamePatcher
 						*CompressionMethods[B.MethodIndex].Name, *C.Id, I);
 					return false;
 				}
+				FIOStats::Get().AddDecompress(B.CompressedSize, B.UncompressedSize);
 				OutData.Append(Uncompressed);
 			}
 			Cursor += B.CompressedSize;
@@ -444,6 +450,7 @@ namespace UnrealGamePatcher
 		// Same contract as ReadChunk: a decoded-but-corrupt chunk is a FAILURE.
 		{
 			const FString HashHex = FPatcherHash::FIoHashToHex(FIoHash::HashBuffer(OutData.GetData(), OutData.Num()));
+			FIOStats::Get().AddHashed(OutData.Num());
 			if (!C.Hash.Equals(HashHex, ESearchCase::IgnoreCase))
 			{
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreReader: chunk '%s' meta hash mismatch (utoc %s, data %s)"),

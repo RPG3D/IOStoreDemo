@@ -14,13 +14,13 @@ public class UnrealGamePatcherCore : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"Core",
-				"CoreUObject",
-				"ApplicationCore",
-				"Json",
-				// Download layer: FDownloadManager / orchestrator drive the
-				// generic download component (transport primitive + executor).
-				"UnrealGamePatcherDownload",
+			"Core",
+			"CoreUObject",
+			"ApplicationCore",
+			"Json",
+			// Download layer: FDownloadManager / orchestrator drive the
+			// generic download component (transport primitive + executor).
+			"UnrealGamePatcherDownload",
 			}
 		);
 	}

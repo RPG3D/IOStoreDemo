@@ -18,7 +18,7 @@ REM                      [-Platform Win64] [-Config Shipping] [-CloudDir <out>]
 REM                      [-BuildRoot <staged build>] [-AppLaunch <rel exe>]
 REM
 REM   -Version    build version (required; also used for BuildVersion + default out dir)
-REM   -AppName    BPS app name (default = .uproject name; manifest is <AppName><Version>.manifest)
+REM   -AppName    app id written into the self-designed index (default = .uproject name)
 REM   -Platform   target platform (default Win64)
 REM   -Config     client config (default Development)
 REM   -CloudDir   CDN root output (default <project>\Saved\UGP_Package\CloudDir -

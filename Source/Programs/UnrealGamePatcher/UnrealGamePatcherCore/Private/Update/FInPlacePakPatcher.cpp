@@ -5,6 +5,7 @@
 #include "Formats/Pak/FPakReader.h"
 #include "Formats/Pak/FPakWriter.h"
 #include "Hash/FPatcherHash.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -76,6 +77,91 @@ namespace UnrealGamePatcher
 			}
 			return OutBytes.Num() == Size;
 		}
+
+		/**
+		 * Placement holes of the COMMITTED container: the complement of every
+		 * byte span the committed footer references - each entry's payload
+		 * header + stored bytes, and the index/footer region at the tail
+		 * (ROADMAP §5.3: the hole list is recomputed from the container on
+		 * every patch; sidecar bookkeeping is gone).
+		 *
+		 * This makes the core invariant structural: a superseded entry is
+		 * still referenced by the current footer, so its bytes are NOT in
+		 * this complement and cannot be reused this generation - "mark dead"
+		 * and "reuse the hole" are separated by one index commit for free.
+		 *
+		 * Returns false when an entry's span does not fit inside the file
+		 * (corrupt index geometry - the caller falls back to the rebuild).
+		 * Comparisons are subtraction-ordered so untrusted int64 fields
+		 * cannot overflow.
+		 */
+		bool ComputePlacementHoles(
+			const FString& PakId,
+			uint32 Version,
+			int64 FileEof,
+			int64 IndexOffset,
+			const TArray<FPakEntry>& Entries,
+			TArray<FHole>& OutHoles)
+		{
+			struct FSpan { int64 Start; int64 End; };
+			TArray<FSpan> Spans;
+			Spans.Reserve(Entries.Num() + 1);
+
+			for (const FPakEntry& E : Entries)
+			{
+				if (E.Offset < 0 || E.Size < 0)
+				{
+					return false;
+				}
+				const int64 HeaderSize = FPakReader::GetSerializedEntrySize(E, Version);
+				if (E.Offset > FileEof || E.Size > FileEof - E.Offset || HeaderSize > FileEof - E.Offset - E.Size)
+				{
+					return false;
+				}
+				FSpan S;
+				S.Start = E.Offset;
+				S.End = E.Offset + HeaderSize + E.Size;
+				Spans.Add(S);
+			}
+			if (IndexOffset < 0 || IndexOffset > FileEof)
+			{
+				return false;
+			}
+			FSpan IndexSpan;
+			IndexSpan.Start = IndexOffset;
+			IndexSpan.End = FileEof;
+			Spans.Add(IndexSpan);
+
+			Spans.Sort([](const FSpan& A, const FSpan& B) { return A.Start < B.Start; });
+
+			OutHoles.Reset();
+			int64 Cursor = 0;
+			for (const FSpan& S : Spans)
+			{
+				const int64 Start = FMath::Max(S.Start, Cursor);
+				if (S.Start > Cursor)
+				{
+					FHole H;
+					H.File = PakId;
+					H.Offset = Cursor;
+					H.Size = S.Start - Cursor;
+					OutHoles.Add(H);
+				}
+				if (S.End > Cursor)
+				{
+					Cursor = S.End;
+				}
+			}
+			if (FileEof > Cursor)
+			{
+				FHole H;
+				H.File = PakId;
+				H.Offset = Cursor;
+				H.Size = FileEof - Cursor;
+				OutHoles.Add(H);
+			}
+			return true;
+		}
 	}
 
 	bool FInPlacePakPatcher::Patch(
@@ -84,10 +170,10 @@ namespace UnrealGamePatcher
 		const FString& PakId,
 		const FString& LocalPakPath,
 		FInPlacePakStats& OutStats,
-		bool bVerifyLocalData,
-		const TArray<FHole>& InAvailableHoles)
+		bool bVerifyLocalData)
 	{
 		OutStats = FInPlacePakStats();
+		const FIOStatsSnapshot IOStart = FIOStats::Get().Snapshot();
 
 		const FIndexFileEntry* RemoteFile = Remote.Files.Find(PakId);
 		if (!RemoteFile || RemoteFile->PakEntries.Num() == 0)
@@ -96,9 +182,21 @@ namespace UnrealGamePatcher
 			return false;
 		}
 
+		// CoW v2 gates: rewriting the index+footer breaks encryption and
+		// invalidates signatures, so neither container kind is patched here -
+		// the caller falls back to the whole-file rebuild.
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		if (PlatformFile.FileExists(*(LocalPakPath + TEXT(".sig"))) ||
+			PlatformFile.FileExists(*(FPaths::ChangeExtension(LocalPakPath, TEXT("sig")))))
+		{
+			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FInPlacePakPatcher: '%s' is signed - falling back to the whole-file rebuild"), *PakId);
+			return false;
+		}
+
 		// Local entries by path. The reader must be destroyed before the
 		// writer opens the file (the read handle's share flags would block it).
 		TMap<FString, FPakEntry> LocalByPath;
+		TArray<FPakEntry> LocalSpans;
 		int64 OldIndexOffset = -1;
 		uint32 OldVersion = 0;
 		const int64 OldEof = IFileManager::Get().FileSize(*LocalPakPath);
@@ -109,11 +207,17 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: cannot read local pak '%s'"), *LocalPakPath);
 				return false;
 			}
-			// Snapshot for hole accounting (the reader dies with this block).
+			if (LocalReader.GetInfo().bEncryptedIndex)
+			{
+				UE_LOG(LogUnrealGamePatcher, Display, TEXT("FInPlacePakPatcher: '%s' has an encrypted index - falling back to the whole-file rebuild"), *PakId);
+				return false;
+			}
+			// Snapshot for hole recomputation (the reader dies with this block).
 			OldIndexOffset = LocalReader.GetInfo().IndexOffset;
 			OldVersion = LocalReader.GetInfo().Version;
 			for (const FPakReader::FPakEntryLocation& Loc : LocalReader.GetFiles())
 			{
+				LocalSpans.Add(Loc.Entry);
 				FPakEntry E = Loc.Entry;
 				uint8 Hash[20] = { 0 };
 				if (bVerifyLocalData)
@@ -147,38 +251,55 @@ namespace UnrealGamePatcher
 			}
 		}
 
-		// Compressed entries whose bytes changed cannot be re-stored in
-		// place: the index carries no block table, so neither the overwrite
-		// layout nor a raw re-store can represent changed compressed bytes
-		// (a raw re-store would decode to garbage). Bail out of the in-place
-		// path entirely - the whole-file rebuild handles them correctly, and
-		// its SameChunks reuse keeps the actual wire delta to the changed
-		// chunks.
+		// Entries present locally but absent from the remote metadata (a pak
+		// entry DELETED between versions) cannot be expressed by the append
+		// path: the re-committed index would still carry the stale entry, the
+		// container would never match the target metadata, and every rerun
+		// would report success while diverging. Bail to the whole-file
+		// rebuild, which reproduces exactly the remote entry set.
+		{
+			TSet<FString> RemotePaths;
+			for (const FIndexPakEntry& RemoteEntry : RemoteFile->PakEntries)
+			{
+				RemotePaths.Add(RemoteEntry.Path);
+			}
+			for (const TPair<FString, FPakEntry>& Pair : LocalByPath)
+			{
+				if (!RemotePaths.Contains(Pair.Key))
+				{
+					UE_LOG(LogUnrealGamePatcher, Display,
+						TEXT("FInPlacePakPatcher: '%s' entry '%s' is gone from the remote metadata - falling back to the whole-file rebuild"),
+						*PakId, *Pair.Key);
+					return false;
+				}
+			}
+		}
+
+		// Changed compressed entries cannot be re-stored by this path: the
+		// index carries no block table to rebuild, and a raw re-store would
+		// decode to garbage. The same holds for changed encrypted entries
+		// (the append path stores plaintext). Bail out of the CoW path
+		// entirely - the whole-file rebuild handles them correctly, and its
+		// SameChunks reuse keeps the actual wire delta to the changed chunks.
 		for (const FIndexPakEntry& RemoteEntry : RemoteFile->PakEntries)
 		{
 			const FPakEntry* Local = LocalByPath.Find(RemoteEntry.Path);
-			if (Local && Local->CompressionMethodIndex != 0)
+			if (Local && (Local->CompressionMethodIndex != 0 || Local->IsEncrypted()))
 			{
 				const FString LocalHash = FPatcherHash::BytesToHex(Local->Hash, 20);
 				if (!LocalHash.Equals(RemoteEntry.SHA1, ESearchCase::IgnoreCase) || Local->Size != RemoteEntry.StoredSize)
 				{
 					UE_LOG(LogUnrealGamePatcher, Display,
-						TEXT("FInPlacePakPatcher: '%s' changed compressed entry '%s' - falling back to the whole-file rebuild"),
+						TEXT("FInPlacePakPatcher: '%s' changed compressed/encrypted entry '%s' - falling back to the whole-file rebuild"),
 						*PakId, *RemoteEntry.Path);
 					return false;
 				}
 			}
 
 			// A compressed REMOTE entry (StoredSize != UncompressedSize - the
-			// manifest carries no method field) can be neither overwritten nor
-			// appended: the encoded index has no block table to rebuild, and
-			// the append path stores method-0 raw, which the engine would read
-			// back as the compressed byte stream (garbage). Unchanged
-			// compressed entries are fine (zero movement below); a changed or
-			// new one bails to the whole-file rebuild, which reproduces the
-			// real compressed layout. This also closes the
-			// local-uncompressed/remote-compressed same-stored-size overwrite
-			// hole.
+			// manifest carries no method field) can only ride the zero-movement
+			// path: the append path stores method-0 raw, which the engine
+			// would read back as the compressed byte stream (garbage).
 			if (RemoteEntry.StoredSize != RemoteEntry.UncompressedSize)
 			{
 				const bool bSameEntry = Local && Local->HasValidHash() &&
@@ -194,159 +315,97 @@ namespace UnrealGamePatcher
 			}
 		}
 
-		// --- Hole accounting: the byte regions this patch turns into dead
-		// space (superseded entry data + the old directory/footer). They are
-		// recorded for FUTURE patches - this patch only backfills from
-		// InAvailableHoles, never from regions it invalidates itself (the
-		// old index bytes must stay readable until Commit rewrites them).
-		TArray<FHole> NewHoles;
+		// --- Placement holes recomputed from the committed container --------
+		TArray<FHole> Holes;
+		if (!ComputePlacementHoles(PakId, OldVersion, OldEof, OldIndexOffset, LocalSpans, Holes))
 		{
-			auto AddDead = [&](int64 Offset, int64 Size)
-			{
-				if (Offset >= 0 && Size > 0)
-				{
-					FHole H;
-					H.File = PakId;
-					H.Offset = Offset;
-					H.Size = Size;
-					NewHoles.Add(H);
-				}
-			};
-			for (const TPair<FString, FPakEntry>& Pair : LocalByPath)
-			{
-				const FPakEntry& E = Pair.Value;
-				const FIndexPakEntry* R = nullptr;
-				for (const FIndexPakEntry& RE : RemoteFile->PakEntries)
-				{
-					if (RE.Path.Equals(Pair.Key, ESearchCase::IgnoreCase))
-					{
-						R = &RE;
-						break;
-					}
-				}
-				const bool bSame = R && E.HasValidHash() &&
-					FPatcherHash::BytesToHex(E.Hash, 20).Equals(R->SHA1, ESearchCase::IgnoreCase) &&
-					E.Size == R->StoredSize;
-				const bool bOverwritten = R && !bSame &&
-					E.Size == R->StoredSize && E.UncompressedSize == R->UncompressedSize;
-				if (!bSame && !bOverwritten)
-				{
-					// Superseded data: re-appended (size changed) or dropped
-					// (absent from the remote set). Header + stored bytes.
-					AddDead(E.Offset, FPakReader::GetSerializedEntrySize(E, OldVersion) + E.Size);
-				}
-			}
-			if (OldIndexOffset > 0 && OldEof > OldIndexOffset)
-			{
-				AddDead(OldIndexOffset, OldEof - OldIndexOffset);
-			}
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: '%s' has corrupt index geometry - falling back to the whole-file rebuild"), *PakId);
+			return false;
 		}
+
+		// Entries this patch writes; the post-verify pass re-hashes them from
+		// the stored bytes instead of trusting any header (C12 fix).
+		TSet<FString> WrittenPaths;
 
 		// The writer must be destroyed before the whole-file hash verify
 		// (its open write handle would make the read stale/locked).
 		{
-		FPakWriter Writer;
-		if (!Writer.Open(LocalPakPath))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: cannot open pak for patching '%s'"), *LocalPakPath);
-			return false;
-		}
-		Writer.SetPlacementHoles(InAvailableHoles);
-
-		for (const FIndexPakEntry& RemoteEntry : RemoteFile->PakEntries)
-		{
-			const FPakEntry* Local = LocalByPath.Find(RemoteEntry.Path);
-
-			TArray64<uint8> RemoteBytes;
-			if (!FetchRemoteBytes(Remote, ChunkRoot, PakId, RemoteEntry.OffsetInFile, RemoteEntry.StoredSize, RemoteBytes))
+			FPakWriter Writer;
+			if (!Writer.Open(LocalPakPath))
 			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: cannot fetch bytes for '%s' (entry '%s')"), *PakId, *RemoteEntry.Path);
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: cannot open pak for patching '%s'"), *LocalPakPath);
 				return false;
 			}
+			Writer.SetPlacementHoles(Holes);
 
-			if (Local && Local->HasValidHash() &&
-				FPatcherHash::BytesToHex(Local->Hash, 20).Equals(RemoteEntry.SHA1, ESearchCase::IgnoreCase))
+			for (const FIndexPakEntry& RemoteEntry : RemoteFile->PakEntries)
 			{
-				// Same entry: zero movement.
-				++OutStats.NumSame;
-				OutStats.BytesReused += RemoteEntry.StoredSize;
-				continue;
-			}
+				const FPakEntry* Local = LocalByPath.Find(RemoteEntry.Path);
 
-			if (Local && Local->Size == RemoteEntry.StoredSize && RemoteEntry.UncompressedSize == Local->UncompressedSize)
-			{
-				// Same stored size + same uncompressed size: overwrite in place.
-				FPakEntry NewEntry = *Local;
-				if (NewEntry.CompressionMethodIndex != 0 && NewEntry.CompressionBlocks.Num() > 1)
+				// Same entry: decide FIRST, without fetching anything. The
+				// verdict is metadata-only (the local pak's built-in hash vs
+				// the manifest SHA1), and the download phase prefetches ONLY
+				// the changed entries' covering windows ("Same entries are
+				// verified locally: zero fetch"). Fetching a same entry's
+				// bytes anyway reads (and, in network mode, FAILS on) windows
+				// that were deliberately never downloaded - review 2026-10-09
+				// H1: the old fetch-before-check order made the first same
+				// entry abort the whole CoW path, silently degrading every
+				// real-world (multi-window) pak update into a full-container
+				// fetch + whole-file rebuild.
+				if (Local && Local->HasValidHash() &&
+					FPatcherHash::BytesToHex(Local->Hash, 20).Equals(RemoteEntry.SHA1, ESearchCase::IgnoreCase))
 				{
-					// Rebuild the compressed block table the way the engine lays
-					// it out: blocks packed back-to-back starting at the first
-					// block (whose offset equals the serialized header size and
-					// is layout-independent). Each block's own size survives any
-					// uniform offset skew (End - Start), so the table can be
-					// reconstructed from a misread one without re-parsing.
-					int64 Cursor = NewEntry.CompressionBlocks[0].CompressedStart;
-					for (FPakCompressedBlock& Block : NewEntry.CompressionBlocks)
-					{
-						const int64 BlockBytes = Block.CompressedEnd - Block.CompressedStart;
-						Block.CompressedStart = Cursor;
-						Block.CompressedEnd = Cursor + BlockBytes;
-						Cursor = Block.CompressedEnd;
-					}
+					// Same entry: zero movement.
+					++OutStats.NumSame;
+					OutStats.BytesReused += RemoteEntry.StoredSize;
+					continue;
 				}
-				TArray<uint8> HashBytes;
-				if (FPatcherHash::HexToBytes(RemoteEntry.SHA1, HashBytes) && HashBytes.Num() == 20)
+
+				// New or changed (any size - CoW never overwrites payload):
+				// fetch the stored bytes and append them raw, dead ranges
+				// first, EOF fallback.
+				TArray64<uint8> RemoteBytes;
+				if (!FetchRemoteBytes(Remote, ChunkRoot, PakId, RemoteEntry.OffsetInFile, RemoteEntry.StoredSize, RemoteBytes))
 				{
-					FMemory::Memcpy(NewEntry.Hash, HashBytes.GetData(), 20);
-				}
-				if (!Writer.Overwrite(RemoteEntry.Path, NewEntry, RemoteBytes.GetData(), RemoteBytes.Num()))
-				{
-					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: in-place overwrite failed for '%s'"), *RemoteEntry.Path);
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: cannot fetch bytes for '%s' (entry '%s')"), *PakId, *RemoteEntry.Path);
 					return false;
 				}
-				++OutStats.NumOverwritten;
-				OutStats.BytesWritten += RemoteBytes.Num();
-				continue;
+
+				FPakWriter::FEntryToWrite W;
+				W.Path = RemoteEntry.Path;
+				W.CompressionMethodIndex = 0;
+				W.UncompressedSize = RemoteEntry.UncompressedSize > 0 ? RemoteEntry.UncompressedSize : RemoteEntry.StoredSize;
+				FPakWriter::FStoredBlock Block;
+				Block.Bytes = MoveTemp(RemoteBytes);
+				W.Blocks.Add(MoveTemp(Block));
+				FPakEntry OutEntry;
+				if (!Writer.AppendEntry(W, OutEntry))
+				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: append failed for '%s'"), *RemoteEntry.Path);
+					return false;
+				}
+				++OutStats.NumAppended;
+				OutStats.BytesWritten += W.Blocks[0].Bytes.Num();
+				WrittenPaths.Add(RemoteEntry.Path);
 			}
 
-			// New or size-changed: append at the end (stored raw).
-			FPakWriter::FEntryToWrite W;
-			W.Path = RemoteEntry.Path;
-			W.CompressionMethodIndex = 0;
-			W.UncompressedSize = RemoteEntry.UncompressedSize > 0 ? RemoteEntry.UncompressedSize : RemoteEntry.StoredSize;
-			FPakWriter::FStoredBlock Block;
-			Block.Bytes = MoveTemp(RemoteBytes);
-			W.Blocks.Add(MoveTemp(Block));
-			FPakEntry OutEntry;
-			if (!Writer.AppendEntry(W, OutEntry))
+			if (!Writer.Commit())
 			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: append failed for '%s'"), *RemoteEntry.Path);
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: commit failed for '%s'"), *LocalPakPath);
 				return false;
 			}
-			++OutStats.NumAppended;
-			OutStats.BytesWritten += W.Blocks[0].Bytes.Num();
-		}
-
-		if (!Writer.Commit())
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FInPlacePakPatcher: commit failed for '%s'"), *LocalPakPath);
-			return false;
-		}
-		OutStats.UpdatedHoles = Writer.GetPlacementHoles();
-		for (const FHole& H : NewHoles)
-		{
-			OutStats.UpdatedHoles.Add(H);
-		}
-		OutStats.NumHolesFilled = Writer.GetNumHolesFilled();
+			OutStats.NumHolesFilled = Writer.GetNumHolesFilled();
 		} // writer closed here
 
 		// Verify the patched pak PER-ENTRY against the remote metadata. The
 		// container is a virtual disk: its physical layout may legitimately
 		// differ from the CDN copy (per-machine append order), so the
 		// whole-file hash is NOT a valid equality signal - the per-entry
-		// built-in hashes are. Every remote entry must be present locally
-		// with a matching hash (extra stale entries are dead bytes, compact
-		// reclaims them).
+		// content hashes are. Entries written by THIS patch are re-hashed
+		// from the bytes now stored in the container (a corrupted/torn write
+		// is caught even if every header claims otherwise); untouched entries
+		// keep the cheap stored-hash comparison.
 		{
 			FPakReader Check;
 			if (!Check.Open(LocalPakPath) || !Check.ReadIndex())
@@ -358,7 +417,17 @@ namespace UnrealGamePatcher
 			for (const FPakReader::FPakEntryLocation& Loc : Check.GetFiles())
 			{
 				uint8 Hash[20] = { 0 };
-				if (Loc.Entry.HasValidHash())
+				const bool bWritten = WrittenPaths.Contains(Loc.Path);
+				if (bWritten)
+				{
+					if (!Check.ComputePayloadHash(Loc.Entry, Hash))
+					{
+						UE_LOG(LogUnrealGamePatcher, Error,
+							TEXT("FInPlacePakPatcher: cannot re-hash written entry '%s' in patched '%s'"), *Loc.Path, *LocalPakPath);
+						return false;
+					}
+				}
+				else if (Loc.Entry.HasValidHash())
 				{
 					FMemory::Memcpy(Hash, Loc.Entry.Hash, 20);
 				}
@@ -376,7 +445,7 @@ namespace UnrealGamePatcher
 				if (!H || !H->Equals(R.SHA1, ESearchCase::IgnoreCase))
 				{
 					UE_LOG(LogUnrealGamePatcher, Error,
-						TEXT("FInPlacePakPatcher: entry '%s' of patched '%s' does not match remote metadata (in-place patch failed verification)"),
+						TEXT("FInPlacePakPatcher: entry '%s' of patched '%s' does not match remote metadata (CoW patch failed verification)"),
 						*R.Path, *PakId);
 					return false;
 				}
@@ -384,8 +453,14 @@ namespace UnrealGamePatcher
 		}
 
 		UE_LOG(LogUnrealGamePatcher, Display,
-			TEXT("FInPlacePakPatcher: '%s': %d same (zero movement, %lld bytes reused), %d overwritten in place, %d appended; %lld bytes written"),
-			*PakId, OutStats.NumSame, OutStats.BytesReused, OutStats.NumOverwritten, OutStats.NumAppended, OutStats.BytesWritten);
+			TEXT("FInPlacePakPatcher: '%s': %d same (zero movement, %lld bytes reused), %d appended (CoW, %d holes filled); %lld bytes written"),
+			*PakId, OutStats.NumSame, OutStats.BytesReused, OutStats.NumAppended, OutStats.NumHolesFilled, OutStats.BytesWritten);
+		// Per-patch I/O report: a CoW patch must read only the windows of the
+		// entries it writes - same entries are metadata-compared, never
+		// fetched. Disk reads approaching the container size mean the patch
+		// is secretly pulling everything (the H1 failure signature).
+		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FInPlacePakPatcher: '%s' I/O: %s"),
+			*PakId, *FIOStats::FormatDelta(IOStart, FIOStats::Get().Snapshot()));
 		return true;
 	}
 }

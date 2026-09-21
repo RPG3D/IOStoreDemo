@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "State/FPatcherState.h"
+#include "Formats/JsonIo.h"
 #include "UnrealGamePatcherLog.h"
 #include "UnrealGamePatcherPaths.h"
 #include "HAL/FileManager.h"
@@ -53,43 +54,6 @@ namespace UnrealGamePatcher
 			if (Str == TEXT("replace-file")) return EApplyOp::ReplaceFile;
 			if (Str == TEXT("delete")) return EApplyOp::Delete;
 			return EApplyOp::Overwrite;
-		}
-
-		/** Strict field readers: wrong type or missing field => return false so a
-		 *  damaged file is rejected instead of silently defaulted. */
-
-		bool ReadInt64Field(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, int64& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::Number)
-			{
-				return false;
-			}
-			const double N = (*Value)->AsNumber();
-			Out = (int64)N;
-			return true;
-		}
-
-		bool ReadStringField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, FString& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::String)
-			{
-				return false;
-			}
-			Out = (*Value)->AsString();
-			return true;
-		}
-
-		bool ReadArrayField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, TArray<TSharedPtr<FJsonValue>>& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::Array)
-			{
-				return false;
-			}
-			Out = (*Value)->AsArray();
-			return true;
 		}
 
 		TSharedPtr<FJsonObject> SerializeTransaction(const FTransactionRecord& Txn)
@@ -201,34 +165,16 @@ namespace UnrealGamePatcher
 		} // optional; omitted when never verified
 
 		FString Json;
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
-		if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer))
+		if (!SerializeJsonCompact(Root.ToSharedRef(), Json))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPatcherState: failed to serialize state to JSON"));
 			return false;
 		}
 
-		// Write atomically: temp file + recoverable replace. A crash mid-write
-		// - or a failed rename (AV/lock) - leaves the previous good state file
-		// untouched: the sidecar IS the recovery record, losing it must not be
+		// Write atomically via WriteJsonFileAtomic (temp + recoverable
+		// replace): the sidecar IS the recovery record, losing it must not be
 		// possible.
-		const FString TempPath = StatePath + TEXT(".tmp");
-		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-		if (PF.FileExists(*TempPath))
-		{
-			PF.DeleteFile(*TempPath);
-		}
-		if (!FFileHelper::SaveStringToFile(Json, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPatcherState: failed writing '%s'"), *TempPath);
-			return false;
-		}
-		if (!Paths::AtomicReplaceFile(TempPath, StatePath))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPatcherState: failed moving '%s' to '%s'"), *TempPath, *StatePath);
-			return false;
-		}
-		return true;
+		return WriteJsonFileAtomic(StatePath, Json, TEXT("FPatcherState"));
 	}
 
 	bool FPatcherStateFile::Load(const FString& StatePath, FPatcherState& OutState)

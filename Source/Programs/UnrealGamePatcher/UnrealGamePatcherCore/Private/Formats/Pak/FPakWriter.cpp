@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Formats/Pak/FPakWriter.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -11,6 +12,10 @@ namespace UnrealGamePatcher
 {
 	namespace
 	{
+		// Footer writes are aligned to this boundary so the whole footer fits
+		// one disk sector and the commit write is sector-atomic (ROADMAP §5.2).
+		constexpr int64 CommitSectorBytes = 512;
+
 		// --- Low level binary writers (mirrors the reader helpers) -----------
 
 		template <typename T>
@@ -179,86 +184,6 @@ namespace UnrealGamePatcher
 		return Info.CompressionMethods.Num() - 1;
 	}
 
-	bool FPakWriter::Overwrite(const FString& PathInPak, const FPakEntry& NewEntry, const uint8* Data, int64 Size)
-	{
-		if (!WriteHandle)
-		{
-			return false;
-		}
-
-		// Find the existing directory entry.
-		FPakReader::FPakEntryLocation* Existing = nullptr;
-		for (FPakReader::FPakEntryLocation& Loc : Files)
-		{
-			if (Loc.Path.Equals(PathInPak, ESearchCase::IgnoreCase))
-			{
-				Existing = &Loc;
-				break;
-			}
-		}
-		if (!Existing)
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: cannot overwrite '%s': not in pak"), *PathInPak);
-			return false;
-		}
-
-		// In-place overwrite requires an unchanged stored size and unchanged
-		// compression layout so the payload header keeps its serialized size.
-		const int64 OldHeaderSize = GetEntrySerializedSize(Existing->Entry, Info.Version);
-		const int64 NewHeaderSize = GetEntrySerializedSize(NewEntry, Info.Version);
-		if (NewEntry.Size != Existing->Entry.Size || NewHeaderSize != OldHeaderSize)
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: cannot overwrite '%s' in place: stored size/layout changed (%lld vs %lld bytes)"),
-				*PathInPak, NewEntry.Size, Existing->Entry.Size);
-			return false;
-		}
-
-		IFileHandle* Handle = static_cast<IFileHandle*>(WriteHandle);
-
-		// The payload write is unbounded by the format: reject a byte count
-		// larger than the entry's stored size, or the next entry's payload
-		// would be silently overwritten while the index still claims the old
-		// layout (undetectable corruption).
-		if (Size > Existing->Entry.Size)
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: cannot overwrite '%s': %lld bytes into a %lld-byte stored slot"),
-				*PathInPak, Size, Existing->Entry.Size);
-			return false;
-		}
-
-		// Rewrite the payload header (keeps the same size) at the entry offset.
-		TArray64<uint8> Header;
-		SerializePakEntry(Header, NewEntry, Info.Version);
-		if (!Handle->Seek(Existing->Entry.Offset) ||
-			!Handle->Write(Header.GetData(), Header.Num()))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed writing header for '%s'"), *PathInPak);
-			return false;
-		}
-
-		// Rewrite the stored payload in place.
-		if (Size > 0)
-		{
-			if (!Handle->Seek(Existing->Entry.Offset + OldHeaderSize) ||
-				!Handle->Write(Data, Size))
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed writing data for '%s'"), *PathInPak);
-				return false;
-			}
-		}
-
-		// The directory entry keeps its ON-DISK offset (the in-place patch
-		// never moves data); the caller's NewEntry may carry a fresh offset
-		// value, so preserve the original one explicitly.
-		const int64 KeptOffset = Existing->Entry.Offset;
-		Existing->Entry = NewEntry;
-		Existing->Entry.Offset = KeptOffset;
-
-		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FPakWriter: overwrote '%s' in place (%lld bytes at %lld)"),
-			*PathInPak, Size, Existing->Entry.Offset);
-		return true;
-	}
-
 	bool FPakWriter::AppendEntry(const FEntryToWrite& InEntry, FPakEntry& OutEntry)
 	{
 		if (!WriteHandle)
@@ -381,12 +306,13 @@ namespace UnrealGamePatcher
 			}
 		}
 
-		IFileHandle* Handle = static_cast<IFileHandle*>(WriteHandle);
-		if (!Handle->Seek(Entry.Offset) || !Handle->Write(Payload.GetData(), Payload.Num()))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed appending '%s'"), *InEntry.Path);
-			return false;
-		}
+	IFileHandle* Handle = static_cast<IFileHandle*>(WriteHandle);
+	if (!Handle->Seek(Entry.Offset) || !Handle->Write(Payload.GetData(), Payload.Num()))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed appending '%s'"), *InEntry.Path);
+		return false;
+	}
+	FIOStats::Get().AddDiskWrite(Payload.Num());
 
 		if (HoleIdx == INDEX_NONE)
 		{
@@ -396,7 +322,17 @@ namespace UnrealGamePatcher
 		// Hole-placed: the EOF cursor and BytesAdded stay unchanged - the
 		// bytes went into recorded dead space, the file did not grow.
 
-		// Track the entry for the directory rebuild.
+		// Track the entry for the directory rebuild. A re-appended path
+		// supersedes the previous generation: the old span stays in the file
+		// but is no longer referenced by the committed index, so it becomes
+		// dead space the next patch's placement-hole recompute picks up.
+		for (int32 Idx = Files.Num() - 1; Idx >= 0; --Idx)
+		{
+			if (Files[Idx].Path.Equals(InEntry.Path, ESearchCase::IgnoreCase))
+			{
+				Files.RemoveAt(Idx);
+			}
+		}
 		FPakReader::FPakEntryLocation Loc;
 		Loc.Path = InEntry.Path;
 		Loc.Entry = Entry;
@@ -546,19 +482,58 @@ namespace UnrealGamePatcher
 			Footer.Append(Methods, sizeof(Methods));
 		}
 
-		// --- Append index + FullDirectoryIndex blob + footer at end of file --
+		// --- Three-stage commit (ROADMAP §5.2), full flush between stages -----
+		// Stage 1: the payloads were written by AppendEntry(); make them durable
+		// before any index byte references them.
 		IFileHandle* Handle = static_cast<IFileHandle*>(WriteHandle);
-		if (!Handle->Seek(FileSize) ||
-			!Handle->Write(Index.GetData(), Index.Num()) ||
-			!Handle->Write(DirIndex.GetData(), DirIndex.Num()) ||
-			!Handle->Write(Footer.GetData(), Footer.Num()))
+		if (!Handle->Flush(true))
 		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed writing index/footer"));
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed flushing payloads"));
 			return false;
 		}
-		const int64 Total = Index.Num() + DirIndex.Num() + Footer.Num();
+
+	// Stage 2: index + FullDirectoryIndex blob at the end of the file.
+	if (!Handle->Seek(FileSize) ||
+		!Handle->Write(Index.GetData(), Index.Num()) ||
+		!Handle->Write(DirIndex.GetData(), DirIndex.Num()) ||
+		!Handle->Flush(true))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed writing index"));
+		return false;
+	}
+	FIOStats::Get().AddDiskWrite(Index.Num() + DirIndex.Num());
+
+		// Stage 3: footer — the commit point. Sector-aligned so the whole
+		// footer (221 bytes for V10..V12) lies inside a single 512-byte sector
+		// and the write is sector-atomic; zero-pad the gap. A crash before
+		// this stage leaves the previous footer valid (old version intact);
+		// a torn footer is discarded by FPakRecovery's backward scan.
+		const int64 IndexEnd = FileSize + Index.Num() + DirIndex.Num();
+		const int64 FooterEnd = Align(IndexEnd + Footer.Num(), CommitSectorBytes);
+		const int64 FooterStart = FooterEnd - Footer.Num();
+		if (FooterStart > IndexEnd)
+		{
+			const int64 Pad = FooterStart - IndexEnd; // < CommitSectorBytes
+			TArray64<uint8> Zeros;
+			Zeros.AddZeroed((int32)Pad);
+			if (!Handle->Write(Zeros.GetData(), Pad))
+			{
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed padding before footer"));
+				return false;
+			}
+		}
+	if (!Handle->Seek(FooterStart) ||
+		!Handle->Write(Footer.GetData(), Footer.Num()) ||
+		!Handle->Flush(true))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FPakWriter: failed writing footer"));
+		return false;
+	}
+	FIOStats::Get().AddDiskWrite((FooterStart > IndexEnd ? FooterStart - IndexEnd : 0) + Footer.Num());
+
+		const int64 Total = FooterEnd - FileSize;
 		BytesAdded += Total;
-		FileSize += Total;
+		FileSize = FooterEnd;
 
 		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FPakWriter: committed index (%lld) + dir index (%lld) + footer; pak is %lld bytes"),
 			Index.Num(), DirIndex.Num(), FileSize);

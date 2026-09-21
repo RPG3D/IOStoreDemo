@@ -1,6 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "FBuildDiffer.h"
+#include "Formats/JsonIo.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "UnrealGamePatcherPaths.h"
 #include "Hash/FPatcherHash.h"
@@ -17,55 +19,6 @@ namespace UnrealGamePatcher
 {
 	namespace
 	{
-		// Same strict readers as FIndexManifest.cpp.
-		bool ReadInt64Field(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, int64& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::Number)
-			{
-				return false;
-			}
-			Out = (int64)(*Value)->AsNumber();
-			return true;
-		}
-
-		bool ReadStringField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, FString& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::String)
-			{
-				return false;
-			}
-			Out = (*Value)->AsString();
-			return true;
-		}
-
-		bool ReadObjectField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key, TSharedPtr<FJsonObject>& Out)
-		{
-			const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Key);
-			if (!Value || !(*Value).IsValid() || (*Value)->Type != EJson::Object)
-			{
-				return false;
-			}
-			Out = (*Value)->AsObject();
-			return true;
-		}
-
-		bool IsHex40(const FString& Str)
-		{
-			if (Str.Len() != 40) return false;
-			for (const TCHAR C : Str)
-			{
-				if (!(C >= TEXT('0') && C <= TEXT('9')) &&
-					!(C >= TEXT('a') && C <= TEXT('f')) &&
-					!(C >= TEXT('A') && C <= TEXT('F')))
-				{
-					return false;
-				}
-			}
-			return true;
-		}
-
 		/** Canonical body for the delta manifest; fixed key order so the
 		 *  self-check hash is deterministic (same scheme as the index). */
 		bool SerializeDeltaBody(const FDeltaManifest& D, bool bIncludeSelfCheck, const FString& SelfCheckHex, FString& OutJson)
@@ -129,8 +82,7 @@ namespace UnrealGamePatcher
 				Root->SetStringField(TEXT("selfCheck"), SelfCheckHex);
 			}
 
-			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutJson);
-			return FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+			return SerializeJsonCompact(Root.ToSharedRef(), OutJson);
 		}
 	}
 
@@ -141,7 +93,7 @@ namespace UnrealGamePatcher
 		{
 			return false;
 		}
-		const FString SelfCheckHex = FPatcherHash::XXH64ToHex(Body.GetCharArray().GetData(), Body.Len() * sizeof(TCHAR));
+		const FString SelfCheckHex = JsonSelfCheckHex(Body);
 
 		FString Full;
 		if (!SerializeDeltaBody(Delta, true, SelfCheckHex, Full))
@@ -149,23 +101,7 @@ namespace UnrealGamePatcher
 			return false;
 		}
 
-		const FString TempPath = Path + TEXT(".tmp");
-		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-		if (PF.FileExists(*TempPath))
-		{
-			PF.DeleteFile(*TempPath);
-		}
-		if (!FFileHelper::SaveStringToFile(Full, *TempPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FDeltaManifest: failed writing '%s'"), *TempPath);
-			return false;
-		}
-		if (!Paths::AtomicReplaceFile(TempPath, Path))
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FDeltaManifest: failed moving '%s' to '%s'"), *TempPath, *Path);
-			return false;
-		}
-		return true;
+		return WriteJsonFileAtomic(Path, Full, TEXT("FDeltaManifest"));
 	}
 
 	bool FDeltaManifestFile::Load(const FString& Path, FDeltaManifest& OutDelta)
@@ -283,7 +219,7 @@ namespace UnrealGamePatcher
 		{
 			return false;
 		}
-		const FString Recomputed = FPatcherHash::XXH64ToHex(Body.GetCharArray().GetData(), Body.Len() * sizeof(TCHAR));
+		const FString Recomputed = JsonSelfCheckHex(Body);
 		if (!Recomputed.Equals(SelfCheckHex, ESearchCase::IgnoreCase))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FDeltaManifest: '%s' FAILED self-check (embedded %s, recomputed %s)"),
@@ -391,11 +327,16 @@ namespace UnrealGamePatcher
 					PF.CreateDirectoryTree(*FPaths::GetPath(Dst));
 				}
 				const int64 SrcSize = IFileManager::Get().FileSize(*Src);
-				if (SrcSize == INDEX_NONE || (IFileManager::Get().FileSize(*Dst) != SrcSize &&
-					IFileManager::Get().Copy(*Dst, *Src) != ECopyResult::COPY_OK))
+				const bool bCopyNeeded = IFileManager::Get().FileSize(*Dst) != SrcSize;
+				if (SrcSize == INDEX_NONE || (bCopyNeeded && IFileManager::Get().Copy(*Dst, *Src) != ECopyResult::COPY_OK))
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FBuildDiffer: failed copying chunk '%s'"), *Src);
 					return false;
+				}
+				if (bCopyNeeded)
+				{
+					FIOStats::Get().AddDiskRead(SrcSize);
+					FIOStats::Get().AddDiskWrite(SrcSize);
 				}
 			}
 		}

@@ -2,6 +2,7 @@
 
 #include "Formats/Chunk/FChunkDataLoader.h"
 #include "Hash/FPatcherHash.h"
+#include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -14,17 +15,18 @@ namespace UnrealGamePatcher
 {
 	namespace
 	{
-		bool ReadAllBytes(const FString& Path, TArray64<uint8>& OutBytes)
+	bool ReadAllBytes(const FString& Path, TArray64<uint8>& OutBytes)
+	{
+		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+		IFileHandle* Handle = PF.OpenRead(*Path);
+		if (!Handle)
 		{
-			IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-			IFileHandle* Handle = PF.OpenRead(*Path);
-			if (!Handle)
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: cannot open '%s'"), *Path);
-				return false;
-			}
-			const int64 Size = Handle->Size();
-			OutBytes.SetNumUninitialized(Size);
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: cannot open '%s'"), *Path);
+			return false;
+		}
+		const int64 Size = Handle->Size();
+		FIOStats::Get().AddDiskRead(Size);
+		OutBytes.SetNumUninitialized(Size);
 			const bool bOk = Size == 0 || Handle->Read(OutBytes.GetData(), Size);
 			delete Handle;
 			if (!bOk)
@@ -69,49 +71,59 @@ namespace UnrealGamePatcher
 		Hasher.GetHash(Hash);
 		OutSha1Hex = FPatcherHash::BytesToHex(Hash, 20);
 
-		// Try Oodle; keep it only when it saves at least MinOodleSavePercent of
-		// the window (compressed < 90%), otherwise store the window raw.
-		TArray64<uint8> Stored;
-		OutStoredAs = StoredAsRaw;
+	// Try Oodle; keep it only when it saves at least MinOodleSavePercent of
+	// the window (compressed < 90%), otherwise store the window raw.
+	TArray64<uint8> Stored;
+	OutStoredAs = StoredAsRaw;
+	{
+		int64 Bound = 0;
+		if (FCompression::CompressMemoryBound(NAME_Oodle, Bound, UncompressedSize))
 		{
-			int64 Bound = 0;
-			if (FCompression::CompressMemoryBound(NAME_Oodle, Bound, UncompressedSize))
+			TArray64<uint8> Compressed;
+			Compressed.SetNumUninitialized(Bound);
+			int64 CompressedSize = Bound;
+			if (FCompression::CompressMemory(NAME_Oodle, Compressed.GetData(), CompressedSize,
+				Uncompressed, UncompressedSize) &&
+				CompressedSize > 0 &&
+				CompressedSize * 100 < UncompressedSize * (100 - MinOodleSavePercent))
 			{
-				TArray64<uint8> Compressed;
-				Compressed.SetNumUninitialized(Bound);
-				int64 CompressedSize = Bound;
-				if (FCompression::CompressMemory(NAME_Oodle, Compressed.GetData(), CompressedSize,
-					Uncompressed, UncompressedSize) &&
-					CompressedSize > 0 &&
-					CompressedSize * 100 < UncompressedSize * (100 - MinOodleSavePercent))
-				{
-					Compressed.SetNum(CompressedSize, EAllowShrinking::No);
-					Stored = MoveTemp(Compressed);
-					OutStoredAs = StoredAsOodle;
-				}
-			}
-			if (OutStoredAs == StoredAsRaw)
-			{
-				Stored.SetNumUninitialized(UncompressedSize);
-				FMemory::Memcpy(Stored.GetData(), Uncompressed, UncompressedSize);
+				FIOStats::Get().AddCompress(UncompressedSize, CompressedSize);
+				Compressed.SetNum(CompressedSize, EAllowShrinking::No);
+				Stored = MoveTemp(Compressed);
+				OutStoredAs = StoredAsOodle;
 			}
 		}
+		if (OutStoredAs == StoredAsRaw)
+		{
+			Stored.SetNumUninitialized(UncompressedSize);
+			FMemory::Memcpy(Stored.GetData(), Uncompressed, UncompressedSize);
+		}
+	}
 
 		// [8B magic][8B usz][8B csz][1B storedAs][20B sha1][data]
 		TArray64<uint8> Out;
 		Out.Reserve(HeaderSize + Stored.Num());
-		for (int32 I = 0; I < 8; ++I) { Out.Add((uint8)FChunkDataLoader::Magic[I]); }
-		WriteU64(Out, (uint64)UncompressedSize);
-		WriteU64(Out, (uint64)Stored.Num());
-		Out.Add(OutStoredAs);
-		for (int32 I = 0; I < 20; ++I) { Out.Add(Hash[I]); }
-		Out.Append(Stored);
+	for (int32 I = 0; I < 8; ++I) { Out.Add((uint8)FChunkDataLoader::Magic[I]); }
+	WriteU64(Out, (uint64)UncompressedSize);
+	WriteU64(Out, (uint64)Stored.Num());
+	Out.Add(OutStoredAs);
+	for (int32 I = 0; I < 20; ++I) { Out.Add(Hash[I]); }
+	Out.Append(Stored);
 
-		return FFileHelper::SaveArrayToFile(Out, *ChunkFilePath);
+	const bool bOk = FFileHelper::SaveArrayToFile(Out, *ChunkFilePath);
+	if (bOk)
+	{
+		FIOStats::Get().AddDiskWrite(Out.Num());
 	}
+	return bOk;
+}
 
 	bool FChunkDataLoader::Load(const FString& ChunkFilePath, const FIndexChunkEntry& Entry, TArray64<uint8>& OutData)
 	{
+		// Count ATTEMPTS (not successes): a patcher that reads windows the
+		// prefetch skipped shows up as attempts against missing cache files
+		// even though zero of them succeed (the H1 signature).
+		FIOStats::Get().AddChunkLoad();
 		TArray64<uint8> Raw;
 		if (!ReadAllBytes(ChunkFilePath, Raw))
 		{
@@ -163,25 +175,27 @@ namespace UnrealGamePatcher
 				FMemory::Memcpy(Uncompressed.GetData(), Data, UncompressedSize);
 			}
 		}
-		else if (StoredAs == StoredAsOodle)
+	else if (StoredAs == StoredAsOodle)
+	{
+		Uncompressed.SetNumUninitialized(UncompressedSize);
+		if (!FCompression::UncompressMemory(NAME_Oodle, Uncompressed.GetData(), UncompressedSize,
+			const_cast<uint8*>(Data), CompressedSize))
 		{
-			Uncompressed.SetNumUninitialized(UncompressedSize);
-			if (!FCompression::UncompressMemory(NAME_Oodle, Uncompressed.GetData(), UncompressedSize,
-				const_cast<uint8*>(Data), CompressedSize))
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: Oodle decompress failed for '%s'"), *ChunkFilePath);
-				return false;
-			}
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: Oodle decompress failed for '%s'"), *ChunkFilePath);
+			return false;
 		}
+		FIOStats::Get().AddDecompress(CompressedSize, UncompressedSize);
+	}
 		else
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: '%s' has unknown StoredAs %d"), *ChunkFilePath, StoredAs);
 			return false;
 		}
 
-		// Verify the content SHA1 against the manifest entry (the chunk key).
-		FSHA1 Hasher;
-		Hasher.Update(Uncompressed.GetData(), (int32)Uncompressed.Num());
+	// Verify the content SHA1 against the manifest entry (the chunk key).
+	FSHA1 Hasher;
+	Hasher.Update(Uncompressed.GetData(), (int32)Uncompressed.Num());
+	FIOStats::Get().AddHashed(Uncompressed.Num());
 		uint8 Hash[20] = { 0 };
 		Hasher.Final();
 		Hasher.GetHash(Hash);
