@@ -83,3 +83,16 @@ IoStoreServer/Data/
 
 # Build outputs
 Archives/
+
+# Local edit backups and tool caches (AGENTS.md backup convention)
+*.bak*
+__pycache__/
+
+# IDE / agent workspace files
+.idea/
+.vscode/
+.claude/
+.zcode/
+
+# Visual Studio local cache
+.vs/

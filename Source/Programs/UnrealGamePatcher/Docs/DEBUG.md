@@ -1,6 +1,7 @@
 # UnrealGamePatcher 调试手册
 
-> 面向手工验证 / 排障。自动化测试见 `TESTCASES.md`；架构见 `TECHNICAL.md` / `DOWNLOAD.md`。
+> 面向手工验证 / 排障。自动化测试见 `TESTCASES.md`；架构见 `TECHNICAL.md` / `DOWNLOAD.md`；
+> **MCP 驱动的断点调试环境（debugmcp + codelldb）见 `DEBUGGER.md`**。
 > 所有命令在仓库根目录（`D:\UEProject\IOStoreDemo`）执行，**均为单行**——cmd /
 > PowerShell / Git Bash 直接整段粘贴即可（本文不使用续行符；如需折行，cmd 用 `^`、
 > PowerShell 用反引号 `` ` `` 且行尾不能有空格）。示例 CDN = ElectricDreamsEnv
@@ -13,9 +14,15 @@
 :: 1. 启动 rustfs S3 服务器（:9000，数据在 <project>\Saved\rustfs-data）
 Source\Programs\UnrealGamePatcher\Scripts\start_rustfs.bat
 
-:: 2. 发布 CDN（已发布过可跳过；增量重跑也安全）
+:: 2. 发布 CDN（已发布过可跳过；重跑默认续传——HEAD+MD5 跳过已传对象，--full 强制全传；
+::    连接类故障指数退避重试，单对象重试耗尽记失败继续，连续 10 失败才中止）
 python Source\Programs\UnrealGamePatcher\Scripts\s3_sync.py --endpoint http://127.0.0.1:9000 --access-key ugpadmin --secret-key ugpadmin123 --bucket ugp-eds --create --public --sync D:\UEProject\ElectricDreamsEnv\Saved\UGP_Cloud
 ```
+
+> 2026-10-14 排障注记：全量传输中断报 `WinError 10060`（连接超时）——rustfs 一直在运行、
+> 未重启，根因是它在同盘大流量 PUT 下 accept 停顿超过了客户端 120s 超时；旧脚本无重试无续传，
+> 一次瞬时超时即整体中止。现脚本已加重试+续传，直接重跑即从断点继续（实测 10011/10011 全部
+> MD5 校验一致，0 重传）。
 
 CDN 构建源（两次 cook 差异 = 真实小更新）：`RunUAT BuildCookRun -build -cook -stage -pak` →
 `UnrealGamePatcher.exe -cli build -staged=<staged> -app=ElectricDreamsEnv -version=<v> -out=<cloud>`。
@@ -109,3 +116,4 @@ Binaries\Win64\UnrealGamePatcher.exe -cli iostoredump -utoc=<f.utoc> -ucas=<f.uc
 | 多段文件内容清零 | 旧版段写入截断 bug | 已修复（`FILEWRITE_Append`）；复现于旧构建 |
 | repair 永不收敛 | 旧版 fpak 压缩块 32 对齐误读 | 已修复（引擎对齐=1）；升级构建后 repair 一次即收敛 |
 | update 挂起无输出 | 旧版回调丢 OnDone | 已修复；确认 exe 为最新构建 |
+| CDN index 报 `FAILED self-check (embedded X, recomputed Y)` 且两次重跑 recomputed 恒定 | 2026-09-02 前的发布器用 pretty-print 写 index，selfCheck 绑定旧字节布局；新代码紧凑重序列化必然不同 = 假阳性（2026-10-15 实战定位，CDN 对象 MD5 与发布源一致） | 已修复：Load 在 canonical 重算不匹配时回退 raw-body 校验（`JsonIo.h` `MatchesRawBodySelfCheck`）。若升级后仍报错才是真损坏/真篡改 |
