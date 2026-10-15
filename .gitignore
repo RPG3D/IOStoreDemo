@@ -96,3 +96,6 @@ __pycache__/
 
 # Visual Studio local cache
 .vs/
+
+# Hand-written mini solution for UGP debug workflow (DEBUGGER.md)
+!Tools/VSDebug/UGPDebugOnly.sln
