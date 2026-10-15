@@ -220,7 +220,8 @@ namespace UnrealGamePatcher
 			return false;
 		}
 		const FString Recomputed = JsonSelfCheckHex(Body);
-		if (!Recomputed.Equals(SelfCheckHex, ESearchCase::IgnoreCase))
+		if (!Recomputed.Equals(SelfCheckHex, ESearchCase::IgnoreCase) &&
+			!MatchesRawBodySelfCheck(Json, SelfCheckHex))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FDeltaManifest: '%s' FAILED self-check (embedded %s, recomputed %s)"),
 				*Path, *SelfCheckHex, *Recomputed);

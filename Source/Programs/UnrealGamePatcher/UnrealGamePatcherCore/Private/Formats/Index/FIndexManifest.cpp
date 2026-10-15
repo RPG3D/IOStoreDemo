@@ -383,7 +383,8 @@ namespace UnrealGamePatcher
 			return false;
 		}
 		const FString Recomputed = JsonSelfCheckHex(Body);
-		if (!Recomputed.Equals(SelfCheckHex, ESearchCase::IgnoreCase))
+		if (!Recomputed.Equals(SelfCheckHex, ESearchCase::IgnoreCase) &&
+			!MatchesRawBodySelfCheck(Json, SelfCheckHex))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: '%s' FAILED self-check (tampered or corrupt; embedded %s, recomputed %s)"),
 				TEXT("<index>"), *SelfCheckHex, *Recomputed);

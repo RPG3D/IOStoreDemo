@@ -168,6 +168,12 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 - 逐目标**先备份原文件**到 `.ugp/backup/` 再操作；每步写日志（崩溃恢复可定位进度）。
 - 任一失败 → **回滚**：按目标逆序恢复备份（Added 无备份则删除），备份目录清除，状态 `rolled-back`。
 - 下次启动读到 `pending` → **先回滚恢复**，再应用新版本（模拟 kill 后 rerun 结果正确，`updatetest` 验证）。
+- **pak 在回滚中永不恢复/删除（CoW v2 语义，2026-10-10 动态验证）**：全新装注入失败
+  （`-injectfail=2`）后，ucas/utoc 被正确删除而 **pak 完整保留在盘上——这是设计而非缺陷**。
+  Rollback lambda 对 `.pak` 目标显式短路：pak 永不备份也永不回滚，写一半的 pak 尾部由
+  FPakRecovery 截断回最近一次提交的 footer——容器要么是完整旧版、要么是完整新版。
+  残留的完整新版 pak 在下一次 update 的 diff 中判 Same，只补缺失的 ucas/utoc，收敛正确
+  （动态证据：`review-dbg-2026-10-10.md` D-1）。
 - **空洞回填（CoW v2，2026-09-21 起）**：pak 死区不再记入 sidecar——由**已提交 index 的
   补集**实时重算（`ComputePlacementHoles`）；**下一次更新的追加优先回填**这些空洞
   （pak 32B 对齐 / ucas 块对齐，best-fit；逻辑块序保持稠密，物理写进死区，
@@ -243,6 +249,10 @@ cmd 批处理 `%1` 会在 `=` 处截断 → **参数用空格分隔**。失败�
 ```
 （`updateStrategy` 已移除——只写的遗留字段；应用策略由客户端逐文件按扩展名 + 元数据存在性决定。）
 - `selfCheck` = XXH3-64(规范化正文，除 selfCheck 外)；Save/Load 同一 `SerializeBody` 保证确定性。
+  canonical 重算不匹配时回退 **raw-body 校验**（`JsonIo.h` `MatchesRawBodySelfCheck`：剥离
+  内嵌 selfCheck 键后对原始文本字节重算）——2026-09-02 前的发布器用 pretty-print 写盘
+  （且 ioChunks 无 metaHash/fileOffset/fileSize），canonical 重算对这类旧布局必然假阳性
+  「篡改」；raw-body 前像校验对任意序列化布局等价成立，篡改强度不变（任一字节改动即失配）。
 - 加载时严格校验（缺失字段/错误类型/自校验不符 → 拒收）。
 
 ### 5.2 pak（`FPakReader` / `FPakWriter`）

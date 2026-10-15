@@ -11,6 +11,9 @@
 #include "Formats/Pak/FPakRecovery.h"
 #include "State/FPatcherState.h"
 #include "Formats/Index/FIndexManifest.h"
+#include "Formats/JsonIo.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
 #include "Formats/Diff/FDiffAnalyzer.h"
 #include "Formats/Diff/FLocalTruthExtractor.h"
 #include "FBuildIngestor.h"
@@ -686,6 +689,52 @@ namespace
 			Json = Json.Left(FieldStart) + Json.RightChop(FieldEnd);
 			Check(FFileHelper::SaveStringToFile(Json, *IndexPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM), TEXT("write manifest without selfCheck"));
 			Check(!UnrealGamePatcher::FIndexManifestFile::Load(IndexPath, Dummy), TEXT("reject missing selfCheck"));
+		}
+
+		// --- 4e. Legacy-layout fallback (a pre-condensed serializer embeds
+		//        the hash over its own byte layout, e.g. pretty-printed) ----
+		{
+			Check(UnrealGamePatcher::FIndexManifestFile::Save(IndexPath, Sample), TEXT("save clean manifest (legacy case)"));
+			FString Json;
+			Check(FFileHelper::LoadFileToString(Json, *IndexPath), TEXT("read clean manifest (legacy case)"));
+			TSharedPtr<FJsonObject> Root;
+			{
+				const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+				Check(FJsonSerializer::Deserialize(Reader, Root) && Root.IsValid(), TEXT("parse clean manifest (legacy case)"));
+			}
+			// Re-serialize without selfCheck under a pretty writer: the byte
+			// layout a legacy publisher could have produced (LINE_TERMINATOR
+			// + tabs). The hash goes over exactly these bytes.
+			Root->Values.Remove(TEXT("selfCheck"));
+			FString PrettyBody;
+			{
+				const TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+					TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&PrettyBody);
+				Check(FJsonSerializer::Serialize(Root.ToSharedRef(), Writer), TEXT("serialize pretty body (legacy case)"));
+			}
+			Root->SetStringField(TEXT("selfCheck"), UnrealGamePatcher::JsonSelfCheckHex(PrettyBody));
+			FString PrettyFull;
+			{
+				const TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+					TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&PrettyFull);
+				Check(FJsonSerializer::Serialize(Root.ToSharedRef(), Writer), TEXT("serialize pretty full (legacy case)"));
+			}
+			Check(FFileHelper::SaveStringToFile(PrettyFull, *IndexPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM), TEXT("write legacy-layout manifest"));
+			// Canonical re-serialization cannot reproduce the pretty bytes;
+			// the raw-body fallback must accept the file.
+			UnrealGamePatcher::FIndexManifest LegacyLoaded;
+			Check(UnrealGamePatcher::FIndexManifestFile::Load(IndexPath, LegacyLoaded), TEXT("load legacy-layout manifest (raw-body fallback)"));
+			Check(LegacyLoaded.Files.Num() == Sample.Files.Num() &&
+				LegacyLoaded.Chunks.Num() == Sample.Chunks.Num(),
+				TEXT("legacy manifest data intact"));
+
+			// Tampering a legacy-layout file must still be caught: the raw
+			// hash over the modified bytes no longer matches.
+			Check(FFileHelper::LoadFileToString(Json, *IndexPath), TEXT("re-read legacy manifest"));
+			Json = Json.Replace(TEXT("1.0.0"), TEXT("1.0.1"));
+			Check(FFileHelper::SaveStringToFile(Json, *IndexPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM), TEXT("write tampered legacy manifest"));
+			UnrealGamePatcher::FIndexManifest LegacyDummy;
+			Check(!UnrealGamePatcher::FIndexManifestFile::Load(IndexPath, LegacyDummy), TEXT("reject tampered legacy-layout manifest"));
 		}
 
 		// --- 5. Corruption / schema detection ------------------------------

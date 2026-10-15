@@ -6,6 +6,7 @@
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformFileManager.h"
 #include "Hash/FPatcherHash.h"
+#include "Misc/Char.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -151,5 +152,49 @@ namespace UnrealGamePatcher
 	inline FString JsonSelfCheckHex(const FString& CanonicalBody)
 	{
 		return FPatcherHash::XXH64ToHex(CanonicalBody.GetCharArray().GetData(), CanonicalBody.Len() * sizeof(TCHAR));
+	}
+
+	/** Legacy-layout fallback for the canonical-body self-check. Indexes/deltas
+	 *  published before the condensed serializer (pretty-printed writer, pre-
+	 *  metaHash ioChunks) embed the hash over their own raw bytes, so the
+	 *  canonical re-serialization can never reproduce it. Verifies the hash
+	 *  against the raw text with the embedded "selfCheck" key-value stripped.
+	 *  Tamper strength is unchanged: any body byte change breaks the raw hash. */
+	inline bool MatchesRawBodySelfCheck(const FString& Text, const FString& SelfCheckHex)
+	{
+		// Scan every "selfCheck" token from the end (root writes it last); a
+		// token inside an escaped value can't match the strict shape below.
+		// SearchFrom strictly decreases: Find's FromEnd StartPos=-1 would mean
+		// INDEX_NONE (= search from the end again, looping forever).
+		const TCHAR Needle[] = TEXT("\"selfCheck\"");
+		constexpr int32 NeedleLen = sizeof(Needle) / sizeof(TCHAR) - 1;
+		const FString Quoted = TEXT("\"") + SelfCheckHex + TEXT("\"");
+		int32 SearchFrom = Text.Len();
+		while (SearchFrom > 0)
+		{
+			const int32 KeyIdx = Text.Find(Needle, ESearchCase::CaseSensitive, ESearchDir::FromEnd, SearchFrom - 1);
+			if (KeyIdx == INDEX_NONE) { break; }
+			SearchFrom = KeyIdx;
+			int32 Cursor = KeyIdx + NeedleLen;
+			const auto SkipWs = [&Text, &Cursor]()
+			{
+				while (Cursor < Text.Len() && TChar<TCHAR>::IsWhitespace(Text[Cursor])) { ++Cursor; }
+			};
+			SkipWs();
+			if (Cursor >= Text.Len() || Text[Cursor] != TEXT(':')) { continue; }
+			++Cursor;
+			SkipWs();
+			if (!Text.Mid(Cursor, Quoted.Len()).Equals(Quoted, ESearchCase::IgnoreCase)) { continue; }
+			const int32 ValueEnd = Cursor + Quoted.Len();
+			int32 CommaIdx = KeyIdx - 1;
+			while (CommaIdx >= 0 && TChar<TCHAR>::IsWhitespace(Text[CommaIdx])) { --CommaIdx; }
+			if (CommaIdx < 0 || Text[CommaIdx] != TEXT(',')) { continue; }
+			const FString RawBody = Text.Mid(0, CommaIdx) + Text.Mid(ValueEnd);
+			if (JsonSelfCheckHex(RawBody).Equals(SelfCheckHex, ESearchCase::IgnoreCase))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 }

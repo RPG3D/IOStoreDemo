@@ -89,7 +89,10 @@ namespace UnrealGamePatcher
 
 		// --- FIoChunkId: hex round trip ---------------------------------------
 		{
-			const FIoChunkId ChunkId = CreateIoChunkId(0x1234, 0, EIoChunkType::ExternalFile);
+			// ExternalFile / bulk-data types are rejected by engine
+			// CreateIoChunkId (IoChunkId checkSlow asserts, Debug-only); the
+			// hex round trip is type-agnostic.
+			const FIoChunkId ChunkId = CreateIoChunkId(0x1234, 0, EIoChunkType::ExportBundleData);
 			const FString Hex = FPatcherHash::FIoChunkIdToHex(ChunkId);
 			const FIoChunkId Parsed = FPatcherHash::FIoChunkIdFromHex(Hex);
 			bAllPassed &= Check(Parsed == ChunkId, TEXT("FIoChunkId hex round trip"));
