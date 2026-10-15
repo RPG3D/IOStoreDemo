@@ -1,0 +1,38 @@
+{
+  "$comment": "UGP debug-scenario breakpoint preset, consumed by verify_mcp_debug.py. Lines are 1-based and follow the current source (review acc7588).",
+  "breakpoints": [
+    {
+      "file": "Source/Programs/UnrealGamePatcher/UnrealGamePatcherCore/Private/Update/FUpdateOrchestrator.cpp",
+      "line": 449,
+      "label": "FUpdateOrchestrator::UpdateWithOptions body entry (CLI update path; Version=1.0.0, fresh install)",
+      "expectVars": [
+        "CdnDir",
+        "Version",
+        "InstallDir"
+      ],
+      "marker": "UpdateWithOptions"
+    },
+    {
+      "file": "Source/Programs/UnrealGamePatcher/UnrealGamePatcherCore/Private/Update/FUpdateOrchestrator.cpp",
+      "line": 256,
+      "label": "RebuildFileFromChunks body entry (whole-file rebuild assembles chunks; hits per added file)",
+      "marker": "RebuildFileFromChunks",
+      "expectVars": [
+        "FileId",
+        "InstallDir"
+      ]
+    }
+  ],
+  "assert": {
+    "exitCode": 0,
+    "installedFiles": [
+      "pakchunk1-Windows.pak",
+      "pakchunk1-Windows.ucas",
+      "pakchunk1-Windows.utoc"
+    ],
+    "stateFiles": [
+      "UnrealGamePatcher.state.json",
+      ".ugp/index.json"
+    ]
+  }
+}
