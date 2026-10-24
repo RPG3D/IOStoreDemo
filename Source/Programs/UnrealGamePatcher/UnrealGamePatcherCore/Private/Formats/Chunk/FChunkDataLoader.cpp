@@ -4,6 +4,7 @@
 #include "Hash/FPatcherHash.h"
 #include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
+#include "UnrealGamePatcherPaths.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Compression.h"
@@ -100,9 +101,9 @@ namespace UnrealGamePatcher
 		}
 	}
 
-		// [8B magic][8B usz][8B csz][1B storedAs][20B sha1][data]
-		TArray64<uint8> Out;
-		Out.Reserve(HeaderSize + Stored.Num());
+	// [8B magic][8B usz][8B csz][1B storedAs][20B sha1][data]
+	TArray64<uint8> Out;
+	Out.Reserve(HeaderSize + Stored.Num());
 	for (int32 I = 0; I < 8; ++I) { Out.Add((uint8)FChunkDataLoader::Magic[I]); }
 	WriteU64(Out, (uint64)UncompressedSize);
 	WriteU64(Out, (uint64)Stored.Num());
@@ -110,12 +111,29 @@ namespace UnrealGamePatcher
 	for (int32 I = 0; I < 20; ++I) { Out.Add(Hash[I]); }
 	Out.Append(Stored);
 
-	const bool bOk = FFileHelper::SaveArrayToFile(Out, *ChunkFilePath);
-	if (bOk)
+	// Atomic publish (fixplan L-M3): the content-addressed target may be a
+	// cross-version chunk shared with an already-published index - a torn
+	// direct write would corrupt it for every existing client. Write to a
+	// temp name and swap in; readers never see a partial file.
+	const FString TempPath = ChunkFilePath + TEXT(".tmp");
+	IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+	if (PF.FileExists(*TempPath) && !PF.DeleteFile(*TempPath))
 	{
-		FIOStats::Get().AddDiskWrite(Out.Num());
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: cannot remove stale temp '%s'"), *TempPath);
+		return false;
 	}
-	return bOk;
+	if (!FFileHelper::SaveArrayToFile(Out, *TempPath))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: failed writing '%s'"), *TempPath);
+		return false;
+	}
+	if (!Paths::AtomicReplaceFile(TempPath, ChunkFilePath))
+	{
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("FChunkDataLoader: cannot publish '%s'"), *ChunkFilePath);
+		return false;
+	}
+	FIOStats::Get().AddDiskWrite(Out.Num());
+	return true;
 }
 
 	bool FChunkDataLoader::Load(const FString& ChunkFilePath, const FIndexChunkEntry& Entry, TArray64<uint8>& OutData)

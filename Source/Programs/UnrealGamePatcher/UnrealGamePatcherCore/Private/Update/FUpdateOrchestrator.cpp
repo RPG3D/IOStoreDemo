@@ -448,6 +448,16 @@ namespace UnrealGamePatcher
 	{
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
 
+		// Single-writer guard (fixplan L-M5): mutating runs take the install
+		// lock so a parallel CLI/GUI run on the same directory cannot
+		// interleave transactions, sidecar writes or CoW commits. Check-only
+		// runs stay lock-free read-only. The lock is held for the whole run.
+		Paths::FInstallLock InstallLock;
+		if (bApply && !InstallLock.Acquire(InstallDir))
+		{
+			return false;
+		}
+
 		// Fresh installs are the PRIMARY scenario (a patcher bootstrapping a
 		// new directory / new player machine): create the install dir instead
 		// of demanding it pre-exist. Idempotent when it is already there.

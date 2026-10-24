@@ -24,4 +24,25 @@ namespace UnrealGamePatcher::Paths
 	 *  existing destination) is closed. Returns false, with DestPath left
 	 *  holding its previous content, when SrcPath could not be moved in. */
 	UNREALGAMEPATCHERCORE_API bool AtomicReplaceFile(const FString& SrcPath, const FString& DestPath);
+
+	/** Single-writer guard for one install directory (fixplan L-M5): a named
+	 *  mutex derived from the case-normalized install path. The OS releases
+	 *  the mutex on process death, so there is no stale-lock state to
+	 *  recover - a crashed run never blocks the next one. */
+	struct UNREALGAMEPATCHERCORE_API FInstallLock
+	{
+		FInstallLock() = default;
+		~FInstallLock();
+		FInstallLock(const FInstallLock&) = delete;
+		FInstallLock& operator=(const FInstallLock&) = delete;
+
+		/** Takes the lock; returns false (and logs) when another writer
+		 *  already holds it. Re-entrant within one process is NOT supported
+		 *  - a second Acquire on the same directory fails by design. */
+		bool Acquire(const FString& InstallDir);
+		void Release();
+
+	private:
+		void* MutexHandle = nullptr; // HANDLE; void* keeps windows.h out of this header
+	};
 }

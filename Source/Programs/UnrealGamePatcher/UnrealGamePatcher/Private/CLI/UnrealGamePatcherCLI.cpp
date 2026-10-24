@@ -1272,6 +1272,36 @@ namespace
 		Check(FBuildIngestor::Ingest(StagedDir, TEXT("IOStoreDemo"), TEXT("1.0.0"), CdnB, R2), TEXT("ingest #2 succeeds"));
 		Check(R1.NumFiles == 4 && R1.NumChunks > 0, TEXT("ingest: 4 files, chunks produced"));
 
+		// --- 1b. Chunk write atomicity (fixplan L-M3): overwriting an
+		//     existing content-addressed chunk (cross-version shared) and a
+		//     garbage-prefilled target must land complete bytes with no .tmp
+		//     residue - readers never see a partial publish -----------------
+		{
+			const FString ChunkDir = FPaths::Combine(WorkDir, TEXT("chunks-atomic"));
+			PF.CreateDirectoryTree(*ChunkDir);
+			const uint8 A[] = { 1, 2, 3, 4, 5 };
+			const uint8 B[] = { 9, 8, 7, 6 };
+			FString Sha1A, Sha1B;
+			uint8 StoredAs = 0;
+			const FString PathA = FPaths::Combine(ChunkDir, TEXT("a.chunk"));
+			Check(FChunkDataLoader::Write(PathA, A, sizeof(A), Sha1A, StoredAs), TEXT("chunk write #1 succeeds"));
+			Check(FChunkDataLoader::Write(PathA, B, sizeof(B), Sha1B, StoredAs), TEXT("chunk write #2 (overwrite) succeeds"));
+			Check(Sha1A != Sha1B, TEXT("chunk overwrite produced the new content address"));
+			const FString PathC = FPaths::Combine(ChunkDir, TEXT("c.chunk"));
+			{
+				const uint8 Garbage[] = { 0xEE };
+				Check(FFileHelper::SaveArrayToFile(TArray<uint8>(Garbage, 1), *PathC), TEXT("prefill garbage chunk"));
+			}
+			Check(FChunkDataLoader::Write(PathC, A, sizeof(A), Sha1A, StoredAs), TEXT("chunk write over garbage succeeds"));
+			TArray64<uint8> Round;
+			FIndexChunkEntry Entry;
+			Entry.SHA1 = Sha1A;
+			Entry.Size = sizeof(A);
+			Check(FChunkDataLoader::Load(PathC, Entry, Round) && Round.Num() == (int64)sizeof(A),
+				TEXT("chunk load round-trips after overwrite"));
+			Check(!PF.FileExists(*(PathA + TEXT(".tmp"))), TEXT("no .tmp residue after chunk writes"));
+		}
+
 		// --- 2. Determinism: byte-identical index files ---------------------
 		{
 			FString BytesA, BytesB;
@@ -2226,6 +2256,22 @@ namespace
 		Check(S1.NumChunksFetched == Index.Chunks.Num(), TEXT("full update: every chunk fetched (no local state)"));
 		Check(S1.NumChunksReused == 0, TEXT("full update: nothing reused"));
 		Check(PF.FileExists(*(FPaths::Combine(Install, TEXT(".ugp"), TEXT("index.json")))), TEXT("local state file written"));
+
+		// --- 1b. Install lock (fixplan L-M5): one writer per install dir ----
+		{
+			Paths::FInstallLock Lock;
+			Check(Lock.Acquire(Install), TEXT("install lock: acquire succeeds"));
+			{
+				Paths::FInstallLock Second;
+				Check(!Second.Acquire(Install), TEXT("install lock: second acquire on same dir fails"));
+				const FString Other = FPaths::Combine(WorkDir, TEXT("install-other"));
+				Check(Second.Acquire(Other), TEXT("install lock: different dir acquires"));
+				Second.Release();
+			}
+			Lock.Release();
+			Check(Lock.Acquire(Install), TEXT("install lock: re-acquire after release succeeds"));
+			Lock.Release();
+		}
 
 
 
@@ -4276,7 +4322,76 @@ namespace
 						FMemory::Memcmp(Final.GetData(), Whole.GetData(), BigTotal) == 0,
 						TEXT("H2b: resumed content matches the CDN copy"));
 				}
+			// --- H2c: Cancel fast path - a job with InFlight == 0 (here:
+			//     planned but window-starved, undone > 0) fires OnDone
+			//     immediately. NOTE: the stale-InFlight state N-C1 described
+			//     (issued segments all settled, remainder unissued) is NOT
+			//     reachable through scheduling - refill-on-settle always
+			//     re-takes the freed slot. The settle-side InFlight decrement
+			//     (fixplan N-C1/M23) is accounting hygiene that keeps the
+			//     InFlight==0 check exact; this test pins the check's
+			//     contract. -------------------------------------------------
+			{
+				FStallingBackend Stall;
+				Stall.Root = Cdn;
+				bool bBCanceledDone = false;
+				{
+					FDownloadExecutorConfig CfgC;
+					CfgC.Window = 2;
+					FDownloadExecutor Executor(Stall, CfgC);
+					// Job A: 3 segments at 12MB - the 2-slot window fills with
+					// A0/A1; A2 stays unissued, so A is never exhausted.
+					FDownloadJob A;
+					A.Id = TEXT("H2c-A");
+					A.Url = BigUrl;
+					A.DestPath = FPaths::Combine(WorkDir, TEXT("h2c-a.bin"));
+					A.ExpectedSize = 12ll << 20;
+					const int64 HandleA = Executor.Submit(MoveTemp(A), [](const FDownloadResult&) {});
+					// Job B: planned but starved - 0 issued, InFlight == 0.
+					FDownloadJob B;
+					B.Id = TEXT("H2c-B");
+					B.Url = BigUrl;
+					B.DestPath = FPaths::Combine(WorkDir, TEXT("h2c-b.bin"));
+					B.ExpectedSize = BigTotal;
+					const int64 HandleB = Executor.Submit(MoveTemp(B),
+						[&bBCanceledDone](const FDownloadResult&) { bBCanceledDone = true; });
+					{
+						FScopeLock Scope(&Stall.Lock);
+						Check(Stall.Pending.Num() == 2, TEXT("H2c: window holds exactly A's two segments"));
+					}
+					Executor.Cancel(HandleB);
+					Check(bBCanceledDone, TEXT("H2c: cancel of a zero-in-flight job fires OnDone immediately"));
+					Executor.Cancel(HandleA);
+				} // destructor cancels A's pending requests; nothing hangs
 			}
+
+			// --- H2d: batch watchdog - a transport that never settles must
+			//     fail the batch at the stall timeout instead of hanging. ---
+			{
+				FStallingBackend Stall;
+				Stall.Root = Cdn;
+				FDownloadManager Manager(Stall, 2, 0, /*StallTimeoutSec=*/1.5);
+				TArray<FDownloadRequest> Reqs;
+				for (int32 I = 0; I < 2; ++I)
+				{
+					FDownloadRequest R;
+					R.Id = FString::Printf(TEXT("H2d-%d"), I);
+					R.Url = BigUrl;
+					R.Size = BigTotal;
+					R.DestFile = FPaths::Combine(WorkDir, FString::Printf(TEXT("h2d-%d.bin"), I));
+					Reqs.Add(R);
+				}
+				FDownloadStats Stats;
+				TArray<FString> Failed;
+				const double T0 = FPlatformTime::Seconds();
+				const bool bOk = Manager.DownloadAll(Reqs, Stats, Failed);
+				const double Elapsed = FPlatformTime::Seconds() - T0;
+				Check(!bOk, TEXT("H2d: stalled batch fails"));
+				Check(Failed.Contains(TEXT("H2d-0")) && Failed.Contains(TEXT("H2d-1")),
+					TEXT("H2d: stalled jobs reported failed"));
+				Check(Elapsed < 30.0, TEXT("H2d: watchdog fired near the stall timeout (no hang)"));
+			}
+			} // H2b/H2c/H2d scope: FStallingBackend and the 9MB fixture live here
 
 			// --- H3: fairness - later small jobs finish before the big (4.4) -
 			{
