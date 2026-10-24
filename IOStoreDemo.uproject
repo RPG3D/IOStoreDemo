@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "{8A76C2A2-4968-00D2-732B-03A4200B8146}",
+	"EngineAssociation": "{A8AD6A96-449D-7D70-175F-DBBAEA8C6118}",
 	"Category": "",
 	"Description": "",
 	"Modules": [
@@ -21,6 +21,10 @@
 		}
 	],
 	"TargetPlatforms": [],
+	
+	
+	
+	
 	"AdditionalRootDirectories": [],
 	"AdditionalPluginDirectories": [],
 	"EpicSampleNameHash": ""
