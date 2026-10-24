@@ -98,6 +98,19 @@ namespace UnrealGamePatcher
 			bAllPassed &= Check(Parsed == ChunkId, TEXT("FIoChunkId hex round trip"));
 		}
 
+		// --- Strict hex parsing: malformed input never reaches the engine ----
+		{
+			TArray<uint8> Out;
+			bAllPassed &= Check(!FPatcherHash::HexToBytes(TEXT("abc"), Out), TEXT("reject odd-length hex"));
+			bAllPassed &= Check(!FPatcherHash::HexToBytes(TEXT("zz"), Out), TEXT("reject non-hex input"));
+			bAllPassed &= Check(FPatcherHash::HexToBytes(TEXT("DEADBEEF"), Out) && Out.Num() == 4,
+				TEXT("accept even-length hex"));
+			const FXxHash64 BadXx = FPatcherHash::XXH64FromHex(TEXT("nothex"));
+			bAllPassed &= Check(BadXx.Hash == 0, TEXT("XXH64FromHex bad input -> zero hash"));
+			const FIoHash BadIo = FPatcherHash::FIoHashFromHex(TEXT("1234"));
+			bAllPassed &= Check(BadIo == FIoHash(), TEXT("FIoHashFromHex bad input -> invalid hash"));
+		}
+
 		return bAllPassed;
 	}
 }

@@ -329,10 +329,26 @@ namespace UnrealGamePatcher
 						State->Deliver(Total, false);
 						return;
 					}
+					// A header-period delivery (Content-Range) cancels the
+					// request, so its completion lands here - delivered is
+					// success, not an error.
+					if (State->bDelivered.load())
+					{
+						UE_LOG(LogUnrealGamePatcherDownload, Verbose, TEXT("FHttpRangeRequest: probe '%s' completion after header-period delivery"), *Url);
+						return;
+					}
 					UE_LOG(LogUnrealGamePatcherDownload, Error, TEXT("FHttpRangeRequest: probe '%s' failed (no total)"), *Url);
 					State->Deliver(-1, false);
 				});
 			Request->SetDelegateThreadPolicy(EHttpRequestDelegateThreadPolicy::CompleteOnHttpThread);
-			Request->ProcessRequest();
+			if (!Request->ProcessRequest())
+			{
+				// Same contract as IssueRequest: the completion may never be
+				// dispatched for a request that failed to start - deliver the
+				// failure inline (Deliver keeps it single).
+				UE_LOG(LogUnrealGamePatcherDownload, Error, TEXT("FHttpRangeRequest: probe '%s' cannot start"), *Url);
+				State->Deliver(-1, false);
+				return;
+			}
 		}
 }

@@ -177,6 +177,7 @@ namespace UnrealGamePatcher
 		int32 NextEnqueueOrder = 0;
 		int32 WindowInFlight = 0;
 		int64 NextHandle = 0;
+		int64 ProgressTick = 0;
 
 		FExecutorState(IChunkDownloader& InBackend, const FDownloadExecutorConfig& InConfig)
 			: Backend(InBackend), Cfg(InConfig)
@@ -251,6 +252,12 @@ namespace UnrealGamePatcher
 			const TArray64<uint8>& Data, const FString& Error)
 		{
 			WindowInFlight -= 1;
+			// Paired with IssueSegment's += 1: every issued segment settles
+			// exactly once, so the decrement must happen before the early
+			// returns below or a canceled/paused job's count goes stale and
+			// Cancel's InFlight==0 check never fires.
+			J.InFlight -= 1;
+			ProgressTick += 1;
 
 			if (J.bFinished)
 			{
@@ -314,12 +321,12 @@ namespace UnrealGamePatcher
 
 		// ---- scheduling (Lock held) ---------------------------------------
 
-		/** Fills the in-flight window. Three rules, in order: (0) fair share -
-		 *  any job may hold up to 4 in-flight segments; (1) finishing jobs -
-		 *  a job with <= 2 undone segments gets unlimited share so files
-		 *  complete (and verify/promote) early; probes for unknown-size jobs.
-		 *  Called after every submit/cancel/settle - the single scheduling
-		 *  point. */
+		/** Fills the in-flight window. Two rules, in order: (0) finishing jobs -
+		 *  a job with <= 2 undone segments gets the window first (capped at 4
+		 *  in-flight segments per job) so files complete (and verify/promote)
+		 *  early; (1) any job, unlimited share, plus size probes for
+		 *  unknown-size jobs. Called after every submit/cancel/settle - the
+		 *  single scheduling point. */
 		void Refill()
 		{
 			while (WindowInFlight < Cfg.Window)
@@ -673,4 +680,10 @@ void UnrealGamePatcher::FDownloadExecutor::Cancel(int64 Handle)
 {
 	FScopeLock Scope(&State->Lock);
 	State->Cancel(Handle);
+}
+
+int64 UnrealGamePatcher::FDownloadExecutor::GetProgressTick()
+{
+	FScopeLock Scope(&State->Lock);
+	return State->ProgressTick;
 }

@@ -10,6 +10,32 @@
 
 namespace UnrealGamePatcher
 {
+	namespace
+	{
+		// The engine's UE::String::HexToBytes pads odd lengths (writing
+		// (Len+1)/2 bytes), checkf-crashes on non-hex characters in
+		// Debug/Development and silently zero-fills in Shipping - and
+		// FIoHash's string ctor check()s on the wrong length. Everything
+		// handed to the engine must pass this gate first.
+		bool IsStrictHex(const FString& Hex, const int32 ExpectedLen)
+		{
+			if (Hex.Len() != ExpectedLen)
+			{
+				return false;
+			}
+			for (const TCHAR C : Hex)
+			{
+				if (!(C >= TEXT('0') && C <= TEXT('9')) &&
+					!(C >= TEXT('a') && C <= TEXT('f')) &&
+					!(C >= TEXT('A') && C <= TEXT('F')))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+
 	uint64 FPatcherHash::XXH64(const void* Data, uint64 Size)
 	{
 		return FXxHash64::HashBuffer(Data, Size).Hash;
@@ -32,8 +58,12 @@ namespace UnrealGamePatcher
 
 	FXxHash64 FPatcherHash::XXH64FromHex(const FString& Hex)
 	{
+		if (!IsStrictHex(Hex, 16))
+		{
+			return FXxHash64();
+		}
 		uint8 Bytes[sizeof(uint64)] = { 0 };
-		UE::String::HexToBytes(Hex, Bytes);
+		UE::String::HexToBytes(FWideStringView(Hex), Bytes);
 		return FXxHash64::FromByteArray(Bytes);
 	}
 
@@ -46,6 +76,10 @@ namespace UnrealGamePatcher
 
 	FIoHash FPatcherHash::FIoHashFromHex(const FString& Hex)
 	{
+		if (!IsStrictHex(Hex, 40))
+		{
+			return FIoHash();
+		}
 		return FIoHash(FWideStringView(Hex));
 	}
 
@@ -69,11 +103,18 @@ namespace UnrealGamePatcher
 	bool FPatcherHash::HexToBytes(const FString& Hex, TArray<uint8>& OutBytes)
 	{
 		OutBytes.Reset();
-		const int32 MaxBytes = Hex.Len() / 2;
-		OutBytes.SetNumUninitialized(MaxBytes);
+		// Pre-validate: odd length would make the engine write one byte past
+		// the Len/2-sized buffer, non-hex input crashes (Debug) or zero-fills
+		// (Shipping). After this gate the engine call is exact.
+		if (Hex.Len() % 2 != 0 || !IsStrictHex(Hex, Hex.Len()))
+		{
+			return false;
+		}
+		const int32 NumBytes = Hex.Len() / 2;
+		OutBytes.SetNumUninitialized(NumBytes);
 		const int32 Written = UE::String::HexToBytes(FWideStringView(Hex), OutBytes.GetData());
 		OutBytes.SetNum(Written);
-		return Written == MaxBytes;
+		return Written == NumBytes;
 	}
 
 	FString FPatcherHash::FileSHA1Hex(const FString& Path, int64* OutSize)

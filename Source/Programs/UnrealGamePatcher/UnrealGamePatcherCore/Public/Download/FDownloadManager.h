@@ -42,9 +42,12 @@ namespace UnrealGamePatcher
 	struct FDownloadManager
 	{
 		/** InDownloader must outlive the manager. MaxConcurrent bounds the
-		 *  in-flight worker threads; MaxRetries bounds transport retries per
-		 *  request. */
-		UNREALGAMEPATCHERCORE_API FDownloadManager(IChunkDownloader& InDownloader, int32 MaxConcurrent = 8, int32 MaxRetries = 3);
+		 *  in-flight window; MaxRetries bounds transport retries per request;
+		 *  StallTimeoutSec is the batch watchdog: no segment-level progress
+		 *  for this long fails the whole batch (guards against a transport
+		 *  that loses its settle callback - that would otherwise hang the
+		 *  waiting thread forever). */
+		UNREALGAMEPATCHERCORE_API FDownloadManager(IChunkDownloader& InDownloader, int32 MaxConcurrent = 8, int32 MaxRetries = 3, double InStallTimeoutSec = 300.0);
 
 		/** Downloads every request. Returns false when at least one request
 		 *  failed permanently (its id is reported through OutFailedIds; no
@@ -58,5 +61,6 @@ namespace UnrealGamePatcher
 		IChunkDownloader& Downloader;
 		int32 MaxConcurrent;
 		int32 MaxRetries;
+		double StallTimeoutSec;
 	};
 }

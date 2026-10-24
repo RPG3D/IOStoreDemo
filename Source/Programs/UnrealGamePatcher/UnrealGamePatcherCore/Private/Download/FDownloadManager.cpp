@@ -8,6 +8,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/Event.h"
 #include "Misc/ScopeLock.h"
 #include "SecureHash.h"
 
@@ -55,10 +56,11 @@ namespace UnrealGamePatcher
 		}
 	}
 
-	FDownloadManager::FDownloadManager(IChunkDownloader& InDownloader, int32 InMaxConcurrent, int32 InMaxRetries)
+	FDownloadManager::FDownloadManager(IChunkDownloader& InDownloader, int32 InMaxConcurrent, int32 InMaxRetries, double InStallTimeoutSec)
 		: Downloader(InDownloader)
 		, MaxConcurrent(FMath::Max(1, InMaxConcurrent))
 		, MaxRetries(FMath::Max(0, InMaxRetries))
+		, StallTimeoutSec(InStallTimeoutSec)
 	{
 	}
 
@@ -112,12 +114,26 @@ namespace UnrealGamePatcher
 		Cfg.MaxRetries = MaxRetries;
 		FDownloadExecutor Executor(Downloader, Cfg);
 
-		std::atomic<int32> Remaining{ ToFetch.Num() };
-		std::atomic<int32> Retries{ 0 };
-		std::atomic<int64> BytesDownloaded{ 0 };
-		FCriticalSection FailLock;
-		FEvent* DoneEvent = FPlatformProcess::GetSynchEventFromPool(true);
+		// Batch state lives on the heap and is captured by value: the watchdog
+		// below may return while straggler callbacks are still pending (a
+		// lost-callback transport), so no lambda may touch this stack frame -
+		// including the failure list, which is owned here and moved into the
+		// caller's array just before returning.
+		struct FBatchContext
+		{
+			std::atomic<int32> Remaining{ 0 };
+			std::atomic<int32> Retries{ 0 };
+			std::atomic<int64> BytesDownloaded{ 0 };
+			FCriticalSection FailLock;
+			TArray<FString> Failed;
+			TSet<FString> FinishedIds;
+			FEventRef DoneEvent; // owned: outlives straggler Triggers
+		};
+		TSharedRef<FBatchContext> Ctx = MakeShared<FBatchContext>();
+		Ctx->Remaining.store(ToFetch.Num(), std::memory_order_release);
 
+		TArray<int64> Handles;
+		Handles.Reserve(ToFetch.Num());
 		for (const FDownloadRequest& Request : ToFetch)
 		{
 			FDownloadJob Job;
@@ -127,34 +143,104 @@ namespace UnrealGamePatcher
 			Job.ExpectedSize = Request.Size;
 			Job.ExpectedSha1 = Request.ExpectedSha1;
 
-			Executor.Submit(MoveTemp(Job),
-				[&Remaining, &Retries, &BytesDownloaded, &FailLock, &OutFailedIds,
-					DoneEvent, Id = Request.Id](const FDownloadResult& Result)
+			Handles.Add(Executor.Submit(MoveTemp(Job),
+				[Ctx, Id = Request.Id](const FDownloadResult& Result)
 			{
-				Retries.fetch_add(Result.Retries, std::memory_order_release);
-				BytesDownloaded.fetch_add(Result.BytesDownloaded, std::memory_order_release);
-				if (!Result.bSuccess)
+				Ctx->Retries.fetch_add(Result.Retries, std::memory_order_release);
+				Ctx->BytesDownloaded.fetch_add(Result.BytesDownloaded, std::memory_order_release);
 				{
-					FScopeLock FailScope(&FailLock);
-					OutFailedIds.AddUnique(Result.Id);
-					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FDownloadManager: '%s' failed: %s"), *Result.Id, *Result.Error);
+					FScopeLock FailScope(&Ctx->FailLock);
+					Ctx->FinishedIds.Add(Id);
+					if (!Result.bSuccess)
+					{
+						Ctx->Failed.AddUnique(Result.Id);
+						UE_LOG(LogUnrealGamePatcher, Error, TEXT("FDownloadManager: '%s' failed: %s"), *Result.Id, *Result.Error);
+					}
 				}
-				if (Remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+				if (Ctx->Remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
 				{
-					DoneEvent->Trigger();
+					Ctx->DoneEvent->Trigger();
 				}
-			});
+			}));
 		}
 
+		bool bStalled = false;
 		if (ToFetch.Num() > 0)
 		{
-			DoneEvent->Wait();
+			// Watchdog: a transport that loses its settle callback would hang
+			// this thread forever on the unbounded wait. Fail the batch when
+			// the executor reports no segment-level progress for
+			// StallTimeoutSec; straggler callbacks stay safe (heap context)
+			// and still record through FailedIds.
+			const double StallTimeout = FMath::Max(StallTimeoutSec, 1.0);
+			double LastProgress = FPlatformTime::Seconds();
+			int64 LastTick = Executor.GetProgressTick();
+			while (Ctx->Remaining.load(std::memory_order_acquire) > 0)
+			{
+				if (Ctx->DoneEvent->Wait(1000))
+				{
+					break;
+				}
+				const int64 Tick = Executor.GetProgressTick();
+				const double Now = FPlatformTime::Seconds();
+				if (Tick != LastTick)
+				{
+					LastTick = Tick;
+					LastProgress = Now;
+				}
+				else if (Now - LastProgress >= StallTimeout)
+				{
+					UE_LOG(LogUnrealGamePatcher, Error,
+						TEXT("FDownloadManager: batch stalled for %.0fs with %d job(s) unfinished - failing the batch"),
+						Now - LastProgress, Ctx->Remaining.load(std::memory_order_acquire));
+					for (const int64 Handle : Handles)
+					{
+						Executor.Cancel(Handle);
+					}
+					bStalled = true;
+					break;
+				}
+			}
+			if (bStalled)
+			{
+				// Grace drain: canceled jobs on a healthy transport settle
+				// within moments; a genuinely hung one never does - its late
+				// callbacks only touch the heap context, so returning is safe.
+				const double Deadline = FPlatformTime::Seconds() + 10.0;
+				while (Ctx->Remaining.load(std::memory_order_acquire) > 0 &&
+					FPlatformTime::Seconds() < Deadline)
+				{
+					Ctx->DoneEvent->Wait(250);
+				}
+				// Jobs that never reported count as failed (the late callbacks
+				// would record them anyway, but the return value must already
+				// reflect the failure).
+				FScopeLock FailScope(&Ctx->FailLock);
+				for (const FDownloadRequest& Request : ToFetch)
+				{
+					if (!Ctx->FinishedIds.Contains(Request.Id))
+					{
+						Ctx->Failed.AddUnique(Request.Id);
+					}
+				}
+			}
 		}
-		FPlatformProcess::ReturnSynchEventToPool(DoneEvent);
+
+		// Publish results into the caller's array. The pre-check above may
+		// already have added ids here, so merge instead of replace. After
+		// this, straggler callbacks keep writing into the (heap-owned)
+		// context - safe to drop on the floor: the batch already returned.
+		{
+			FScopeLock FailScope(&Ctx->FailLock);
+			for (const FString& F : Ctx->Failed)
+			{
+				OutFailedIds.AddUnique(F);
+			}
+		}
 
 		OutStats.Completed = OutStats.SkippedExisting + (int32)ToFetch.Num() - OutFailedIds.Num();
-		OutStats.Retries = Retries.load(std::memory_order_acquire);
-		OutStats.BytesDownloaded = BytesDownloaded.load(std::memory_order_acquire);
+		OutStats.Retries = Ctx->Retries.load(std::memory_order_acquire);
+		OutStats.BytesDownloaded = Ctx->BytesDownloaded.load(std::memory_order_acquire);
 		OutStats.Failed = OutFailedIds.Num();
 
 		// Global I/O accounting: wire bytes that actually crossed the network,

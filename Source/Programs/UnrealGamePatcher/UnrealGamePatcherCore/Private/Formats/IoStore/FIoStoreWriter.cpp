@@ -550,7 +550,11 @@ namespace UnrealGamePatcher
 		for (const FString& Id : ChunkIds)
 		{
 			TArray<uint8> Bytes;
-			FPatcherHash::HexToBytes(Id, Bytes);
+			if (!FPatcherHash::HexToBytes(Id, Bytes))
+			{
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: chunk id '%s' is not valid hex"), *Id);
+				return false;
+			}
 			Out.Append(Bytes);
 		}
 		// Offset-lengths.
@@ -587,8 +591,11 @@ namespace UnrealGamePatcher
 		for (const FIoStoreChunk& C : Chunks)
 		{
 			TArray<uint8> Bytes;
-			FPatcherHash::HexToBytes(C.Hash, Bytes);
-			Bytes.SetNum(20);
+			if (!FPatcherHash::HexToBytes(C.Hash, Bytes) || Bytes.Num() != 20)
+			{
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: chunk hash '%s' is not valid 40-hex"), *C.Hash);
+				return false;
+			}
 			Out.Append(Bytes);
 			Out.Add(C.bIsCompressed ? 0x01 : 0x00); // flags
 			Out.Add(0); Out.Add(0); Out.Add(0);

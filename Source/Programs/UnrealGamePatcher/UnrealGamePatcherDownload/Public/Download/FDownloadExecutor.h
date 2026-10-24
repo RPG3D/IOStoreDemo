@@ -12,10 +12,10 @@ namespace UnrealGamePatcher
 	 * Window-driven download executor (Docs/DOWNLOAD.md §5): submits jobs whose
 	 * segments (4MB quantum) are issued onto the engine HTTP thread with an
 	 * in-flight window (the concurrency knob); hash/write/promote run on a
-	 * small compute pool; three-rule fair scheduling fills the window;
-	 * journal-bitmap resume survives interruptions with per-segment
-	 * granularity. The business layer only Submits and waits - segments,
-	 * threads, retries and resume are invisible.
+	 * small compute pool; two-rule scheduling (finishing jobs first, then any
+	 * job) fills the window; journal-bitmap resume survives interruptions with
+	 * per-segment granularity. The business layer only Submits and waits -
+	 * segments, threads, retries and resume are invisible.
 	 *
 	 * Per-batch instance semantics: create one executor per download batch
 	 * (matches FDownloadManager::DownloadAll); no cross-batch state.
@@ -24,6 +24,11 @@ namespace UnrealGamePatcher
 	{
 		UNREALGAMEPATCHERDOWNLOAD_API FDownloadExecutor(IChunkDownloader& InBackend, const FDownloadExecutorConfig& InConfig = FDownloadExecutorConfig());
 		UNREALGAMEPATCHERDOWNLOAD_API ~FDownloadExecutor();
+
+		/** Monotonic segment-settle counter (any settle counts, success or
+		 *  failure). The batch watchdog uses it as the liveness signal: zero
+		 *  ticks for a long span means no transport callback arrived. */
+		UNREALGAMEPATCHERDOWNLOAD_API int64 GetProgressTick();
 
 		FDownloadExecutor(const FDownloadExecutor&) = delete;
 		FDownloadExecutor& operator=(const FDownloadExecutor&) = delete;
