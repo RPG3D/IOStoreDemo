@@ -4,6 +4,13 @@
 > 预期效果（关键断言）与依赖。AI 开发 UGP 时以此为准——改动后必须保证
 > 所有套件通过（`UnrealGamePatcher.exe -cli <suite>` 退出码 0）。
 > 与 `TECHNICAL.md`（实现细节）互补；README.md 是概念介绍。
+> **代码位置（2026-10-24 拆分）**：一套件一文件，文件名 = `-cli` 命令名
+> （`UnrealGamePatcher/Private/Tests/Selftest.cpp` … `Iostoreinplace.cpp` 共 14 个，
+> e2etest/perftest 共用 `E2etest.cpp` 的同一实现）；每个文件头部注释即本套件
+> 的验证点清单。共享脚手架（MakeCheck/FinishTest/BuildFixtureCdn/
+> FCdnServerProc 等）在 `TestFramework.h/.cpp`。CLI 巨石仅保留生产命令与
+> 分发表（768 行）。命令入口与断言零改动（两轮拆分后 738 PASS 均与
+> 拆分前逐套件一致）。
 
 ---
 
