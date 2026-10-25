@@ -173,7 +173,12 @@ namespace UnrealGamePatcher
 		bool bVerifyLocalData)
 	{
 		OutStats = FInPlacePakStats();
-		const FIOStatsSnapshot IOStart = FIOStats::Get().Snapshot();
+		// Per-patch I/O report (H1 sentinel): a CoW patch must read only the
+		// windows of the entries it writes - same entries are
+		// metadata-compared, never fetched. Disk reads approaching the
+		// container size mean the patch is secretly pulling everything. The
+		// scoped guard logs the delta on every exit path, failure included.
+		FScopedIOPatchDelta ScopedIO(FString::Printf(TEXT("FInPlacePakPatcher: '%s' I/O:"), *PakId));
 
 		const FIndexFileEntry* RemoteFile = Remote.Files.Find(PakId);
 		if (!RemoteFile || RemoteFile->PakEntries.Num() == 0)
@@ -455,12 +460,6 @@ namespace UnrealGamePatcher
 		UE_LOG(LogUnrealGamePatcher, Display,
 			TEXT("FInPlacePakPatcher: '%s': %d same (zero movement, %lld bytes reused), %d appended (CoW, %d holes filled); %lld bytes written"),
 			*PakId, OutStats.NumSame, OutStats.BytesReused, OutStats.NumAppended, OutStats.NumHolesFilled, OutStats.BytesWritten);
-		// Per-patch I/O report: a CoW patch must read only the windows of the
-		// entries it writes - same entries are metadata-compared, never
-		// fetched. Disk reads approaching the container size mean the patch
-		// is secretly pulling everything (the H1 failure signature).
-		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FInPlacePakPatcher: '%s' I/O: %s"),
-			*PakId, *FIOStats::FormatDelta(IOStart, FIOStats::Get().Snapshot()));
 		return true;
 	}
 }

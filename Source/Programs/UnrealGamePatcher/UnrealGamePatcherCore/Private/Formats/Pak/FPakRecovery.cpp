@@ -73,7 +73,7 @@ namespace UnrealGamePatcher
 			TArray64<uint8> Buf;
 			Buf.SetNumUninitialized(WindowBytes);
 			if (!Handle->Seek(WindowStart) || !Handle->Read(Buf.GetData(), WindowBytes)) return false;
-
+			FIOStats::Get().AddDiskRead(WindowBytes);
 			const uint8* Base = Buf.GetData();
 			for (int32 V = PakFileVersionMax; V >= 1; --V)
 			{
@@ -183,6 +183,7 @@ namespace UnrealGamePatcher
 			Chunk.SetNumUninitialized(ChunkBytes);
 			if (Handle->Seek(ChunkStart) && Handle->Read(Chunk.GetData(), ChunkBytes))
 			{
+				FIOStats::Get().AddDiskRead(ChunkBytes);
 				for (int64 I = ChunkBytes - 4; I >= 0; --I)
 				{
 					uint32 Magic = 0;

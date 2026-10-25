@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "UnrealGamePatcherLog.h"
 #include <atomic>
 
 namespace UnrealGamePatcher
@@ -32,6 +33,8 @@ namespace UnrealGamePatcher
 		/** Bytes pushed through content hashes (SHA1/FIoHash) - the verify
 		 *  modes' dominant CPU cost, made visible. */
 		int64 HashedBytes = 0;
+
+		bool operator==(const FIOStatsSnapshot&) const = default;
 	};
 
 	/**
@@ -95,5 +98,34 @@ namespace UnrealGamePatcher
 		std::atomic<int64> DecompressOps{ 0 };
 		std::atomic<int64> ChunkLoads{ 0 };
 		std::atomic<int64> HashedBytes{ 0 };
+	};
+
+	/** RAII per-file patch accounting (fixplan S1): the ctor takes the first
+	 *  snapshot, the dtor logs the delta on EVERY exit path - the in-place
+	 *  patchers have 20+ early-return failure branches that used to drop it
+	 *  silently. An all-zero delta (nothing happened) stays silent. */
+	struct FScopedIOPatchDelta
+	{
+		explicit FScopedIOPatchDelta(FString InTag)
+			: Tag(MoveTemp(InTag))
+			, Start(FIOStats::Get().Snapshot())
+		{
+		}
+		~FScopedIOPatchDelta()
+		{
+			const FIOStatsSnapshot End = FIOStats::Get().Snapshot();
+			if (End == Start)
+			{
+				return;
+			}
+			UE_LOG(LogUnrealGamePatcher, Display, TEXT("%s %s"),
+				*Tag, *FIOStats::FormatDelta(Start, End));
+		}
+		FScopedIOPatchDelta(const FScopedIOPatchDelta&) = delete;
+		FScopedIOPatchDelta& operator=(const FScopedIOPatchDelta&) = delete;
+
+	private:
+		FString Tag;
+		FIOStatsSnapshot Start;
 	};
 }

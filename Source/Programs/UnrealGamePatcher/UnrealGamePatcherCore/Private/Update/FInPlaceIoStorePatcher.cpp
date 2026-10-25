@@ -25,7 +25,12 @@ namespace UnrealGamePatcher
 		const TArray<FHole>& InAvailableHoles)
 	{
 		OutStats = FInPlaceIoStoreStats();
-		const FIOStatsSnapshot IOStart = FIOStats::Get().Snapshot();
+		// Per-patch I/O report (same purpose as the pak patcher's H1
+		// sentinel): a chunk-level patch must read only the changed chunks'
+		// spans plus the small remote utoc - read volume near the container
+		// size means the delta path silently degraded. The scoped guard logs
+		// the delta on every exit path, failure included.
+		FScopedIOPatchDelta ScopedIO(FString::Printf(TEXT("FInPlaceIoStorePatcher: '%s' I/O:"), *UcasId));
 
 		const FIndexFileEntry* RemoteFile = Remote.Files.Find(UcasId);
 		if (!RemoteFile || RemoteFile->IoStoreChunks.Num() == 0)
@@ -328,12 +333,6 @@ namespace UnrealGamePatcher
 		UE_LOG(LogUnrealGamePatcher, Display,
 			TEXT("FInPlaceIoStorePatcher: '%s': %d same (zero movement), %d replaced, %d appended; %lld raw bytes written"),
 			*UcasId, OutStats.NumSame, OutStats.NumReplaced, OutStats.NumAppended, OutStats.BytesWritten);
-		// Per-patch I/O report (same purpose as the pak patcher's): a chunk-
-		// level patch must read only the changed chunks' spans plus the small
-		// remote utoc - read volume near the container size means the delta
-		// path silently degraded.
-		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FInPlaceIoStorePatcher: '%s' I/O: %s"),
-			*UcasId, *FIOStats::FormatDelta(IOStart, FIOStats::Get().Snapshot()));
 		return true;
 	}
 }

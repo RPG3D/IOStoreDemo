@@ -29,6 +29,16 @@ namespace UnrealGamePatcher
 
 	namespace
 	{
+		// Run-report funnel (fixplan S2): one place binding the I/O snapshot
+		// to the stats copy and the greppable summary line - four call
+		// sites, one contract.
+		void EmitIORunReport(const TCHAR* Label, const FString& StatTag, FUpdateStats& OutStats)
+		{
+			OutStats.IOStats = FIOStats::Get().Snapshot();
+			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: %s I/O %s"),
+				Label, *FIOStats::Get().FormatSummary(*StatTag));
+		}
+
 		/** Local content index (the installed version's own extension
 		 *  manifest) lives in a subdirectory so the flat install scan never
 		 *  sees it. */
@@ -860,9 +870,7 @@ namespace UnrealGamePatcher
 				OutStats.NumFilesSame, OutStats.NumFilesChanged, OutStats.NumFilesAdded, OutStats.NumFilesRemoved,
 				SameChunks.Num(), Remote.Chunks.Num(),
 				bHaveLocalIndex ? TEXT("") : TEXT(" (no local state: full fetch)"));
-			OutStats.IOStats = FIOStats::Get().Snapshot();
-			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: check I/O %s"),
-				*FIOStats::Get().FormatSummary(TEXT("check")));
+			EmitIORunReport(TEXT("check"), TEXT("check"), OutStats);
 			return true;
 		}
 
@@ -1568,9 +1576,7 @@ namespace UnrealGamePatcher
 		{
 			Rollback(State);
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: update to %s failed - transaction rolled back"), *Version);
-			OutStats.IOStats = FIOStats::Get().Snapshot();
-			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: failed-run I/O %s"),
-				*FIOStats::Get().FormatSummary(TEXT("update-failed")));
+			EmitIORunReport(TEXT("failed-run"), TEXT("update-failed"), OutStats);
 			Emit(EUpdatePhase::Failed, (LastError != EPatcherError::Ok) ? LastError : EPatcherError::ApplyFailed, true,
 				WritesApplied, NumTargets, TEXT("apply failed, rolled back"));
 			return false;
@@ -1645,9 +1651,7 @@ namespace UnrealGamePatcher
 		// from): a small delta MUST show small read/write/net numbers - any
 		// container-sized volume on a byte-sized change means a silent
 		// fallback happened (review H1).
-		OutStats.IOStats = FIOStats::Get().Snapshot();
-		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: update I/O %s"),
-			*FIOStats::Get().FormatSummary(*FString::Printf(TEXT("update %s"), *Version)));
+		EmitIORunReport(TEXT("update"), *FString::Printf(TEXT("update %s"), *Version), OutStats);
 
 		return true;
 	}
@@ -1732,9 +1736,7 @@ namespace UnrealGamePatcher
 		}
 
 		OutStats.NumChunksReused = OutStats.ReusedChunkGuids.Num();
-		OutStats.IOStats = FIOStats::Get().Snapshot();
-		UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: compact I/O %s"),
-			*FIOStats::Get().FormatSummary(TEXT("compact")));
+		EmitIORunReport(TEXT("compact"), TEXT("compact"), OutStats);
 		return Rebuilt;
 	}
 
