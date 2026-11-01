@@ -99,6 +99,27 @@ namespace UnrealGamePatcher
 		}
 	const int64 UtocSize = Handle->Size();
 	OriginalUcasSize = IFileManager::Get().FileSize(*UcasPath);
+
+	// Detect the trailing container-header stub (see FIoStoreReader::Open):
+	// appended blocks must go BEFORE it and Commit re-appends it last.
+	UcasTrailerSize = 0;
+	{
+		IFileHandle* UcasTail = PF.OpenRead(*UcasPath);
+		uint8 Tail[8] = {};
+		if (UcasTail && UcasTail->Size() >= 16 && UcasTail->Seek(UcasTail->Size() - 8) &&
+			UcasTail->Read(Tail, 8))
+		{
+			const uint32 Sig = (uint32)Tail[0] | ((uint32)Tail[1] << 8) | ((uint32)Tail[2] << 16) | ((uint32)Tail[3] << 24);
+			const uint32 Ver = (uint32)Tail[4] | ((uint32)Tail[5] << 8) | ((uint32)Tail[6] << 16) | ((uint32)Tail[7] << 24);
+			if (Sig == 0x496F436E && Ver >= 1 && Ver <= 5) // FIoContainerHeader::Signature, Initial..Latest
+			{
+				FMemory::Memcpy(UcasTrailer, Tail, 8);
+				UcasTrailerSize = 8;
+				OriginalUcasSize -= UcasTrailerSize;
+			}
+		}
+		delete UcasTail;
+	}
 	TArray<uint8> Toc;
 	Toc.SetNumUninitialized(UtocSize);
 	if (!Handle->Read(Toc.GetData(), UtocSize))
@@ -472,8 +493,16 @@ namespace UnrealGamePatcher
 	{
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
 
-		// 1. Append the new blocks to the .ucas.
-		if (AppendedUcasData.Num() > 0)
+		// 1. Append the new blocks to the .ucas. The write is POSITIONED at
+		// the end of the block data (OriginalUcasSize, i.e. before any
+		// trailing container-header stub) and the stub is re-written last,
+		// so the container keeps a fresh engine container's EOF layout:
+		// [block data][appended blocks][stub].
+		// The handle MUST be opened with bAppend=true: OpenWrite(bAppend=
+		// false) TRUNCATES the file on POSIX/Apple (ftruncate) while it only
+		// recreates-on-open on Windows. bAppend=true positions at EOF on
+		// both and still allows explicit Seek + positioned writes.
+		if (AppendedUcasData.Num() > 0 || UcasTrailerSize > 0)
 		{
 			IFileHandle* Ucas = PF.OpenWrite(*UcasPath, /*bAppend=*/true);
 			if (!Ucas)
@@ -481,14 +510,16 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: cannot append to '%s'"), *UcasPath);
 				return false;
 			}
-		const bool bOk = Ucas->Write(AppendedUcasData.GetData(), AppendedUcasData.Num());
+		const bool bOk = Ucas->Seek(OriginalUcasSize) &&
+			(AppendedUcasData.Num() == 0 || Ucas->Write(AppendedUcasData.GetData(), AppendedUcasData.Num())) &&
+			(UcasTrailerSize == 0 || Ucas->Write(UcasTrailer, UcasTrailerSize));
 		delete Ucas;
 		if (!bOk)
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreWriter: failed appending to '%s'"), *UcasPath);
 			return false;
 		}
-		FIOStats::Get().AddDiskWrite(AppendedUcasData.Num());
+		FIOStats::Get().AddDiskWrite(AppendedUcasData.Num() + UcasTrailerSize);
 		}
 
 		// 1b. Backfilled blocks: pwrite into the recorded dead regions (the
@@ -578,7 +609,11 @@ namespace UnrealGamePatcher
 		// Compression method names.
 		for (int32 I = 1; I < CompressionMethods.Num(); ++I)
 		{
-			const ANSICHAR* Name = TCHAR_TO_ANSI(*CompressionMethods[I]);
+			// Hoist the converter: TCHAR_TO_ANSI would leave 'Name' pointing
+			// into a temporary that dies at the end of the full-expression
+			// (UB; clang -Wdangling rejects it, MSVC happened to tolerate it).
+			const auto Converted = StringCast<ANSICHAR>(*CompressionMethods[I]);
+			const ANSICHAR* Name = Converted.Get();
 			const int32 Len = FMath::Min(31, (int32)FCStringAnsi::Strlen(Name));
 			Out.Append((const uint8*)Name, Len);
 			for (int32 J = Len; J < 32; ++J) { Out.Add(0); }

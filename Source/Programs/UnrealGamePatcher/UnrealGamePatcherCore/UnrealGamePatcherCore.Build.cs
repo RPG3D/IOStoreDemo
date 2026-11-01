@@ -11,13 +11,22 @@ public class UnrealGamePatcherCore : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		CppStandard = CppStandardVersion.Cpp20;
 
-		PrivateDependencyModuleNames.AddRange(
+		// Json is a PUBLIC dependency: the module's public header JsonIo.h
+		// includes Dom/JsonObject.h, so every module that includes JsonIo.h
+		// needs the Json include paths propagated (UBT only forwards them
+		// through public dependencies).
+		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
 			"Core",
 			"CoreUObject",
 			"ApplicationCore",
 			"Json",
+			}
+		);
+		PrivateDependencyModuleNames.AddRange(
+			new string[]
+			{
 			// Download layer: FDownloadManager / orchestrator drive the
 			// generic download component (transport primitive + executor).
 			"UnrealGamePatcherDownload",

@@ -93,6 +93,12 @@ namespace UnrealGamePatcher
 		TArray<uint8> DirectoryIndex;
 		int32 OriginalBlockCount = 0;
 		int64 OriginalUcasSize = 0;
+		// Trailing container-header stub (8 bytes, see FIoStoreReader) - the
+		// append base is the END OF BLOCK DATA (before the stub) and Commit
+		// re-appends the stub last so the patched container keeps the same
+		// EOF layout as a fresh engine-written one.
+		uint8 UcasTrailer[8] = {};
+		int32 UcasTrailerSize = 0;
 		// Working state for Commit.
 		TArray64<uint8> AppendedUcasData; // new blocks to append to the .ucas
 		TArray<FIoStoreBlock> AppendedBlocks;

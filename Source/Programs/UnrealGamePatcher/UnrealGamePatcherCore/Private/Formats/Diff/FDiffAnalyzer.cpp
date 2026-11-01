@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Formats/Diff/FDiffAnalyzer.h"
+#include "UnrealGamePatcherLog.h"
 
 namespace UnrealGamePatcher
 {
@@ -143,6 +144,11 @@ namespace UnrealGamePatcher
 					E.LocalSize = L->Size;
 					E.RemoteSize = R->Size;
 					E.Kind = (L->SHA1 == R->SHA1) ? EChangeKind::Same : EChangeKind::Changed;
+					if (E.Kind == EChangeKind::Changed)
+					{
+						UE_LOG(LogUnrealGamePatcher, Verbose, TEXT("FDiffAnalyzer: '%s' classified Changed (plain sha diff: local %s, remote %s)"),
+							*Id, *L->SHA1, *R->SHA1);
+					}
 				}
 				else if (L)
 				{
@@ -206,6 +212,14 @@ namespace UnrealGamePatcher
 				else
 				{
 					E.Kind = (L->SHA1 == R->SHA1) ? EChangeKind::Same : EChangeKind::Changed;
+				}
+				if (E.Kind == EChangeKind::Changed)
+				{
+					// Verbose: name every Changed classification so a check /
+					// update report can be traced to the exact container or
+					// file without re-running a hash audit by hand.
+					UE_LOG(LogUnrealGamePatcher, Verbose, TEXT("FDiffAnalyzer: '%s' classified Changed (local sha %s, remote sha %s)"),
+						*Id, *L->SHA1, *R->SHA1);
 				}
 				if (E.Kind == EChangeKind::Same)
 				{

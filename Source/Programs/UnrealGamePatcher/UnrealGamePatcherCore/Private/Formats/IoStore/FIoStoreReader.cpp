@@ -70,6 +70,28 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIoStoreReader: cannot open '%s'"), *UcasPath);
 			return false;
 		}
+
+		// Some engine builds append a container-header stub after the block
+		// data of a .ucas ({FIoContainerHeader::Signature, version} = 8 bytes;
+		// seen on 5.7-staged containers, absent on older ones). The compressed
+		// blocks never cover it - detect it so "blocks tile the container"
+		// checks and the in-place append base treat the data region as ending
+		// where the blocks end, and so a patch can keep the stub last on disk.
+		UcasTrailerSize = 0;
+		{
+			uint8 Tail[8] = {};
+			if (UcasHandle->Size() >= 16 && UcasHandle->Seek(UcasHandle->Size() - 8) &&
+				UcasHandle->Read(Tail, 8))
+			{
+				const uint32 Sig = (uint32)Tail[0] | ((uint32)Tail[1] << 8) | ((uint32)Tail[2] << 16) | ((uint32)Tail[3] << 24);
+				const uint32 Ver = (uint32)Tail[4] | ((uint32)Tail[5] << 8) | ((uint32)Tail[6] << 16) | ((uint32)Tail[7] << 24);
+				// 0x496F436E = FIoContainerHeader::Signature; version 1..5 = Initial..Latest.
+				if (Sig == 0x496F436E && Ver >= 1 && Ver <= 5)
+				{
+					UcasTrailerSize = 8;
+				}
+			}
+		}
 		return true;
 	}
 
@@ -275,6 +297,7 @@ namespace UnrealGamePatcher
 		Blocks.Reset();
 		CompressionMethods.Reset();
 		CompressionBlockSize = 0;
+		UcasTrailerSize = 0;
 	}
 
 	bool FIoStoreReader::ReadUcasRange(int64 Offset, int32 Size, TArray64<uint8>& OutData) const

@@ -313,6 +313,26 @@ namespace UnrealGamePatcher
 				else if (bIsPak)
 				{
 					ExtractPakEntries(Dir / Name, E, bVerify);
+					if (E.PakEntries.Num() == 0 && E.SHA1.IsEmpty())
+					{
+						// An EMPTY pak (0 entries - e.g. a placeholder optional
+						// container) has no inner truth to express, and the
+						// diff's pak branch needs entries on BOTH sides before
+						// it trusts per-entry hashes. Without a whole-file
+						// hash here the entry falls to the plain SHA1 compare
+						// with an EMPTY local hash - a phantom Changed that
+						// never converges (check would flag a byte-perfect
+						// file on every run; no mirror rule rescues paks).
+						// The whole-file hash IS the truth for an empty pak;
+						// a later in-place append changes it and correctly
+						// routes the container through a rebuild.
+						FString Sha;
+						int64 Size = 0;
+						if (HashWholeFile(Dir / Name, Sha, Size))
+						{
+							E.SHA1 = Sha;
+						}
+					}
 				}
 				else // ucas
 				{

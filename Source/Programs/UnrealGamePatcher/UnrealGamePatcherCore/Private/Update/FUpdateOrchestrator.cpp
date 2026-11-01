@@ -1735,6 +1735,30 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Display, TEXT("FUpdateOrchestrator: compact rebuilt '%s' (%lld bytes)"), *FileId, Remote.Files[FileId].Size);
 		}
 
+		// The rebuilt files are byte-identical to the CDN copy: any holes
+		// recorded for them are STALE (that physical layout is gone - the
+		// bytes under a stale hole are LIVE after the rebuild, and the next
+		// in-place patch would backfill new chunk data over them). The update
+		// path clears holes for files it rebuilds (WriteAtomic branch);
+		// compact must keep the same invariant.
+		{
+			const FString StatePath = Paths::GetStatePath(InstallDir);
+			FPatcherState State;
+			if (FPatcherStateFile::Load(StatePath, State))
+			{
+				bool bDirty = false;
+				for (const FString& FileId : FileIds)
+				{
+					bDirty |= State.Holes.RemoveAll([&FileId](const FHole& H) { return H.File == FileId; }) > 0;
+				}
+				if (bDirty && !FPatcherStateFile::Save(StatePath, State))
+				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: compact rebuilt the files but could not update the sidecar"));
+					return -1;
+				}
+			}
+		}
+
 		OutStats.NumChunksReused = OutStats.ReusedChunkGuids.Num();
 		EmitIORunReport(TEXT("compact"), TEXT("compact"), OutStats);
 		return Rebuilt;

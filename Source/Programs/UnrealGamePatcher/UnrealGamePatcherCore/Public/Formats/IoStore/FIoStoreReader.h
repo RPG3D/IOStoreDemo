@@ -54,6 +54,12 @@ namespace UnrealGamePatcher
 		UNREALGAMEPATCHERCORE_API const TArray<FIoStoreBlock>& GetBlocks() const { return Blocks; }
 		UNREALGAMEPATCHERCORE_API int32 GetCompressionBlockSize() const { return CompressionBlockSize; }
 
+		/** Size of the trailing container-header stub some engine builds
+		 *  append after the block data of a .ucas ({FIoContainerHeader::
+		 *  Signature, version} = 8 bytes). The compressed blocks never cover
+		 *  it, so "blocks tile the container" means up to UcasSize - this. */
+		UNREALGAMEPATCHERCORE_API int32 GetUcasTrailerSize() const { return UcasTrailerSize; }
+
 		/** Returns the RAW (uncompressed) bytes of the chunk at index,
 		 *  decompressed and verified against the TOC meta hash. */
 		UNREALGAMEPATCHERCORE_API bool ReadChunk(int32 Index, TArray64<uint8>& OutData) const;
@@ -92,5 +98,6 @@ namespace UnrealGamePatcher
 		TArray<FIoStoreChunk> Chunks;
 		TArray<FIoStoreBlock> Blocks;
 		TArray<FCompressionMethod> CompressionMethods;
+		int32 UcasTrailerSize = 0;
 	};
 }
