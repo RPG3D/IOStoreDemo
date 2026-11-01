@@ -5,7 +5,7 @@
 #include "UnrealGamePatcherLog.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
-#include "Windows/WindowsHWrapper.h"
+#include "Misc/Timespan.h"
 
 namespace UnrealGamePatcher::Paths
 {
@@ -46,40 +46,44 @@ namespace UnrealGamePatcher::Paths
 
 	bool FInstallLock::Acquire(const FString& InstallDir)
 	{
-		if (MutexHandle)
+		if (Mutex.IsSet())
 		{
 			return true;
 		}
 		// Case-fold + slash-normalize so different spellings of the same
-		// directory map to one lock; the 64-bit hash keeps the kernel object
-		// name short and free of path characters.
+		// directory map to one lock; the 64-bit hash keeps the lock name
+		// short and free of path characters. The normalization itself is
+		// platform-independent, so one directory maps to the same lock name
+		// on every platform.
 		FString Key = InstallDir;
-		Key.ReplaceInline(TEXT("/"), TEXT("\\"));
+		Key.ReplaceInline(TEXT("\\"), TEXT("/"));
 		Key.ToUpperInline();
 		const uint64 NameHash = FPatcherHash::XXH64(Key.GetCharArray().GetData(), Key.Len() * sizeof(TCHAR));
-		const FString MutexName = FString::Printf(TEXT("Local\\UnrealGamePatcher_Install_%016llx"), NameHash);
-		void* Handle = CreateMutexW(nullptr, 0, *MutexName);
-		if (!Handle)
+#if PLATFORM_WINDOWS
+		// The "Local/" prefix selects the Windows session-local namespace.
+		const FString LockName = FString::Printf(TEXT("Local/UnrealGamePatcher_Install_%016llx"), NameHash);
+#else
+		// POSIX: the name becomes a lock file in the per-user settings dir
+		// (engine-managed FPlatformSystemWideMutex = exclusive flock).
+		const FString LockName = FString::Printf(TEXT("UnrealGamePatcher_Install_%016llx"), NameHash);
+#endif
+		// FTimespan::Zero() = single try-lock attempt (non-blocking).
+		Mutex.Emplace(LockName, FTimespan::Zero());
+		if (!Mutex->IsValid())
 		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: cannot create install lock for '%s' (win error %u)"), *InstallDir, GetLastError());
+			Mutex.Reset();
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: cannot acquire the install lock for '%s' - another patcher instance may be working on this directory"), *InstallDir);
 			return false;
 		}
-		if (GetLastError() == ERROR_ALREADY_EXISTS)
-		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: another patcher instance is working on '%s' - refusing to run concurrently"), *InstallDir);
-			CloseHandle((HANDLE)Handle);
-			return false;
-		}
-		MutexHandle = Handle;
 		return true;
 	}
 
 	void FInstallLock::Release()
 	{
-		if (MutexHandle)
+		if (Mutex.IsSet())
 		{
-			CloseHandle((HANDLE)MutexHandle);
-			MutexHandle = nullptr;
+			Mutex->Release();
+			Mutex.Reset();
 		}
 	}
 }

@@ -31,11 +31,13 @@
 #include "Download/FHttpRangeRequest.h"
 #include "HttpModule.h"
 #include "UnrealGamePatcherPaths.h"
+#if PLATFORM_WINDOWS
 #include "Windows/WindowsHWrapper.h"
 // Windows.h defines ReplaceFile as a macro (-> ReplaceFileW), which collides
 // with the EApplyOp::ReplaceFile member used by the transaction tests.
 #ifdef ReplaceFile
 #undef ReplaceFile
+#endif
 #endif
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"

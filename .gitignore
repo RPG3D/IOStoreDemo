@@ -99,3 +99,12 @@ __pycache__/
 
 # Hand-written mini solution for UGP debug workflow (DEBUGGER.md)
 !Tools/VSDebug/UGPDebugOnly.sln
+
+# UGP: fixture is rebuilt per machine from a real packaging run (see
+# Source/Programs/UnrealGamePatcher/Docs/TESTCASES.md - 依赖与数据)
+.manifesttest/
+
+# UGP: third-party S3 server binaries are machine-local (see
+# Source/Programs/UnrealGamePatcher/Scripts/start_rustfs.* header)
+Source/Programs/UnrealGamePatcher/Scripts/rustfs
+Source/Programs/UnrealGamePatcher/Scripts/rustfs.exe

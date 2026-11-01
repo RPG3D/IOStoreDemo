@@ -150,6 +150,17 @@ Scripts\start_rustfs.bat                     # 启动 :9000（数据在 Saved\ru
 python Scripts\s3_sync.py --endpoint http://127.0.0.1:9000 --access-key ugpadmin --secret-key ugpadmin123 --bucket ugp-cdn --create --public --sync Saved\UGP_Package\CloudDir        # 建桶+公开读+上传（零依赖 SigV4）
 ```
 
+macOS/Linux 用等价脚本 `Scripts/start_rustfs.sh`（二进制放 `Scripts/rustfs`，其余环境变量与用法相同）：
+
+```sh
+./Scripts/start_rustfs.sh                    # 启动 :9000（数据在 Saved/rustfs-data）
+python3 Scripts/s3_sync.py ...               # 参数同上
+```
+
+> Intel Mac 注意：rustfs 官方 x86_64 macOS 构建止于 `1.0.0-beta.10-preview.1`，
+> 该构建依赖 Homebrew 的 liblzma 路径；`start_rustfs.sh` 首次启动会自动改链到系统
+> `/usr/lib/liblzma.5.dylib` 并重签（需要 Xcode CLT），无需安装 Homebrew。
+
 客户端接入——`-cdn` 是唯一数据源，本地目录或 HTTP 基址二选一：
 
 ```bat

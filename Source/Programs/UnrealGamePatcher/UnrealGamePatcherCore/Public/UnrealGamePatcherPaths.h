@@ -3,6 +3,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/PlatformMutex.h"
+#include "Misc/Optional.h"
 
 /**
  * Well-known file / directory layout helpers for the patcher.
@@ -26,8 +28,11 @@ namespace UnrealGamePatcher::Paths
 	UNREALGAMEPATCHERCORE_API bool AtomicReplaceFile(const FString& SrcPath, const FString& DestPath);
 
 	/** Single-writer guard for one install directory (fixplan L-M5): a named
-	 *  mutex derived from the case-normalized install path. The OS releases
-	 *  the mutex on process death, so there is no stale-lock state to
+	 *  system-wide mutex derived from the case-normalized install path, built
+	 *  on the engine's UE::FPlatformSystemWideMutex (named kernel mutex on
+	 *  Windows, flock-ed lock file in the per-user settings dir on POSIX
+	 *  platforms - same primitive covers Mac / Linux / Android). The OS
+	 *  releases it on process death, so there is no stale-lock state to
 	 *  recover - a crashed run never blocks the next one. */
 	struct UNREALGAMEPATCHERCORE_API FInstallLock
 	{
@@ -43,6 +48,6 @@ namespace UnrealGamePatcher::Paths
 		void Release();
 
 	private:
-		void* MutexHandle = nullptr; // HANDLE; void* keeps windows.h out of this header
+		TOptional<UE::FPlatformSystemWideMutex> Mutex;
 	};
 }
