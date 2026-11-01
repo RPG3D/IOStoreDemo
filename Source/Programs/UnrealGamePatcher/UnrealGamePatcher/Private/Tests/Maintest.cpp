@@ -32,7 +32,8 @@ namespace UnrealGamePatcher::Tests
 
 		FUpdateStats S0;
 		Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.0.0"), Install, true, S0), TEXT("maintest: install 1.0.0"));
-		Check(S0.NumFilesAdded == 4, TEXT("maintest: 4 files installed"));
+		// The file count is fixture-derived (any real staged set works).
+		Check(S0.NumFilesAdded == Index.Files.Num(), TEXT("maintest: every manifest file installed"));
 
 		// --- 1. check is read-only and reports a no-op ---------------------
 		{
@@ -60,7 +61,10 @@ namespace UnrealGamePatcher::Tests
 			State.Holes.Add(Hole);
 			Check(FPatcherStateFile::Save(StatePath, State), TEXT("compact: injected a hole for ucas"));
 
-			// The check-side report must flag the bloat (500000 / 10348176 = 4.8%).
+			// The check-side report must flag the injected hole: HoleBytes
+			// must be exactly the injected 500000, and the bloat ratio must
+			// be positive (the absolute % depends on the fixture's size - the
+			// original fixture gave ~4.8%).
 			{
 				int64 HoleBytes = 0;
 				int64 InstallBytes = 0;
@@ -71,8 +75,8 @@ namespace UnrealGamePatcher::Tests
 				FPatcherStateFile::Load(StatePath, S2);
 				for (const FHole& H : S2.Holes) { HoleBytes += H.Size; }
 				const double Bloat = InstallBytes > 0 ? (100.0 * (double)HoleBytes / (double)InstallBytes) : 0.0;
-				Check(HoleBytes == 500000 && Bloat > 4.0 && Bloat < 6.0,
-					TEXT("compact: hole report shows ~4.8% bloat"));
+				Check(HoleBytes == 500000 && Bloat > 0.0,
+					TEXT("compact: hole report flags the injected hole (positive bloat ratio)"));
 			}
 
 			// Compact rebuilds the hole-bearing file from CDN chunks.
@@ -89,9 +93,15 @@ namespace UnrealGamePatcher::Tests
 				Size == Index.Files[TEXT("pakchunk1-Windows.ucas")].Size,
 				TEXT("compact: rebuilt ucas is content-equivalent (hash == manifest)"));
 
-			// After compact, holes are cleared.
-			State.Holes.RemoveAll([&](const FHole& H) { return H.File == TEXT("pakchunk1-Windows.ucas"); });
-			Check(FPatcherStateFile::Save(StatePath, State), TEXT("compact: holes cleared"));
+			// The REBUILD path itself must clear the rebuilt file's recorded
+			// holes and commit the sidecar. (The old test removed the hole by
+			// hand here, which would have masked an orchestrator regression.)
+			{
+				FPatcherState After;
+				Check(FPatcherStateFile::Load(StatePath, After), TEXT("compact: sidecar loads after rebuild"));
+				Check(After.Holes.FilterByPredicate([](const FHole& H) { return H.File == TEXT("pakchunk1-Windows.ucas"); }).Num() == 0,
+					TEXT("compact: orchestrator cleared the rebuilt file's holes"));
+			}
 
 			// Compact with no holes is a no-op success.
 			TArray<FString> None;

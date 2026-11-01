@@ -202,7 +202,8 @@ namespace UnrealGamePatcher::Tests
 			for (const TPair<FString, FIndexChunkEntry>& P : Out23.Delta.Chunks) { ViaUnion.Add(P.Key); }
 			TSet<FString> Direct;
 			for (const TPair<FString, FIndexChunkEntry>& P : Out13Direct.Delta.Chunks) { Direct.Add(P.Key); }
-			Check(ViaUnion.Num() == Direct.Num(), TEXT("skip-version delta == union of step deltas"));
+			Check(ViaUnion.Difference(Direct).Num() == 0 && Direct.Difference(ViaUnion).Num() == 0,
+				TEXT("skip-version delta == union of step deltas (set equality)"));
 		}
 
 		// --- 4. Delta manifest tamper detection -----------------------------

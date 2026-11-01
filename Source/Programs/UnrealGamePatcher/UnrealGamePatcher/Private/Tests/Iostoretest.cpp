@@ -18,7 +18,7 @@ namespace UnrealGamePatcher::Tests
 
 		using namespace UnrealGamePatcher;
 
-		const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
+		const FString ProjectRoot = GetProjectRootFromExecutable();
 		const FString StageDir = FPaths::Combine(ProjectRoot, TEXT(".manifesttest"), TEXT("chunkinstall"), TEXT("Windows"), TEXT("1.0.0"), TEXT("pakchunk1"));
 		const FString UtocPath = FPaths::Combine(StageDir, TEXT("pakchunk1-Windows.utoc"));
 		const FString UcasPath = FPaths::Combine(StageDir, TEXT("pakchunk1-Windows.ucas"));
@@ -51,7 +51,11 @@ namespace UnrealGamePatcher::Tests
 				}
 			}
 			Check(bAllInRange, TEXT("iostore: every chunk's block range in bounds"));
-			Check(MaxBlockEnd == UcasSize, TEXT("iostore: compression blocks cover the ucas exactly"));
+			// Some engine builds append an 8-byte container-header stub after
+			// the block data (FIoStoreReader detects it) - the blocks must
+			// tile the DATA region exactly, not the whole file.
+			Check(MaxBlockEnd == UcasSize - Reader.GetUcasTrailerSize(),
+				TEXT("iostore: compression blocks cover the ucas data exactly"));
 		}
 
 		// Decode chunks: every chunk must decode to exactly its raw size.

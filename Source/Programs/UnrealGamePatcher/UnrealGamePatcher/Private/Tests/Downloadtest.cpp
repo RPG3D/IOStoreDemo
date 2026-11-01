@@ -39,7 +39,7 @@ namespace UnrealGamePatcher::Tests
 
 		// Serve the CDN over HTTP with the EXTERNAL python server (the patcher
 		// contains no HTTP server; Scripts/cdn_server.py provides it).
-		const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
+		const FString ProjectRoot = GetProjectRootFromExecutable();
 		const FString CdnScript = FPaths::Combine(ProjectRoot, TEXT("Source"), TEXT("Programs"), TEXT("UnrealGamePatcher"), TEXT("Scripts"), TEXT("cdn_server.py"));
 		FCdnServerProc CdnServer;
 		Check(CdnServer.Start(CdnScript, Cdn, FPaths::Combine(WorkDir, TEXT("cdn.log"))),
@@ -89,11 +89,25 @@ namespace UnrealGamePatcher::Tests
 			const int32 NumFixtureChunks = Index.Chunks.Num();
 			TArray<FDownloadRequest> Requests;
 			MakeChunkRequests(Cache, Requests);
+			// A light per-connection throttle makes the concurrency evidence
+			// deterministic: on an unthrottled loopback the transfers can
+			// finish inside the connection-setup window and the peak overlap
+			// stays at 1 even though the manager issued everything in
+			// parallel (same flake class the H3 throttle fixed). Disarmed
+			// right after the Peak check.
+			{
+				TArray64<uint8> Ctrl;
+				Http.DownloadRange(FString::Printf(TEXT("%s/__ctl/throttle?kbps=32768"), *BaseUrl), 0, -1, Ctrl);
+			}
 			FDownloadStats Stats;
 			TArray<FString> Failed;
 			Check(Manager.DownloadAll(Requests, Stats, Failed) && Stats.SkippedExisting == 0,
 				*FString::Printf(TEXT("A: all %d chunks downloaded over HTTP"), NumFixtureChunks));
 			Check(CdnServer.Stats().Peak >= 2, TEXT("A: server saw overlapping connections (real concurrency)"));
+			{
+				TArray64<uint8> Ctrl;
+				Http.DownloadRange(FString::Printf(TEXT("%s/__ctl/throttle?kbps=0"), *BaseUrl), 0, -1, Ctrl);
+			}
 
 			bool bAllCached = true;
 			for (const FDownloadRequest& Req : Requests)
@@ -291,7 +305,7 @@ namespace UnrealGamePatcher::Tests
 			FUpdateStats S1;
 			Check(FUpdateOrchestrator::UpdateWithOptions(Cdn, TEXT("1.0.0"), Install, true, Options, S1),
 				TEXT("E: full network update succeeds"));
-			Check(S1.NumFilesAdded == 4, TEXT("E: 4 files installed"));
+			Check(S1.NumFilesAdded == Index.Files.Num(), TEXT("E: every manifest file installed"));
 			Check(S1.NumChunksFetched == Index.Chunks.Num(), TEXT("E: every chunk downloaded over HTTP"));
 
 			bool bAllMatch = true;
@@ -312,7 +326,7 @@ namespace UnrealGamePatcher::Tests
 			FUpdateStats S2;
 			Check(FUpdateOrchestrator::UpdateWithOptions(Cdn, TEXT("1.0.0"), Install, true, Options, S2),
 				TEXT("E: no-op rerun succeeds"));
-			Check(S2.NumFilesSame == 4 && S2.NumChunksFetched == 0, TEXT("E: no-op rerun fetches nothing"));
+			Check(S2.NumFilesSame == Index.Files.Num() && S2.NumChunksFetched == 0, TEXT("E: no-op rerun fetches nothing"));
 			Check(CdnServer.Stats().Files == ReqBefore, TEXT("E: rerun hit the cache, not the network"));
 
 			// Interruption: drop one chunk from the cache and damage a file.
@@ -327,9 +341,14 @@ namespace UnrealGamePatcher::Tests
 			{
 				const FString UcasPath = FPaths::Combine(Install, TEXT("pakchunk1-Windows.ucas"));
 				TArray64<uint8> Bytes;
-				FFileHelper::LoadFileToArray(Bytes, *UcasPath);
-				Bytes[Bytes.Num() / 2] ^= 0xFF;
-				FFileHelper::SaveArrayToFile(Bytes, *UcasPath);
+				// Guarded: if the previous update aborted the install may be
+				// absent - record the failure via the checks below instead of
+				// crashing on an empty array.
+				if (FFileHelper::LoadFileToArray(Bytes, *UcasPath) && Bytes.Num() > 0)
+				{
+					Bytes[Bytes.Num() / 2] ^= 0xFF;
+					FFileHelper::SaveArrayToFile(Bytes, *UcasPath);
+				}
 			}
 
 			// Same-size damage is only caught by verify/repair runs (trust
@@ -655,15 +674,18 @@ namespace UnrealGamePatcher::Tests
 				H.GetHash(Hash);
 				for (int32 I = 0; I < 20; ++I) { CorruptedSha1 += FString::Printf(TEXT("%02x"), Hash[I]); }
 			}
-			// Lock the file for reads only (share read, no write): the update
-			// can analyze it but cannot replace it, so the write fails mid-
-			// apply and the transaction must roll back.
-			HANDLE Lock = CreateFileW(*PakPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-			Check(Lock != INVALID_HANDLE_VALUE, TEXT("G: file locked (read-only share)"));
-
 			// Same-size corruption needs a verify run to be detected at all.
 			FUpdateOptions VerifyOptions;
 			VerifyOptions.bForceVerify = true;
+#if PLATFORM_WINDOWS
+			// Lock the file for reads only (share read, no write): the update
+			// can analyze it but cannot replace it, so the write fails mid-
+			// apply and the transaction must roll back. macOS has no mandatory
+			// share locks (advisory flock does not block the patcher's opens),
+			// so the locked-failure half of this case cannot exist there; the
+			// rollback path itself is exercised by the other failure cases.
+			HANDLE Lock = CreateFileW(*PakPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			Check(Lock != INVALID_HANDLE_VALUE, TEXT("G: file locked (read-only share)"));
 			// Capture the terminal failure event: the unified error code must
 			// classify the locked target as WriteLocked (not a generic failure).
 			UnrealGamePatcher::EPatcherError FailCode = UnrealGamePatcher::EPatcherError::Ok;
@@ -692,6 +714,7 @@ namespace UnrealGamePatcher::Tests
 				FLocalTruthExtractor::HashWholeFile(PakPath, Sha1, Size);
 				Check(Sha1 == CorruptedSha1, TEXT("G: locked file unchanged after failed update"));
 			}
+#endif
 
 			// Unlocked: the same verify update now repairs the file.
 			FUpdateStats SOk;
@@ -1070,7 +1093,16 @@ namespace UnrealGamePatcher::Tests
 				// Real HTTP backend: completion order depends on actual transfer
 				// timing. The big 9MB job is submitted first, three small
 				// manifest chunks after - the finishing-priority + fair-share
-				// rules must let the small ones finish first.
+				// rules must let the small ones finish first. On a loopback
+				// transport the transfer-vs-connection-setup race can reorder
+				// finishes (observed flaky on macOS), so arm the server's
+				// per-connection throttle: the big transfer then takes seconds
+				// while the smalls stay sub-second - the fairness property is
+				// exercised deterministically. Disarmed at the end of the case.
+				{
+					TArray64<uint8> Ctrl;
+					Http.DownloadRange(FString::Printf(TEXT("%s/__ctl/throttle?kbps=2048"), *BaseUrl), 0, -1, Ctrl);
+				}
 				const FString CacheH3 = FPaths::Combine(WorkDir, TEXT("cacheH3"));
 				PF.CreateDirectoryTree(*CacheH3);
 
@@ -1124,8 +1156,14 @@ namespace UnrealGamePatcher::Tests
 						if (FinishOrder[I] != TEXT("H3-big")) { ++SmallCount; }
 					}
 					bSmallsFirst = BigPos >= 0 && SmallCount >= 2;
+					UE_LOG(LogUnrealGamePatcher, Display, TEXT("H3: finish order = [%s]"), *FString::Join(FinishOrder, TEXT(", ")));
 				}
 				Check(bSmallsFirst, TEXT("H3: small jobs finish before the big one (fair share + finishing priority)"));
+			}
+			{
+				// Disarm the H3 throttle (H4 measures transport-cap behavior).
+				TArray64<uint8> Ctrl;
+				Http.DownloadRange(FString::Printf(TEXT("%s/__ctl/throttle?kbps=0"), *BaseUrl), 0, -1, Ctrl);
 			}
 
 			// --- H4a: lied manifest vs transport cap (4.5) ------------------

@@ -12,7 +12,7 @@ namespace UnrealGamePatcher::Tests
 		UnrealGamePatcher::FIndexManifest& OutIndex)
 	{
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
-		const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
+		const FString ProjectRoot = GetProjectRootFromExecutable();
 		const FString StagedSrc = FPaths::Combine(ProjectRoot, TEXT(".manifesttest"), TEXT("chunkinstall"),
 			TEXT("Windows"), TEXT("1.0.0"), TEXT("pakchunk1"));
 		const FString StagedDir = FPaths::Combine(WorkDir, TEXT("staged"));

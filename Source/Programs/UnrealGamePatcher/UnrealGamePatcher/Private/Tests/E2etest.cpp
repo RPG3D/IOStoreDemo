@@ -47,7 +47,7 @@ namespace UnrealGamePatcher::Tests
 			{
 				FullInstallBytes += Pair.Value.Size;
 			}
-			Check(S.NumFilesAdded == 4 && S.NumChunksFetched == Index.Chunks.Num(), TEXT("e2e: full install fetched every chunk"));
+			Check(S.NumFilesAdded == Index.Files.Num() && S.NumChunksFetched == Index.Chunks.Num(), TEXT("e2e: full install fetched every manifest file/chunk"));
 		}
 
 		// Engine-loadability of the installed containers. Whole-file hash

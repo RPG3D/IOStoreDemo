@@ -307,7 +307,15 @@ id-only 判据说 Same、更新永不下发）→ 原地 patch 保 id 换数据 
 - **真实打包产物 fixture**：`.manifesttest/chunkinstall/Windows/1.0.0/pakchunk1`
   （真实小容器 pak/ucas/utoc，作 staged 输入）——buildtest/difftest/updatetest/
   maintest/downloadtest/e2etest/perftest/pakinplace/iostoreinplace 共用；
-- **外部 CDN 服务器**：`Scripts/cdn_server.py`（downloadtest）；
+  **不入库，换机/新 checkout 需重建**：跑一次 UAT 打包
+  （`RunUAT BuildCookRun -build -cook -stage -pak`），把
+  `Saved/StagedBuilds/<平台>/IOStoreDemo/Content/Paks/pakchunk1-*` 三个文件
+  拷为上述 `-Windows` 命名（容器格式平台无关，套件按扩展名解析；断言均从
+  fixture 派生，不依赖原条目数）；
+- **外部 CDN 服务器**：`Scripts/cdn_server.py`（downloadtest/benchtest；按平台
+  解析 python 解释器，POSIX 需绝对路径）；
+- **rustfs 二进制**：`Scripts/rustfs(.exe)` 不入库——见 README「发布到 S3 兼容
+  存储」，macOS 用 `Scripts/start_rustfs.sh`；
 - **测试工作目录**：`Saved/<suite>`（Program 的 ProjectDir 下），测完清理。
 
 ## 新增测试时

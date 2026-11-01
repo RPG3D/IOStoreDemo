@@ -38,11 +38,13 @@
 #include "Download/FHttpRangeRequest.h"
 #include "HttpModule.h"
 #include "UnrealGamePatcherPaths.h"
+#if PLATFORM_WINDOWS
 #include "Windows/WindowsHWrapper.h"
 // Windows.h defines ReplaceFile as a macro (-> ReplaceFileW), which collides
 // with the EApplyOp::ReplaceFile member used by the transaction tests.
 #ifdef ReplaceFile
 #undef ReplaceFile
+#endif
 #endif
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -91,19 +93,47 @@ namespace UnrealGamePatcher::Tests
 		FString LogPath;
 		int32 Port = 0;
 
+		/** Safety net: a suite that exits early (a crash apart) must not leak
+		 *  the python child - an orphan would hold the work dir open and a
+		 *  colliding port would make the next run's probe hit the STALE
+		 *  server, serving the previous CDN root. */
+		~FCdnServerProc()
+		{
+			Stop();
+		}
+
 		bool Start(const FString& InScriptPath, const FString& Root, const FString& InLogPath,
 			const TCHAR* ProbeRelPath = TEXT("index/1.0.0/UnrealGamePatcher.index.json"))
 		{
 			ScriptPath = InScriptPath;
 			LogPath = InLogPath;
 			Port = 18080 + (FPlatformTime::Cycles() % 200);
-			Proc = FPlatformProcess::CreateProc(
-				TEXT("python"),
-				*FString::Printf(TEXT("\"%s\" --root \"%s\" --port %d --log \"%s\""), *ScriptPath, *Root, Port, *LogPath),
-				false, true, false, nullptr, 0, nullptr, nullptr);
+			const FString Args = FString::Printf(TEXT("\"%s\" --root \"%s\" --port %d --log \"%s\""), *ScriptPath, *Root, Port, *LogPath);
+#if PLATFORM_WINDOWS
+			// Windows: CreateProcess searches PATH for the interpreter.
+			Proc = FPlatformProcess::CreateProc(TEXT("python"), *Args, false, true, false, nullptr, 0, nullptr, nullptr);
+#else
+			// POSIX CreateProc needs an ABSOLUTE path (execv does not search
+			// PATH), and macOS/Linux ship "python3" only. Probe the usual
+			// interpreter locations.
+			IPlatformFile& PFs = FPlatformFileManager::Get().GetPlatformFile();
+			const TCHAR* PythonCandidates[] = { TEXT("/usr/bin/python3"), TEXT("/usr/local/bin/python3"), TEXT("/opt/homebrew/bin/python3") };
+			for (const TCHAR* Py : PythonCandidates)
+			{
+				if (!PFs.FileExists(Py))
+				{
+					continue;
+				}
+				Proc = FPlatformProcess::CreateProc(Py, *Args, false, true, false, nullptr, 0, nullptr, nullptr);
+				if (Proc.IsValid())
+				{
+					break;
+				}
+			}
+#endif
 			if (!Proc.IsValid())
 			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FCdnServerProc: cannot start python (is it on PATH?)"));
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FCdnServerProc: cannot start a python3 interpreter (looked in /usr/bin, /usr/local/bin, /opt/homebrew/bin)"));
 				return false;
 			}
 			// Wait for READY by probing over the real transport. /__ctl/stats
@@ -185,10 +215,36 @@ namespace UnrealGamePatcher::Tests
 		};
 	}
 
+	/** Project root located from the executable: every platform stages the
+	 *  program at <Project>/Binaries/<Platform>/. FPlatformProcess::BaseDir()
+	 *  carries a trailing slash on Windows (one GetPath hop eats it) but not
+	 *  on macOS, and FPlatformMisc::ProjectDir() points into the engine's
+	 *  Program dir for Program targets - so walk up to the .uproject's
+	 *  Config/ marker instead of hard-coding a hop count. */
+	inline FString GetProjectRootFromExecutable()
+	{
+		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+		FString Dir = FPlatformProcess::BaseDir();
+		while (Dir.EndsWith(TEXT("/")) || Dir.EndsWith(TEXT("\\")))
+		{
+			Dir.LeftChopInline(1);
+		}
+		for (int32 Hop = 0; Hop < 6 && !Dir.IsEmpty(); ++Hop)
+		{
+			if (PF.FileExists(*FPaths::Combine(Dir, TEXT("Config"), TEXT("DefaultEngine.ini"))))
+			{
+				return Dir;
+			}
+			Dir = FPaths::GetPath(Dir);
+		}
+		// Legacy fallback (the Windows three-GetPath hop).
+		return FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
+	}
+
 	/** Absolute path of the per-test work dir under Saved/. */
 	inline FString GetTestWorkDir(const TCHAR* Name)
 	{
-		return FPaths::ConvertRelativePathToFull(FPaths::Combine(FPlatformMisc::ProjectDir(), TEXT("Saved"), Name));
+		return FPaths::ConvertRelativePathToFull(FPaths::Combine(GetProjectRootFromExecutable(), TEXT("Saved"), Name));
 	}
 
 	/** Delete (if any) and recreate WorkDir. */

@@ -65,7 +65,7 @@ namespace UnrealGamePatcher::Tests
 			return true;
 		};
 		// --- v1 = copies of the real container; v2 = replace chunk 0 + append.
-		const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
+		const FString ProjectRoot = GetProjectRootFromExecutable();
 		const FString StageDir = FPaths::Combine(ProjectRoot, TEXT(".manifesttest"), TEXT("chunkinstall"), TEXT("Windows"), TEXT("1.0.0"), TEXT("pakchunk1"));
 		const FString V1Ucas = FPaths::Combine(WorkDir, TEXT("v1.ucas"));
 		const FString V1Utoc = FPaths::Combine(WorkDir, TEXT("v1.utoc"));
@@ -270,7 +270,9 @@ namespace UnrealGamePatcher::Tests
 				FIoStoreReader RCur;
 				Check(RCur.Open(FPaths::Combine(Install, TEXT("game.utoc")),
 					FPaths::Combine(Install, TEXT("game.ucas"))), TEXT("chunkremoval: current container opens"));
-				Check(RCur.GetChunkCount() == 136, TEXT("chunkremoval: current container has 136 chunks"));
+				// The install holds v3 (= v1 + 1 appended chunk, see the
+				// stableid section above; 135+1=136 on the original fixture).
+				Check(RCur.GetChunkCount() == V1ChunkCount + 1, TEXT("chunkremoval: current container matches the v3 chunk count"));
 				DroppedId = RCur.GetChunks()[5].Id;
 			}
 			const FString V4Ucas = FPaths::Combine(WorkDir, TEXT("v4.ucas"));
@@ -298,7 +300,7 @@ namespace UnrealGamePatcher::Tests
 				FIoStoreReader R5;
 				Check(R5.Open(FPaths::Combine(Install, TEXT("game.utoc")),
 					FPaths::Combine(Install, TEXT("game.ucas"))), TEXT("chunkremoval: patched container opens"));
-				Check(R5.GetChunkCount() == 135, TEXT("chunkremoval: 135 chunks remain"));
+				Check(R5.GetChunkCount() == V1ChunkCount, TEXT("chunkremoval: exactly one chunk dropped"));
 				bool bGone = true;
 				for (const FIoStoreChunk& C : R5.GetChunks())
 				{

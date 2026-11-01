@@ -112,11 +112,9 @@ namespace UnrealGamePatcher::Tests
 		// --- 4. Local truth extraction from a real pak ----------------------
 		FIndexManifest LocalTruth;
 		{
-			// FPlatformMisc::ProjectDir() points into the engine's Program dir
-			// when running as a Program, so locate the project root via the
-			// executable: <Project>/Binaries/Win64/ -> three GetPath hops (the
-			// first only strips the trailing slash BaseDir carries).
-		const FString ProjectRoot = FPaths::GetPath(FPaths::GetPath(FPaths::GetPath(FPlatformProcess::BaseDir())));
+			// Locate the project root via the executable (BaseDir hop counts
+			// differ per platform - see GetProjectRootFromExecutable()).
+			const FString ProjectRoot = GetProjectRootFromExecutable();
 			const FString SrcPak = FPaths::Combine(ProjectRoot, TEXT(".manifesttest"), TEXT("chunkinstall"),
 				TEXT("Windows"), TEXT("1.0.0"), TEXT("pakchunk1"), TEXT("pakchunk1-Windows.pak"));
 			Check(PF.FileExists(*SrcPak), TEXT("source pak from task 3.1 exists"));
