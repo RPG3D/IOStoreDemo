@@ -57,6 +57,25 @@ namespace UnrealGamePatcher
 		return Hex.Equals(ExpectedSha1, ESearchCase::IgnoreCase);
 	}
 
+	// One lock per staging file: segment settles are concurrent, and the
+	// hole-fill + positioned write below must be serialized per file or a
+	// concurrent filler working from a stale file size can zero out another
+	// segment's already-written data. Network downloads stay parallel - only
+	// the local writes to the SAME file serialize. Entries are bounded by the
+	// run's job count and intentionally live for the process lifetime.
+	static FCriticalSection& StagingLockFor(const FString& Staging)
+	{
+		static FCriticalSection RegistryCS;
+		static TMap<FString, FCriticalSection*> Registry;
+		FScopeLock RegistryLock(&RegistryCS);
+		FCriticalSection*& Lock = Registry.FindOrAdd(Staging, nullptr);
+		if (!Lock)
+		{
+			Lock = new FCriticalSection();
+		}
+		return *Lock;
+	}
+
 	static void JournalReset(const FString& DestPath, int64 SegmentSize, int64 Total)
 	{
 		const FString Text = FString::Printf(TEXT("%s %lld %lld\n"), JournalMagic, SegmentSize, Total);
@@ -292,6 +311,35 @@ namespace UnrealGamePatcher
 			IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
 			const FString Staging = StagingPathFor(J.Job.DestPath);
 			PF.CreateDirectoryTree(*FPaths::GetPath(Staging));
+			// Segments settle out of order: a later segment may reach the file
+			// before the earlier ones. POSIX allows seek-past-EOF writes (the
+			// gap becomes a hole), but Android's FUSE external storage REJECTS
+			// them - fill the hole with zeros first so every segment write
+			// lands at or before the current EOF. Fill + write are serialized
+			// per staging file: concurrent fillers working from a stale file
+			// size could otherwise zero out another segment's written data.
+			// Network transfers stay parallel - only same-file disk writes
+			// serialize here.
+			FScopeLock StagingLock(&StagingLockFor(Staging));
+			{
+				const int64 CurSize = IFileManager::Get().FileSize(*Staging);
+				if (CurSize >= 0 && CurSize < S.Offset)
+				{
+					static const uint8 Zeros[4096] = {};
+					if (FArchive* Filler = IFileManager::Get().CreateFileWriter(*Staging, FILEWRITE_Append))
+					{
+						Filler->Seek(CurSize);
+						int64 Remaining = S.Offset - CurSize;
+						while (Remaining > 0 && !Filler->IsError())
+						{
+							const int32 ZeroChunk = (int32)FMath::Min<int64>(sizeof(Zeros), Remaining);
+							Filler->Serialize((void*)Zeros, ZeroChunk);
+							Remaining -= ZeroChunk;
+						}
+						delete Filler;
+					}
+				}
+			}
 			// FILEWRITE_Append opens WITHOUT truncating (plain OpenWrite would
 			// zero the already-written segments of a multi-segment file);
 			// Seek() then positions absolutely for the in-place segment write.
@@ -303,6 +351,7 @@ namespace UnrealGamePatcher
 				bWritten = !Writer->IsError();
 				delete Writer;
 			}
+			StagingLock.Unlock();
 			if (!bWritten)
 			{
 				Finish(J, false, FString::Printf(TEXT("cannot write segment %d"), S.Index));
