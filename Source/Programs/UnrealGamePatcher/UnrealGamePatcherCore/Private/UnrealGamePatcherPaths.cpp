@@ -6,6 +6,12 @@
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
 #include "Misc/Timespan.h"
+#if PLATFORM_ANDROID
+	#include <fcntl.h>
+	#include <sys/file.h>
+	#include <unistd.h>
+	#include <cerrno>
+#endif
 
 namespace UnrealGamePatcher::Paths
 {
@@ -44,8 +50,49 @@ namespace UnrealGamePatcher::Paths
 		Release();
 	}
 
-	bool FInstallLock::Acquire(const FString& InstallDir)
+	bool FInstallLock::Acquire(const FString& InstallDir, const FString& LockRootDir)
 	{
+#if PLATFORM_ANDROID
+		// Android: UE::FPlatformSystemWideMutex's POSIX implementation puts the
+		// lock file under FPlatformProcess::ApplicationSettingsDir(), which
+		// Android does not override - it degenerates to RootDir("/"), where an
+		// app cannot create files. Lock a file under LockRootDir instead (the
+		// caller passes the app's INTERNAL files dir: the emulated external
+		// storage is FUSE and silently does not support flock). Same
+		// single-writer semantics; flock releases on process death.
+		if (AndroidLockFd >= 0)
+		{
+			return true;
+		}
+		const FString LockDir = LockRootDir.IsEmpty() ? (InstallDir / TEXT(".ugp")) : (LockRootDir / TEXT("UnrealGamePatcher"));
+		FString Key = InstallDir;
+		Key.ReplaceInline(TEXT("\\"), TEXT("/"));
+		Key.ToUpperInline();
+		const uint64 NameHash = FPatcherHash::XXH64(Key.GetCharArray().GetData(), Key.Len() * sizeof(TCHAR));
+		const FString LockPath = FPaths::Combine(LockDir,
+			FString::Printf(TEXT("install.lock.%016llx"), NameHash));
+		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+		if (!PF.CreateDirectoryTree(*FPaths::GetPath(LockPath)))
+		{
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: cannot create the lock directory '%s' (lock file for '%s')"),
+				*FPaths::GetPath(LockPath), *InstallDir);
+			return false;
+		}
+		const int Fd = open(TCHAR_TO_UTF8(*LockPath), O_CREAT | O_WRONLY | O_CLOEXEC, 0666);
+		if (Fd < 0)
+		{
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: cannot open the install lock file '%s' (errno %d)"), *LockPath, errno);
+			return false;
+		}
+		if (flock(Fd, LOCK_EX | LOCK_NB) != 0)
+		{
+			close(Fd);
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: another patcher instance is working on '%s' - refusing to run concurrently"), *InstallDir);
+			return false;
+		}
+		AndroidLockFd = Fd;
+		return true;
+#else
 		if (Mutex.IsSet())
 		{
 			return true;
@@ -76,10 +123,19 @@ namespace UnrealGamePatcher::Paths
 			return false;
 		}
 		return true;
+#endif
 	}
 
 	void FInstallLock::Release()
 	{
+#if PLATFORM_ANDROID
+		if (AndroidLockFd >= 0)
+		{
+			flock(AndroidLockFd, LOCK_UN);
+			close(AndroidLockFd);
+			AndroidLockFd = -1;
+		}
+#endif
 		if (Mutex.IsSet())
 		{
 			Mutex->Release();
