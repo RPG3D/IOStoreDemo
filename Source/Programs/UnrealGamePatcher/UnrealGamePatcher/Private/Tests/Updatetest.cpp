@@ -760,11 +760,15 @@ namespace UnrealGamePatcher::Tests
 			Check(bCrashed, TEXT("crash: simulated kill makes update fail"));
 			Check(ReadStateStatus() == ETransactionStatus::Pending, TEXT("crash: transaction left pending"));
 			Check(PF.DirectoryExists(*(FPaths::Combine(Install, TEXT(".ugp"), TEXT("backup")))), TEXT("crash: backups left on disk"));
+			const FString InterruptedTemp = FPaths::Combine(Install, TEXT("readme.txt.ugp-tmp"));
+			Check(FFileHelper::SaveStringToFile(TEXT("incomplete write"), *InterruptedTemp),
+				TEXT("crash: interrupted atomic write left a temp file"));
 
 			// 10b. Rerun (as the next launch): recovery rolls back the
 			// interrupted transaction, then applies 1.0.5 fresh.
 			FUpdateStats SRecover;
 			Check(FUpdateOrchestrator::Update(Cdn, TEXT("1.0.5"), Install, true, SRecover), TEXT("crash: rerun after kill succeeds"));
+			Check(!PF.FileExists(*InterruptedTemp), TEXT("crash: rerun cleaned up the interrupted temp file"));
 			{
 				TArray64<uint8> OnDisk;
 				const bool bRead = FFileHelper::LoadFileToArray(OnDisk, *(FPaths::Combine(Install, TEXT("readme.txt"))));

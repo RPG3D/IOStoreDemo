@@ -1347,7 +1347,9 @@ namespace UnrealGamePatcher
 				}
 
 				PF.SetReadOnly(*T.File, false);
-				if (!PF.DeleteFile(*T.File))
+				// A replayed replacement may already have consumed a stray
+				// .ugp-tmp file that the diff also planned to remove.
+				if (!PF.DeleteFile(*T.File) && PF.FileExists(*T.File))
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed deleting '%s'"), *T.File);
 					bOk = false;
