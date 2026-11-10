@@ -63,6 +63,16 @@ Build/*/**
 # Don't ignore icon files in Build
 !Build/**/*.ico
 
+# UGP Android port: project Java sources MUST be versioned. The UE template's
+# Build/*/** rule hides Build/Android/src/** entirely, which would drop the
+# patcher Activity from the repo (it is compiled by gradle at packaging time).
+!Build/Android/src/
+!Build/Android/src/com/
+!Build/Android/src/com/epicgames/
+!Build/Android/src/com/epicgames/unreal/
+!Build/Android/src/com/epicgames/unreal/patch/
+!Build/Android/src/com/epicgames/unreal/patch/**
+
 # Built data for maps
 *_BuiltData.uasset
 
@@ -108,3 +118,7 @@ __pycache__/
 # Source/Programs/UnrealGamePatcher/Scripts/start_rustfs.* header)
 Source/Programs/UnrealGamePatcher/Scripts/rustfs
 Source/Programs/UnrealGamePatcher/Scripts/rustfs.exe
+
+# UGP Android: libugp.so 是构建产物（Binaries/Android/UnrealGamePatcherLib-arm64.so 的拷贝），
+# 不入库；打包前见 Docs/android-s1-runbook.md §二 第 1 步
+Plugins/UGPAndroidPatch/Source/UGPAndroidPatch/libs/

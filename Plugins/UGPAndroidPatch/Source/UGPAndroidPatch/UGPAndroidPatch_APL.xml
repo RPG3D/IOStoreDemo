@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+	<!--
+	  UGP Android Patch (S1)：
+	  1) 明文策略（S1 经 adb reverse 走 http://127.0.0.1；INTERNET 引擎已声明，
+	     重复声明会让 manifest merger 失败）
+	  2) LAUNCHER 从 GameActivity/SplashActivity 切到 PatchActivity（:ugppatch 进程）
+	  3) 把模块内的 libs/<arch>/libugp.so 拷进 APK（UBT 再把 libs 搬进 jniLibs）
+	     —— 源 = Binaries/Android/UnrealGamePatcherLib-arm64.so 的同步拷贝，
+	     带 lib 前缀命名，对应 System.loadLibrary("ugp")
+	-->
+	<init>
+		<log text="UGPAndroidPatch UPL init (arch=$S(Architecture))"/>
+	</init>
+
+	<androidManifestUpdates>
+		<addAttribute tag="application" name="android:usesCleartextTraffic" value="true"/>
+
+		<!-- 生成的 manifest 里带 LAUNCHER 的是 SpashActivity/GameActivity：
+		     删掉 LAUNCHER filter，换成 PatchActivity（双入口会出现双图标）。 -->
+		<removeElement tag="intent-filter"/>
+		<addElements tag="application">
+			<activity android:name="com.epicgames.unreal.patch.PatchActivity"
+				android:label="IOStoreDemo"
+				android:exported="true"
+				android:process=":ugppatch">
+				<intent-filter>
+					<action android:name="android.intent.action.MAIN"/>
+					<category android:name="android.intent.category.LAUNCHER"/>
+				</intent-filter>
+			</activity>
+		</addElements>
+	</androidManifestUpdates>
+
+	<!-- 与引擎第三方插件（vkquality）同一模式 -->
+	<resourceCopies>
+		<copyFile src="$S(AbsPluginDir)/libs/$S(Architecture)/libugp.so"
+			dst="$S(BuildDir)/libs/$S(Architecture)/libugp.so"/>
+		<log text="Copying libugp.so into the APK"/>
+	</resourceCopies>
+</root>
