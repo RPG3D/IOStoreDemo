@@ -1,31 +1,51 @@
 {
-	"FileVersion": 3,
-	"EngineAssociation": "{A8AD6A96-449D-7D70-175F-DBBAEA8C6118}",
-	"Category": "",
-	"Description": "",
-	"Modules": [
-		{
-			"Name": "IOStoreDemo",
-			"Type": "Runtime",
-			"LoadingPhase": "Default"
-		}
-	],
-	"Plugins": [
-		{
-			"Name": "ModelingToolsEditorMode",
-			"Enabled": true
-		},
-		{
-			"Name": "GameplayStateTree",
-			"Enabled": true
-		}
-	],
-	"TargetPlatforms": [],
-	
-	
-	
-	
-	"AdditionalRootDirectories": [],
-	"AdditionalPluginDirectories": [],
-	"EpicSampleNameHash": ""
+  "FileVersion": 3,
+  "EngineAssociation": "{A8AD6A96-449D-7D70-175F-DBBAEA8C6118}",
+  "Category": "",
+  "Description": "",
+  "Modules": [
+    {
+      "Name": "IOStoreDemo",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "ModelingToolsEditorMode",
+      "Enabled": true
+    },
+    {
+      "Name": "GameplayStateTree",
+      "Enabled": true
+    },
+    {
+      "Name": "MetaHumanSDK",
+      "Enabled": false
+    },
+    {
+      "Name": "MetaHumanCharacter",
+      "Enabled": false
+    },
+    {
+      "Name": "MetaHumanAnimator",
+      "Enabled": false
+    },
+    {
+      "Name": "MetaHumanCoreTechLib",
+      "Enabled": false
+    },
+    {
+      "Name": "MetaHumanLiveLink",
+      "Enabled": false
+    },
+    {
+      "Name": "Bridge",
+      "Enabled": false
+    }
+  ],
+  "TargetPlatforms": [],
+  "AdditionalRootDirectories": [],
+  "AdditionalPluginDirectories": [],
+  "EpicSampleNameHash": ""
 }
