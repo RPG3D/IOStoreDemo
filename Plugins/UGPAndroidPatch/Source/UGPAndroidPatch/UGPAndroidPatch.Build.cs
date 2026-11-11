@@ -1,7 +1,6 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-// S1 全链：仅承载 Android 打包期 UPL（UGPAndroidPatch_APL.xml）——把
-// libugp.so 装进 APK、切换 LAUNCHER 到 PatchActivity。运行时无任何代码。
+// Registers the packaging rules for the in-process startup updater.
 //
 // UBT 不会自动发现 APL 文件：必须像引擎的 AndroidPermission 插件那样，在
 // Build.cs 里把 APL 登记进 target receipt（AndroidPlugin 属性），

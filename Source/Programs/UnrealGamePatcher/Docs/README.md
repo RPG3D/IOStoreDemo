@@ -34,6 +34,9 @@
 - **`TESTCASES.md`**：全部测试套件的权威刻度尺（每套解决什么问题/怎么做/预期效果）。
 - **`DEBUGGER.md`**：MCP 驱动的自动化调试环境（debugmcp + codelldb；断点/求值/回归校验）。
 - **`review-2026-10-09-0206.md`**：最新完整 code review（发现 / 当前状态 / 修复记录；整合全部历史轮次）。
+- **`review-2026-11-11.md`**：Android 启动前更新链的 3 个 P1 问题及复现条件。
+- **`ios-preinit-runbook.md`**：iOS 启动前更新、CDN 发布和真机验收流程。
+- **`android-s1-runbook.md`**：Android 同进程启动更新、Saved/Paks 迁移和真机验收流程。
 
 ## 构建
 
@@ -62,6 +65,22 @@ UnrealGamePatcher.exe -cli <command> [options]
 | `iostoreinplace` | ucas chunk 级原地写入测试（只追加变化 chunk + 原子重写 utoc） |
 
 自测命令：`selftest / statetest / indextest / difftest / buildtest / diffbuild / updatetest / maintest / downloadtest / benchtest / iostoretest / e2etest / perftest / pakinplace / iostoreinplace`（全部通过 = 退出码 0）。
+
+### 更新错误码
+
+日志和移动端重试弹窗使用 `UGP-xxxx`。首位表示失败阶段，后几位定位原因。CLI 的进程退出状态继续使用短数字，详细诊断码从日志读取。
+
+| 范围 | 阶段 | 已定义的错误码 |
+| --- | --- | --- |
+| 1xxx | 版本公告 | `1001` 无法读取 `index/latest.json`，`1002` 公告格式或版本字段无效 |
+| 2xxx | 版本清单 | `2001` 版本清单不可读，`2002` 清单格式、大小限制或自校验失败，`2003` chunk 引用或拼装范围无效 |
+| 3xxx | 本地差分 | `3001` 安装目录扫描失败，`3002` 读取本地内容以生成差分失败 |
+| 4xxx | 下载 | `4001` chunk 下载重试耗尽 |
+| 5xxx | 合并与写入 | `5001` 应用失败，`5002` 打开写入目标失败，`5003` 写入不完整，`5004` 替换目标失败，`5005` 备份失败，`5006` 删除失败，`5007` chunk 文件缺失 |
+| 6xxx | 内容校验 | `6001` chunk 读取、解码或校验失败，`6002` 重建文件哈希不符，`6003` 提交后缺少可挂载内容或索引版本不符 |
+| 7xxx | 提交 | `7001` 事务日志写入失败，`7002` 提交事务状态失败，`7003` 写入内容索引失败，`7004` 激活已提交内容失败 |
+| 8xxx | 恢复 | `8001` 回滚失败，`8002` 更新被中断并留下待恢复事务，`8003` 迁移旧目录失败 |
+| 9xxx | 启动准备 | `9000` 内部错误，`9001` 无法锁定目录，`9002` 无法创建安装目录，`9003` 配置无效，`9004` 无法创建更新副本，`9005` 无法清理更新目录 |
 
 GUI：不带 `-cli` 即打开 Slate 窗口（更新按钮 + 进度条 + 完成后启动游戏），
 参数：`-cdn= -version= -install= [-launch=<游戏exe>] [-autoupdate]`（`-cdn` 同上，`-version` 缺省解析 latest）。

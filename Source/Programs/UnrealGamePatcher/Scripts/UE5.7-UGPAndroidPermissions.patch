@@ -1,0 +1,30 @@
+diff --git a/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template b/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template
+index 15dec3eba..cc3dea595 100644
+--- a/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template
++++ b/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template
+@@ -182,7 +182,6 @@ import com.google.android.gms.common.GooglePlayServicesUtil;
+ import com.google.android.gms.common.ConnectionResult;
+ import com.google.android.gms.games.Games;
+ 
+-import com.google.vr.sdk.samples.permission.PermissionHelper;
+ 
+ import java.nio.charset.StandardCharsets;
+ import java.net.URL;
+@@ -4022,7 +4021,7 @@ Trace.endSection();
+ 			deviceVibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+ 		}
+ 
+-		if (!isStandalone && PermissionHelper.checkPermission("android.permission.CHANGE_WIFI_MULTICAST_STATE"))
++		if (!isStandalone && checkSelfPermission("android.permission.CHANGE_WIFI_MULTICAST_STATE") == PackageManager.PERMISSION_GRANTED)
+ 		{
+ 			WifiManager wifiManager = (WifiManager)getSystemService(Context.WIFI_SERVICE);
+ 			MultiCastLock = wifiManager.createMulticastLock("UE");
+@@ -4111,7 +4110,7 @@ Trace.endSection();
+ 			if (!bIsShipping)
+ 			{
+ 				// For non-shipping builds we may need this permission because we write to the sdcard for logs
+-				if (!PermissionHelper.checkPermission("android.permission.WRITE_EXTERNAL_STORAGE"))
++				if (checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") != PackageManager.PERMISSION_GRANTED)
+ 				{
+ 					Log.debug("android.permission.WRITE_EXTERNAL_STORAGE was not granted; this may cause issues with file access." );
+ 					// we do not do this currently since we must wait until it is granted before accessing files

@@ -20,10 +20,13 @@ public class UnrealGamePatcherLibTarget : TargetRules
 
 		// Same capability set as the standalone patcher: engine Core only,
 		// no Engine module, no Slate/UI. The JNI bootstrap drives the engine
-		// loop explicitly (PreInit -> update -> AppExit).
+		// loop explicitly. Java ends the dedicated process after handoff.
 		bCompileAgainstEngine = false;
 		bCompileAgainstCoreUObject = true;
 		bCompileAgainstApplicationCore = true;
+		bBuildWithEditorOnlyData = false;
+		// The updater runs before any cooked data is installed.
+		bCompileICU = false;
 
 		bBuildDeveloperTools = false;
 		bUseLoggingInShipping = true;

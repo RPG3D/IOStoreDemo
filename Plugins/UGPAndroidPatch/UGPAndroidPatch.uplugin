@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"FriendlyName": "UGP Android Patch",
-	"Description": "S1 全链：把 libugp.so 装进 APK、声明 PatchActivity 为 LAUNCHER（:ugppatch 进程）、INTERNET/明文策略。见 Source/Programs/UnrealGamePatcher/Docs/android-port-feasibility-2026-11-02.md",
+	"Description": "Android packaging configuration for the in-process UGP startup updater.",
 	"VersionName": "1.0",
 	"Version": 1,
 	"CanContainContent": false,
@@ -10,7 +10,8 @@
 		{
 			"Name": "UGPAndroidPatch",
 			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "Default",
+			"PlatformAllowList": ["Android"]
 		}
 	]
 }

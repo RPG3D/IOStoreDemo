@@ -1,4 +1,6 @@
 #include "OnDemandSubsystem.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
 
 DEFINE_LOG_CATEGORY(LogOnDemand);

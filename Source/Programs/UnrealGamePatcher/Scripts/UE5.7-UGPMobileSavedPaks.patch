@@ -1,0 +1,25 @@
+diff --git a/Engine/Source/Runtime/PakFile/Private/IPlatformFilePak.cpp b/Engine/Source/Runtime/PakFile/Private/IPlatformFilePak.cpp
+index 24eed5e52..6b9d4b434 100644
+--- a/Engine/Source/Runtime/PakFile/Private/IPlatformFilePak.cpp
++++ b/Engine/Source/Runtime/PakFile/Private/IPlatformFilePak.cpp
+@@ -5650,7 +5650,19 @@ bool FPakPlatformFile::Initialize(IPlatformFile* Inner, const TCHAR* CmdLine)
+ 	if (FIoDispatcher::IsInitialized())
+ 	{
+ 		FString GlobalUTocPath = FString::Printf(TEXT("%sPaks/global.utoc"), *FPaths::ProjectContentDir());
+-		const bool bShouldMountGlobal = FPlatformFileManager::Get().GetPlatformFile().FileExists(*GlobalUTocPath);
++		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
++		bool bShouldMountGlobal = PlatformFile.FileExists(*GlobalUTocPath);
++#if (PLATFORM_ANDROID && UE_FORCE_USE_PAKS) || (defined(WITH_UGP_IOS_PREINIT) && WITH_UGP_IOS_PREINIT)
++		if (!bShouldMountGlobal)
++		{
++			const FString DownloadedUTocPath = FPaths::ProjectSavedDir() / TEXT("Paks/global.utoc");
++			if (PlatformFile.FileExists(*DownloadedUTocPath))
++			{
++				GlobalUTocPath = DownloadedUTocPath;
++				bShouldMountGlobal = true;
++			}
++		}
++#endif
+ 		if (bShouldMountGlobal || PakPlatformFile_IsForceUseIoStore(CmdLine))
+ 		{
+ 			if (ShouldCheckPak())

@@ -12,6 +12,7 @@ public class UnrealGamePatcherLib : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		CppStandard = CppStandardVersion.Cpp20;
+		PrivateDefinitions.Add("UGP_BUILD_CONFIGURATION=" + Target.Configuration);
 
 		// RequiredProgramMainCPPInclude.h (FEngineLoop/entry plumbing) is
 		// granted via the Launch module's include path - same as the CLI.

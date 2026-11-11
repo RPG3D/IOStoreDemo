@@ -1,5 +1,82 @@
 # S1 真机全链 runbook（2026-11-02）
 
+## Android 同进程启动更新器（2026-11-12）
+
+Android 的 `GameActivity` 和 UGP 使用同一游戏进程。游戏线程在平台文件初始化后、`GEngineLoop.PreInit()` 前运行 UGP，UI 线程绘制启动覆盖层和 Retry 对话框。完成更新或选择可用的旧版后，游戏线程继续启动并挂载容器。iOS 同样在游戏进程内更新。桌面独立更新器使用显式指定的游戏安装路径。
+
+两端把活动容器、索引和事务记录放在 `FPaths::ProjectSavedDir()/Paks`。Android 通过 UE 的物理文件层解析应用沙盒里的绝对路径，使用 `Paks.ugp-update` 和 `Paks.ugp-previous` 发布或回退。更新仅复制和替换 Pak 子目录，存档和日志留在原目录。`global.utoc` 随容器放在 `Saved/Paks`，由引擎在初始化 IoStore 时读取。
+
+升级时从已提交的旧 Android staged 目录复制容器，重写 Saved 目录内的索引和状态。先验证并发布新目录，再将旧 `Content/Paks` 改名为 `Paks.ugp-legacy`。已有 staged CDN 的容器条目在验证清单后映射到 `Saved/Paks`；新 CDN 可直接以容器目录作为 `-staged`。游戏资源应放入 Pak 或 IoStore 容器，启动命令行可随 APK 交付。
+
+引擎工作区需要应用 [UE5.7-UGPAndroidPreInit.patch](../Scripts/UE5.7-UGPAndroidPreInit.patch) 和 [UE5.7-UGPMobileSavedPaks.patch](../Scripts/UE5.7-UGPMobileSavedPaks.patch)。本机引擎需要的 Java 权限修复见下文。UAT 保留 staged 内容供 CDN 发布，UPL 将 `bPackageDataInsideApk` 和 `bHasOBBFiles` 设为 `false`，Gradle 在 APK 装配前移除 OBB，并检查 `bUseExternalFilesDir=true`。更新代码随游戏库编译。
+
+本机 ARM64 Development 真机从旧 staged 安装离线迁入 `Saved/Paks`，11 个容器及测试存档的 SHA-256 一致。空目录首装下载 60 个 chunk（76,446,104 字节），随后由同一个 PID 从 `Saved/Paks` 挂载 `global.utoc` 和 Pak，再进入 `/Game/ThirdPerson/Lvl_ThirdPerson`。容器逐个核对与发布前一致。
+
+增量测试下载 1 个 chunk，提交后 UE 挂载更新过的 `pakchunk1`，从设备拉回该 Pak 并解出新增文件核对。模拟发布在第一次改名后中断，关闭 USB CDN 转发并重启，UE 恢复已提交版本并进图。索引、事务状态、容器和测试存档的 SHA-256 均一致。日志位于本机 `Saved/AndroidSavedPaksQA/`。
+
+## 历史独立进程更新器验证（2026-11-12）
+
+- `PatchActivity` 在 `:ugppatch` 进程里运行，版本检查、清单和安装阶段在屏幕底部转圈。下载阶段显示水平进度条和已完成／总 MiB，缓存中可复用的字节计入起始进度。需要补下载时，界面显示 `Downloading additional content`，保留本次已经完成的字节并更新总量。
+- 首装失败在同一个英文弹窗显示 `UGP-xxxx`、`Failed retries` 和 `Retry`。点击重试立即回到更新界面，只有本次重试失败才增加计数。Activity 重建继续观察同一个 worker，游戏转场后结束更新进程。
+- 通过 UAT 打包时开启 `bUseExternalFilesDir`，Development 内容落在应用专属外部存储，Shipping 落在内部存储。两者都使用 `UnrealGame/IOStoreDemo` 作为安装根目录，CDN 保留 UAT 的项目子目录层级。事务锁使用内部存储。
+- 原生层检查已提交事务、索引版本、文件是否齐全及 Pak footer。已有安装的增量在同级 `.ugp-update` 目录应用，需为完整副本预留空间。完成校验后，先把原目录改名为 `.ugp-previous`，再发布更新目录。若进程在两次改名之间退出，下次启动先恢复旧目录，再检查 CDN。游戏和更新器共用内部存储上的跨进程锁，游戏运行时重新打开启动入口会回到游戏。冷启动时，游戏消耗一次由更新器校验通过后写入的启动标记，从最近任务恢复也遵循同一门控。
+- 用 `-SkipDeploy` 构建 `UnrealGamePatcherLib`，再把目标架构的库复制到插件的 `libs/<ABI>/libugp.so`。用 UAT 生成 APK，Gradle 会检查 manifest 的存储设置及库的 ELF 架构、构建配置和 JNI 版本。更新器使用 UE 的基础国际化实现，启动时无需 cooked ICU 数据。若 UE 5.7 的 Android 媒体代码报 `GetMediaTextureSampleColorConverter` 不存在，在引擎仓库应用 [UE5.7-UGPAndroidMedia.patch](../Scripts/UE5.7-UGPAndroidMedia.patch)。
+
+API 35 x86_64 模拟器使用真实的更新 Activity、`libugp.so`、HTTP CDN 和 Pak 测试数据。首装服务端中断后显示 `UGP-4001`，两次重试失败后计数为 2。旋转保留当前尝试。恢复 CDN 后从 12.6 / 20.1 MiB 继续，日志记录 5 个缓存命中和 5 个网络下载。模拟发布只完成第一次改名的磁盘状态后，在 CDN 不可达时启动，恢复的旧索引和 Pak 的 SHA-256 与中断前一致。
+
+增量下载失败后保留原版本，恢复 CDN 后发布 1.0.2，并用 UnrealPak 解包核对新版数据。更新至 1.0.3 时第一个 Pak 写入副本成功，第二个 Pak 因无法打开临时文件报 `UGP-5002`。回退到 1.0.2 后索引和 Pak 的 SHA-256 保持一致。测试 Activity 验证转场，游戏地图挂载需要完整游戏 APK。
+
+Android 16 ARM64 真机使用同一测试数据。中断后英文弹窗显示 `UGP-4001` 和 `Retry`，连续三次失败后计数为 3。恢复 CDN 后第 4 次重试从 12.6 / 20.1 MiB 继续，网络下载 8,033,896 字节，复用了 5 个已缓存的 chunk。首装 Pak 的 SHA-256 与发布文件一致。再次启动后增量发布 1.0.2，手机上的新版 Pak 与 CDN 对应的 staged Pak 逐字节一致。
+
+ARM64 Development 的 `libugp.so` 通过 UE Core 依赖 `libGPUCounters.so`。UAT 通过同一配置下的 `libGPUCounters_UPL.xml` 把它加入 Gradle 原生库目录。手工组装更新器测试包时也要加入该库。游戏和 `libugp.so` 应使用相同的 ABI 和构建配置，Shipping 的 Core 构建省略该性能计数器依赖。
+
+启动门控回归使用同一台 ARM64 真机。测试 Activity 持锁时，通过新任务再次打开启动器，日志记录 `Game is running; resuming without updating`。索引、两个 Pak 和测试存档的 SHA-256 一致。冷启动后才更新。另将活动 Pak 截断到 8 字节，保留有效的 `.ugp-previous` 并切断本机 CDN，启动器恢复了旧索引、Pak 和存档，再完成转场。
+
+### 完整游戏真机验证
+
+在 Android 16 ARM64 真机安装从 UAT Gradle 工程组装的独立 Development APK，包名 `com.example.ugp.androidgameqa`。移除 APK 内的 OBB 和 `UECommandLine.txt`，保留 UAT staged 根目录作为 CDN 输入。空目录首装下载 97 个 chunk、83,361,696 字节。手机上的索引、命令行和 11 个 Pak／IoStore 文件与发布前的 SHA-256 一致。UE 使用应用专属外部存储，挂载 `../../../IOStoreDemo/Content/Paks` 下的三个 Pak 及其 IoStore 容器，并进入 `/Game/ThirdPerson/Lvl_ThirdPerson`。
+
+更新器使用单独的 task affinity，转场时通过 `NEW_TASK`、`CLEAR_TOP` 和 `SINGLE_TOP` 回到游戏任务。修复前，另开任务重进更新入口会创建第二个 `GameActivity`，触发 UE 的 `onCreate` 断言。修复后在真机重复相同步骤，原游戏 Activity 恢复前台，索引、容器和测试存档的 SHA-256 一致。日志和 APK 位于本机 `Saved/AndroidUGPReview/`。
+
+关闭 USB CDN 转发后强停并冷启动完整游戏，更新器报 `UGP-1001` 并使用已提交的 `1.0.0`，UE 挂载同一批容器后再次进入 `Lvl_ThirdPerson`。旧索引、事务状态、容器和测试存档的 SHA-256 均保持一致。验证后恢复 USB 转发。
+
+Android 保留 UAT 的 `Content/Paks` 布局。iOS 的 `ProjectSavedDir()/Paks` 安装路径和 `global.utoc` 回退见 [iOS PreInit runbook](ios-preinit-runbook.md)。
+
+### 服务端限速和续传验证
+
+从仓库根目录启动测试 CDN。将示例中的 `<CDN 根目录>` 和 `<设备序列号>` 替换为实际值。设备通过 USB 访问本机 CDN，可以保持手机的 Wi-Fi 和移动网络连接。
+
+```bash
+python3 Source/Programs/UnrealGamePatcher/Scripts/cdn_server.py \
+  --root '<CDN 根目录>' --port 18080 --log Saved/UGP-Android-CDN.log
+```
+
+在另一个终端执行以下命令。参数名为 `kbps`，脚本按 KiB/s 计算。限速应用到每个 HTTP 响应，多个请求并发时吞吐可以叠加。
+
+```bash
+adb -s '<设备序列号>' reverse tcp:18080 tcp:18080
+curl -fsS 'http://127.0.0.1:18080/__ctl/throttle?kbps=256'
+```
+
+1. 用空安装目录启动测试包。检查版本时底部转圈，下载时显示已完成／总 MiB。
+2. 进度过半前，可用下面的命令截断下一条请求。该故障只触发一次，客户端自动重试可能直接恢复。若要复现 `UGP-4001` 和手动 Retry，在故障服务中持续中断后续 chunk 请求，同时保持版本和清单可读，直到自动重试耗尽。
+
+   ```bash
+   curl -fsS 'http://127.0.0.1:18080/__ctl/truncate_next?bytes=65536'
+   ```
+
+3. 保持故障并点一次 Retry。弹窗立即收起，底部回到转圈。再次失败后，弹窗中的 `Failed retries` 加一。
+4. 恢复服务端 chunk 响应，再点 Retry。核对进度从缓存字节数继续，CDN 只收到缺失对象的请求。客户端日志中的 `downloaded … bytes, … from cache` 记录实际补下载和缓存命中。
+5. 用同一份数据测吞吐前，清除测试限速。记录清单加载到下载完成的时间，避免把版本检查或测试延迟计入下载时间。
+
+   ```bash
+   curl -fsS 'http://127.0.0.1:18080/__ctl/throttle?kbps=0'
+   ```
+
+同一台 ARM64 真机通过 USB 复测。每响应限制 256 KiB/s 时，恢复 CDN 后从清单加载到补完约 7.7 MiB 用了 15.5 秒。清除限速并使用空安装目录后，完整下载 20.1 MiB 用了 0.56 秒，缓存命中为 0。
+
+## 历史真机记录
+
 > **2026-11-10 真机复测（muyu，Development）**：保留外部存储，沿用同一批容器，
 > 按 UAT 布局放在 `<InstallDir>/IOStoreDemo/Content/Paks/`，并使用 UAT 生成的
 > `UECommandLine.txt`。单份容器挂载成功，预制 Asset Registry 加载成功，进入
@@ -49,16 +126,18 @@
 | 引擎内容可加载 | ✅ `assets/main.obb.png` 76 MB（内容打进 APK） | `unzip -l` |
 | 包名 | `com.YourCompany.IOStoreDemo` | `aapt2 dump badging` |
 
-## 二、复现命令（本机已全部跑通）
+## 二、复现命令
+
+本机精简 UE 5.7 的 Java 模板若因缺少 Google VR 的 `PermissionHelper` 无法编译，在引擎仓库应用 [UE5.7-UGPAndroidPermissions.patch](../Scripts/UE5.7-UGPAndroidPermissions.patch)。补丁使用 Android 原生权限检查。
 
 ```bash
 # 1) 构建 libugp.so（独立库目标，产出 AArch64 DYN）
-Build.bat UnrealGamePatcherLib Android Development -project=D:\UEProject\IOStoreDemo\IOStoreDemo.uproject
+Build.bat UnrealGamePatcherLib Android Development -project=D:\UEProject\IOStoreDemo\IOStoreDemo.uproject -Architecture=arm64 -SkipDeploy
 #    → Binaries/Android/UnrealGamePatcherLib-arm64.so
 #    → 同步到插件：cp → Plugins/UGPAndroidPatch/Source/UGPAndroidPatch/libs/arm64-v8a/libugp.so
 
-# 2) 构建游戏（同时产出 APK；UPL 在此执行）
-Build.bat IOStoreDemo Android Development -project=D:\UEProject\IOStoreDemo\IOStoreDemo.uproject
+# 2) 构建游戏二进制
+Build.bat IOStoreDemo Android Development -project=D:\UEProject\IOStoreDemo\IOStoreDemo.uproject -Architecture=arm64 -SkipDeploy
 
 # 3) 打完整包（cook + stage + pak + package；cook 命中缓存时约 45s）
 RunUAT.bat BuildCookRun -project=D:\UEProject\IOStoreDemo\IOStoreDemo.uproject -noP4 ^

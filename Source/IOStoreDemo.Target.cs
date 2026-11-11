@@ -15,10 +15,14 @@ public class IOStoreDemoTarget : TargetRules
 
 		bCompileIoStoreOnDemand = true;
 
-		// M1 (android-port-feasibility-2026-11-02.md 2.2): the APK ships with ZERO
-		// game containers - all content is installed by UGP into the sandbox
-		// (Content/Paks) at first run. Force the pak environment on even when
-		// the APK has no pak files.
+		// Mobile packages download their game containers into ProjectSavedDir/Paks.
+		// Enable the Pak platform file even when the app ships without containers.
 		GlobalDefinitions.Add("UE_FORCE_USE_PAKS=1");
+
+		if (Target.Platform == UnrealTargetPlatform.IOS)
+		{
+			ExtraModuleNames.Add("UGPIOSPatch");
+			GlobalDefinitions.Add("WITH_UGP_IOS_PREINIT=1");
+		}
     }
 }

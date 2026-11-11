@@ -3,20 +3,22 @@
 // libugp.so - Android entry for the pre-boot patcher (PatchActivity model).
 //
 // Lifecycle (docs/android-port-feasibility-2026-11-02.md §2.3):
-//   PatchActivity (own ":patcher" process) -> System.loadLibrary("ugp")
+//   PatchActivity (own ":ugppatch" process) -> System.loadLibrary("ugp")
 //   -> nativeRunPatch(...): engine-lite init (JNI env + PreInit with -NoPak,
 //   no window, no pak mount) -> FUpdateOrchestrator::UpdateWithOptions
-//   (progress via FUpdateOptions::Events -> JNI callback) -> engine shutdown.
-//   Java then finishes the process; GameActivity boots the real engine, which
-//   mounts the freshly patched containers from Saved/Paks.
+//   (progress via FUpdateOptions::Events -> JNI callback).
+//   Java records readiness and finishes the process. GameActivity boots the real engine, which
+//   mounts the freshly patched containers in the Android staged tree.
 //
 // The whole patch runs ON the calling (Java) thread: Java spawns the worker
 // thread, so JNI callbacks need no extra attach and no engine threading
 // beyond the task-tag scope.
 
 #include "RequiredProgramMainCPPInclude.h"
+#include "HAL/PlatformFileManager.h"
 #include "Misc/CommandLine.h"
-#include "Modules/ModuleManager.h"
+#include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "UnrealGamePatcherLog.h"
 #include "UnrealGamePatcherPaths.h"
 #include "Update/FUpdateOrchestrator.h"
@@ -37,11 +39,16 @@ IMPLEMENT_APPLICATION(UnrealGamePatcherLib, "UnrealGamePatcherLib");
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 #include <android/native_window.h>
+#include <cerrno>
+#include <cstdio>
 
 // Core/Private/Android/AndroidJavaEnv.cpp - set from our JNI entry before
 // touching UE::Jni (FEnv's constructor CHECKs it). Must be at file scope:
 // inside the anonymous namespace it would get internal linkage.
 extern JavaVM* GJavaVM;
+extern FString GFilePathBase;
+extern FString GInternalFilePath;
+extern FString GExternalFilePath;
 
 // Real AssetManager handles captured in RunPatch (defined with the stubs
 // below); engine code (FAndroidPlatformFile) reads them via the thunks.
@@ -83,7 +90,7 @@ namespace
 			}
 		}
 
-		void operator()(const UnrealGamePatcher::FUpdateEvent& Ev)
+		void operator()(const UnrealGamePatcher::FUpdateEvent& Ev) const
 		{
 			if (!Env || !Listener || !Method)
 			{
@@ -102,131 +109,213 @@ namespace
 		}
 	};
 
-	/** Java -> native patch entry contract:
-	 *  boolean nativeRunPatch(String cmdline, String cdn, String version,
-	 *                        String installDir, String internalDir,
-	 *                        AssetManager assets,
-	 *                        OnUpdateEventListener listener)
-	 *  Returns true when the update flow completed (success OR clean failure
-	 *  reported through the listener); false when init itself failed. */
-	jboolean RunPatch(JNIEnv* Env, jclass, jstring JCmdline, jstring JCdn,
-		jstring JVersion, jstring JInstallDir, jstring JInternalDir, jobject JAssets, jobject JListener)
+	bool RenameDirectory(const FString& From, const FString& To)
 	{
+		if (rename(TCHAR_TO_UTF8(*From), TCHAR_TO_UTF8(*To)) == 0)
+		{
+			return true;
+		}
+		UE_LOG(LogUnrealGamePatcher, Error, TEXT("UGP Android: rename '%s' to '%s' failed (errno %d)"), *From, *To, errno);
+		return false;
+	}
+
+	bool RunContentUpdate(const FString& Cdn, const FString& InstallDir, const FString& InternalDir,
+		const FJavaEventSink& Sink)
+	{
+		using namespace UnrealGamePatcher;
+
+		const auto Fail = [&Sink](EPatcherError Error, const TCHAR* Message)
+		{
+			Sink({ EUpdatePhase::Failed, Error, true, 0, 0, Message });
+			return false;
+		};
+		// Keep the startup lock independent of the per-update lock and of
+		// directories exchanged on external app storage (FUSE).
+		Paths::FInstallLock StartupLock;
+		if (!StartupLock.Acquire(InstallDir, InternalDir / TEXT("UGPStartup")))
+		{
+			return Fail(EPatcherError::InstallLockFailed, TEXT("Could not lock the game content directory."));
+		}
+
+		IPlatformFile& File = FPlatformFileManager::Get().GetPlatformFile();
+		const FString StagedDir = InstallDir + TEXT(".ugp-update");
+		const FString PreviousDir = InstallDir + TEXT(".ugp-previous");
+		// If the process died between the two directory renames, restore
+		// the old root before resolving a CDN version or starting the game.
+		if (File.DirectoryExists(*PreviousDir) && !File.DirectoryExists(*InstallDir) &&
+			!RenameDirectory(PreviousDir, InstallDir))
+		{
+			return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous game content."));
+		}
+		FString LocalVersion;
+		bool bInstalled = FUpdateOrchestrator::ReadCommittedVersion(InstallDir, LocalVersion);
+		if (File.DirectoryExists(*PreviousDir) && !bInstalled)
+		{
+			FString PreviousVersion;
+			if (!FUpdateOrchestrator::ReadCommittedVersion(PreviousDir, PreviousVersion) ||
+				(File.DirectoryExists(*StagedDir) && !File.DeleteDirectoryRecursively(*StagedDir)) ||
+				!RenameDirectory(InstallDir, StagedDir) || !RenameDirectory(PreviousDir, InstallDir))
+			{
+				return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous game content."));
+			}
+			LocalVersion = MoveTemp(PreviousVersion);
+			bInstalled = true;
+		}
+
+		const bool bStagingAvailable =
+			(!File.DirectoryExists(*StagedDir) || File.DeleteDirectoryRecursively(*StagedDir)) &&
+			(!File.DirectoryExists(*PreviousDir) || File.DeleteDirectoryRecursively(*PreviousDir));
+
+		FHttpModule::Get();
+		FHttpChunkDownloader Downloader;
+		FUpdateOptions Options;
+		Options.Downloader = &Downloader;
+		Options.BaseUrl = Cdn;
+		Options.ChunkCacheDir = InstallDir + TEXT(".ugp-cache");
+		Options.InstallLockRootDir = InternalDir;
+		Options.bForceVerify = !bInstalled;
+		Options.bPreserveUntrackedFiles = true;
+		EPatcherError LastError = EPatcherError::Internal;
+		Options.Events = [&Sink, &LastError](const FUpdateEvent& Event)
+		{
+			if (Event.bIsError)
+			{
+				LastError = Event.Error;
+			}
+			Sink(Event);
+		};
+		const auto UseOldVersion = [&LocalVersion](EPatcherError Error)
+		{
+			UE_LOG(LogUnrealGamePatcher, Warning, TEXT("UGP Android: [UGP-%04d] using committed content %s"),
+				static_cast<int32>(Error), *LocalVersion);
+			return true;
+		};
+		FString Version;
+		if (!FUpdateOrchestrator::ResolveLatest(Cdn, Options, Version))
+		{
+			return bInstalled ? UseOldVersion(LastError) : false;
+		}
+		if (bInstalled && LocalVersion == Version)
+		{
+			return true;
+		}
+
+		const auto Apply = [&](const FString& TargetDir)
+		{
+			Sink({ EUpdatePhase::Manifest, EPatcherError::Ok, false, 0, 0, TEXT("Loading content manifest...") });
+			FUpdateStats Stats;
+			if (!FUpdateOrchestrator::UpdateWithOptions(Cdn, Version, TargetDir, true, Options, Stats))
+			{
+				return false;
+			}
+			FString InstalledVersion;
+			if (!FUpdateOrchestrator::ReadCommittedVersion(TargetDir, InstalledVersion) || InstalledVersion != Version)
+			{
+				LastError = EPatcherError::InstalledContentInvalid;
+				return Fail(LastError, TEXT("The installed content is missing a mountable Pak or has an invalid version."));
+			}
+			return true;
+		};
+		if (!bInstalled)
+		{
+			// Legacy pending transactions store absolute paths, so only
+			// recover them in their original directory, with the CDN online.
+			return Apply(InstallDir);
+		}
+		if (!bStagingAvailable)
+		{
+			return UseOldVersion(EPatcherError::StagingCleanupFailed);
+		}
+
+		ON_SCOPE_EXIT { File.DeleteDirectoryRecursively(*StagedDir); };
+		Sink({ EUpdatePhase::Diff, EPatcherError::Ok, false, 0, 0, TEXT("Preparing installed content...") });
+		if (!File.CopyDirectoryTree(*StagedDir, *InstallDir, false))
+		{
+			return UseOldVersion(EPatcherError::StagingSnapshotFailed);
+		}
+		if (!Apply(StagedDir))
+		{
+			return UseOldVersion(LastError);
+		}
+		if (!RenameDirectory(InstallDir, PreviousDir))
+		{
+			return UseOldVersion(EPatcherError::ActivateContentFailed);
+		}
+		if (!RenameDirectory(StagedDir, InstallDir))
+		{
+			if (!RenameDirectory(PreviousDir, InstallDir))
+			{
+				return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous game content."));
+			}
+			return UseOldVersion(EPatcherError::ActivateContentFailed);
+		}
+		File.DeleteDirectoryRecursively(*PreviousDir);
+		UE_LOG(LogUnrealGamePatcher, Display, TEXT("UGP Android: activated content %s in %s"), *Version, *InstallDir);
+		return true;
+	}
+
+	jboolean RunPatch(JNIEnv* Env, jstring JCmdline, jstring JCdn,
+		jstring JInstallDir, jstring JInternalDir, jobject JAssets, jobject JListener)
+	{
+		using namespace UnrealGamePatcher;
+
 		const FString CmdLine = JStringToFString(Env, JCmdline);
 		const FString Cdn = JStringToFString(Env, JCdn);
-		const FString Version = JStringToFString(Env, JVersion);
 		const FString InstallDir = JStringToFString(Env, JInstallDir);
 		const FString InternalDir = JStringToFString(Env, JInternalDir);
 
-		// Engine-lite boot, ONCE per process: JVM/env setup, the real
-		// AssetManager (the game process gets these from libUnreal's
-		// JNI_OnLoad - the patcher process never loads libUnreal), then
-		// PreInit with -NoPak (nothing mounts; file APIs hit writable dirs).
-		// A FAILED run must NOT shut the engine down (the failure path below
-		// skips the shutdown sequence) so the Java retry button can re-run
-		// the orchestrator - a second PreInit in one process is unsupported.
-		static bool bEngineReady = false;
-		FTaskTagScope Scope(ETaskTag::EGameThread);
-		if (!bEngineReady)
-		{
-			// In the game process libUnreal's JNI_OnLoad sets the Core-global
-			// GJavaVM; set it from the JNIEnv we were called with -
-			// UE::Jni::FEnv's constructor CHECKs it.
-			JavaVM* VM = nullptr;
-			if (Env->GetJavaVM(&VM) != JNI_OK || !VM)
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("libugp: GetJavaVM failed"));
-				return false;
-			}
-			GJavaVM = VM;
-			AndroidJavaEnv::InitializeJavaEnv();
-
-			// Engine code assumes a real AAssetManager (FAndroidPlatformFile's
-			// asset paths call AAssetManager_open without a null check). Hand
-			// it the activity's real one - the patcher APK is this app's APK,
-			// so its assets are exactly what the engine would see.
-			AAssetManager* NativeAssets = JAssets ? AAssetManager_fromJava(Env, JAssets) : nullptr;
-			GUgpAssetManagerJava = JAssets ? Env->NewGlobalRef(JAssets) : nullptr;
-			GUgpAssetManagerNative = NativeAssets;
-			if (!NativeAssets)
-			{
-				UE_LOG(LogUnrealGamePatcher, Warning, TEXT("libugp: no AssetManager passed - engine file init may fail"));
-			}
-
-			FCommandLine::Set(*CmdLine);
-			if (GEngineLoop.PreInit(0, nullptr, FCommandLine::Get()) != 0)
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("libugp: engine PreInit failed"));
-				return false;
-			}
-			bEngineReady = true;
-		}
-
-		// Progress listener, per run (the Java side may pass a fresh one).
 		FJavaEventSink Sink;
 		if (JListener)
 		{
 			Sink.Env = Env;
 			Sink.Listener = Env->NewGlobalRef(JListener);
 			jclass Cls = Env->GetObjectClass(JListener);
-			Sink.Method = Env->GetMethodID(Cls, "onUpdateEvent",
-				"(IIZIILjava/lang/String;)V"); // (phase, error, isError, current, total, message)
+			Sink.Method = Env->GetMethodID(Cls, "onUpdateEvent", "(IIZIILjava/lang/String;)V");
+			Env->DeleteLocalRef(Cls);
 			if (Env->ExceptionCheck())
 			{
 				Env->ExceptionDescribe();
 				Env->ExceptionClear();
-				return false;
+				return JNI_FALSE;
 			}
 		}
 
-		// Single-writer guard (Android: flock on a file in the app's INTERNAL
-		// dir - the emulated external storage cannot flock; see Paths).
-		UnrealGamePatcher::Paths::FInstallLock Lock;
-		if (!Lock.Acquire(InstallDir, InternalDir))
+		enum class EEngineState { NotStarted, Ready, Unavailable };
+		static EEngineState EngineState = EEngineState::NotStarted;
+		FTaskTagScope Scope(ETaskTag::EGameThread);
+		if (EngineState == EEngineState::NotStarted)
 		{
-			GLog->Flush();
-			return false;
+			// A failed PreInit cannot be attempted again in the same process.
+			EngineState = EEngineState::Unavailable;
+			JavaVM* VM = nullptr;
+			AAssetManager* NativeAssets = JAssets ? AAssetManager_fromJava(Env, JAssets) : nullptr;
+			if (Env->GetJavaVM(&VM) == JNI_OK && VM && NativeAssets)
+			{
+				GJavaVM = VM;
+				GUgpAssetManagerJava = Env->NewGlobalRef(JAssets);
+				GUgpAssetManagerNative = NativeAssets;
+				GInternalFilePath = InternalDir;
+				GFilePathBase = FPaths::GetPath(FPaths::GetPath(InstallDir));
+				GExternalFilePath = GFilePathBase;
+				AndroidJavaEnv::InitializeJavaEnv();
+				FCommandLine::Set(*CmdLine);
+				if (GEngineLoop.PreInit(0, nullptr, FCommandLine::Get()) == 0)
+				{
+					EngineState = EEngineState::Ready;
+				}
+			}
 		}
-
-		// HTTP CDN mode needs the HTTP chunk downloader wired into the options
-		// (same as the CLI's -cdn http(s):// path). Function scope on purpose:
-		// Options.Downloader is a raw pointer the orchestrator keeps using.
-		UnrealGamePatcher::FHttpChunkDownloader Downloader;
-		const bool bCdnIsHttp = Cdn.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase) ||
-			Cdn.StartsWith(TEXT("https://"), ESearchCase::IgnoreCase);
-
-		UnrealGamePatcher::FUpdateOptions Options;
-		Options.ChunkCacheDir = InstallDir / TEXT(".ugp") / TEXT("chunkcache");
-		Options.Events = [&Sink](const UnrealGamePatcher::FUpdateEvent& Ev)
+		if (EngineState != EEngineState::Ready)
 		{
-			Sink(Ev);
-		};
-		if (bCdnIsHttp)
-		{
-			// Force-load FHttpModule on this thread first (see downloadtest).
-			FHttpModule::Get();
-			Options.Downloader = &Downloader;
-			Options.BaseUrl = Cdn;
-		}
-
-		UnrealGamePatcher::FUpdateStats Stats;
-		const bool bOk = UnrealGamePatcher::FUpdateOrchestrator::UpdateWithOptions(
-			Cdn, Version, InstallDir, /*bApply=*/true, Options, Stats);
-		Lock.Release();
-		GLog->Flush();
-
-		if (!bOk)
-		{
-			// Keep the engine alive so the Java retry can re-run in-process
-			// (a second PreInit in one process is unsupported).
+			Sink({ EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0,
+				TEXT("Could not initialize the content updater. Reopen the app to try again.") });
 			return JNI_FALSE;
 		}
-		// Success: same shutdown sequence as the standalone patcher's entry.
-		RequestEngineExit(TEXT("UnrealGamePatcherLib Exiting"));
-		FEngineLoop::AppPreExit();
-		FModuleManager::Get().UnloadModulesAtShutdown();
-		FEngineLoop::AppExit();
-		return JNI_TRUE;
+		const bool bOk = RunContentUpdate(Cdn, InstallDir, InternalDir, Sink);
+		GLog->Flush();
+		// Keep the updater initialized until Java records readiness and ends
+		// this process, so failure to record readiness can still be retried.
+		return bOk ? JNI_TRUE : JNI_FALSE;
 	}
 }
 
@@ -234,11 +323,17 @@ namespace
 // Kept as plain Java_ exports (no RegisterNatives) so the Java side stays
 // free of engine-only glue.
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_epicgames_unreal_patch_PatchActivity_nativeRunPatch(
-	JNIEnv* Env, jclass Cls, jstring JCmdline, jstring JCdn,
-	jstring JVersion, jstring JInstallDir, jstring JInternalDir, jobject JAssets, jobject JListener)
+Java_com_epicgames_unreal_patch_PatchActivity_nativeRunPatchV2(
+	JNIEnv* Env, jclass, jstring JCmdline, jstring JCdn,
+	jstring JInstallDir, jstring JInternalDir, jobject JAssets, jobject JListener)
 {
-	return RunPatch(Env, Cls, JCmdline, JCdn, JVersion, JInstallDir, JInternalDir, JAssets, JListener);
+	return RunPatch(Env, JCmdline, JCdn, JInstallDir, JInternalDir, JAssets, JListener);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_epicgames_unreal_patch_PatchActivity_nativeBuildConfigurationV2(JNIEnv* Env, jclass)
+{
+	return Env->NewStringUTF("UGP_JNI_V2:" PREPROCESSOR_TO_STRING(UGP_BUILD_CONFIGURATION));
 }
 
 // UBT's Android version script (AndroidToolChain.cs) exports JNI_OnLoad and
@@ -261,9 +356,8 @@ extern "C" JNIEXPORT void JNICALL ANativeActivity_onCreate(ANativeActivity*, voi
 // the launch-module TU), but Android Core's platform files reference the
 // glue unconditionally - game targets get the definitions from the linked
 // Launch module. A headless patcher provides inert defaults instead: no
-// activity binding, no APK asset manager (UGP reads regular files only),
-// no virtual keyboard, no meta-data/intent access. If the link ever reports
-// more missing glue symbols, extend this block the same way.
+// activity binding, virtual keyboard or intent access. The real AssetManager
+// is captured from PatchActivity for platform file initialization.
 // ---------------------------------------------------------------------------
 struct android_app;
 struct android_app* GNativeAndroidApp = nullptr; // LaunchAndroid.cpp:309
@@ -319,6 +413,11 @@ void AndroidThunkJava_AddNetworkListener()
 FString FAndroidMisc::GetGPUFamily()
 {
 	return FString();
+}
+
+void FAndroidMisc::GetValidTargetPlatforms(TArray<FString>& TargetPlatformNames)
+{
+	FGenericPlatformMisc::GetValidTargetPlatforms(TargetPlatformNames);
 }
 
 // FAndroidAppEntry is a namespace of engine-boot glue (window/EGL lifecycle);

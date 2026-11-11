@@ -1,0 +1,127 @@
+diff --git a/Engine/Source/Programs/UnrealBuildTool/ToolChain/AppleToolChain.cs b/Engine/Source/Programs/UnrealBuildTool/ToolChain/AppleToolChain.cs
+index 02aa15925..801e94e50 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/ToolChain/AppleToolChain.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/ToolChain/AppleToolChain.cs
+@@ -879,7 +879,9 @@ namespace UnrealBuildTool
+ 			{
+ 				// Todo: This is currently only used when linking binary and swift files have not been tested with dylibs.
+ 				// The right fix is to move the vfs root one step up to be able to handle the ../lib/ path
+-				DirectoryReference dir = DirectoryReference.Combine(ApplePlatformSDK.GetToolchainDirectory(), "../lib/swift", Settings.PlatformDirName);
++				string PlatformDir = LinkEnvironment.Architecture == UnrealArch.IOSSimulator || LinkEnvironment.Architecture == UnrealArch.TVOSSimulator
++					? Settings.SimulatorPlatformDirName : Settings.PlatformDirName;
++				DirectoryReference dir = DirectoryReference.Combine(ApplePlatformSDK.GetToolchainDirectory(), "../lib/swift", PlatformDir);
+ 				Arguments.Add($"-L{dir}");
+ 			}
+ 
+diff --git a/Engine/Source/Runtime/Core/Private/IOS/IOSPlatformFile.cpp b/Engine/Source/Runtime/Core/Private/IOS/IOSPlatformFile.cpp
+index 6c906299d..33d560211 100644
+--- a/Engine/Source/Runtime/Core/Private/IOS/IOSPlatformFile.cpp
++++ b/Engine/Source/Runtime/Core/Private/IOS/IOSPlatformFile.cpp
+@@ -969,6 +969,16 @@ FString FIOSPlatformFile::ConvertToPlatformPath(const FString& Filename, bool bF
+ 		return Result;
+ 	}
+ 
++#if WITH_IOS_SIMULATOR
++	// Simulator data containers are under the Mac user's CoreSimulator directory.
++	// Preserve physical paths already resolved for the current app's sandbox.
++	static const FString SimulatorHome = FString(NSHomeDirectory()) + TEXT("/");
++	if (Result.StartsWith(SimulatorHome, ESearchCase::CaseSensitive))
++	{
++		return Result;
++	}
++#endif
++
+ 	if (Result.StartsWith(TEXT("~/")))
+ 	{
+ 		static FString ReadPathBase = FString([[NSBundle mainBundle]bundlePath] );
+diff --git a/Engine/Source/Runtime/IOS/MarketplaceKit/MarketplaceKit.Build.cs b/Engine/Source/Runtime/IOS/MarketplaceKit/MarketplaceKit.Build.cs
+index 24aceff5a..0d3c15723 100644
+--- a/Engine/Source/Runtime/IOS/MarketplaceKit/MarketplaceKit.Build.cs
++++ b/Engine/Source/Runtime/IOS/MarketplaceKit/MarketplaceKit.Build.cs
+@@ -15,6 +15,9 @@ public class MarketplaceKit : ModuleRules
+ 			"Engine",
+ 		});
+ 
+-		PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "arm64", "libMarketplaceKitWrapper.a"));
++		if (Target.Architecture != UnrealArch.IOSSimulator)
++		{
++			PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "arm64", "libMarketplaceKitWrapper.a"));
++		}
+ 	}
+ }
+diff --git a/Engine/Source/Runtime/IOS/MarketplaceKit/Private/MarketplaceKit.cpp b/Engine/Source/Runtime/IOS/MarketplaceKit/Private/MarketplaceKit.cpp
+index 9cd9ebf66..87140f0fc 100644
+--- a/Engine/Source/Runtime/IOS/MarketplaceKit/Private/MarketplaceKit.cpp
++++ b/Engine/Source/Runtime/IOS/MarketplaceKit/Private/MarketplaceKit.cpp
+@@ -3,7 +3,9 @@
+ #include "MarketplaceKit.h"
+ 
+ #include "CoreGlobals.h"
++#if !WITH_IOS_SIMULATOR
+ #include "MarketplaceKitWrapper.h"
++#endif
+ #include "Misc/CommandLine.h"
+ #include "Misc/ConfigCacheIni.h"
+ #include "Misc/Parse.h"
+@@ -83,6 +85,7 @@ bool FMarketplaceKitModule::SupportsDynamicReloading()
+ 	return true;
+ }
+ 
++#if !WITH_IOS_SIMULATOR
+ static constexpr EMarketplaceType ConvertMarketplaceType(const AppDistributorType Type)
+ {
+ 	switch (Type)
+@@ -96,9 +99,13 @@ static constexpr EMarketplaceType ConvertMarketplaceType(const AppDistributorTyp
+ 		default:								return EMarketplaceType::Other;
+ 	}
+ }
++#endif
+ 
+ void FMarketplaceKitModule::GetCurrentTypeAsync(TFunction<void(EMarketplaceType Type, const FString& Name)> Callback)
+ {
++#if WITH_IOS_SIMULATOR
++	Callback(EMarketplaceType::NotAvailable, FString());
++#else
+ 	[AppDistributorWrapper getCurrentWithCompletionHandler:^(enum AppDistributorType Type, NSString* _Nonnull Name)
+ 	{
+ 		{
+@@ -119,6 +126,7 @@ void FMarketplaceKitModule::GetCurrentTypeAsync(TFunction<void(EMarketplaceType
+ 			Callback(EffectiveType, EffectiveName);
+ 		}
+ 	}];
++#endif
+ }
+ 
+ void FMarketplaceKitModule::GetCurrentType(EMarketplaceType& OutType, FString& OutName)
+@@ -209,6 +217,10 @@ bool FMarketplaceKitModule::IsTestFlightStatic()
+ 
+ void FMarketplaceKitModule::CacheValue()
+ {
++#if WITH_IOS_SIMULATOR
++	// The bundled MarketplaceKit Swift wrapper targets physical iOS devices.
++	bCachedTypeValid = true;
++#else
+ 	if (bCachedTypeValid)
+ 	{
+ 		return;
+@@ -232,6 +244,7 @@ void FMarketplaceKitModule::CacheValue()
+ 	// wait for a result, but timeout after 1s
+ 	dispatch_semaphore_wait(Semaphore, DISPATCH_TIME_FOREVER);
+     dispatch_release(Semaphore);
++#endif
+ }
+ 
+ void FMarketplaceKitModule::GetEffectiveType(EMarketplaceType& OutType, FString& OutName)
+diff --git a/Engine/Source/ThirdParty/Apple/Swift/Swift.Build.cs b/Engine/Source/ThirdParty/Apple/Swift/Swift.Build.cs
+index 07df9b757..81215193b 100644
+--- a/Engine/Source/ThirdParty/Apple/Swift/Swift.Build.cs
++++ b/Engine/Source/ThirdParty/Apple/Swift/Swift.Build.cs
+@@ -13,7 +13,7 @@ public class Swift : ModuleRules
+ 
+         if (Target.Platform == UnrealTargetPlatform.IOS)
+ 		{
+-			PlatformPath = "iphoneos";
++			PlatformPath = Target.Architecture == UnrealArch.IOSSimulator ? "iphonesimulator" : "iphoneos";
+ 		}
+ 		else if(Target.Platform == UnrealTargetPlatform.Mac)
+ 		{

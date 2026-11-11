@@ -1,0 +1,25 @@
+diff --git a/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp b/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp
+index 02f209104..e472af4ae 100644
+--- a/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp
++++ b/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp
+@@ -156,11 +156,13 @@ bool FAndroidJavaMediaFrameData::ExtractToTextureVulkan(FRHICommandListImmediate
+ 				{
+ 					const UE::Color::FColorSpace& Working = UE::Color::FColorSpace::GetWorking();
+ 
++#if WITH_ENGINE
+ 					if (TextureSample->GetMediaTextureSampleColorConverter())
+ 					{
+ 						ColorSpaceMtx = FMatrix44f::Identity;
+ 					}
+ 					else
++#endif
+ 					{
+ 						ColorSpaceMtx = UE::Color::Transpose<float>(UE::Color::FColorSpaceTransform(TextureSample->GetSourceColorSpace(), Working));
+ 					}
+@@ -279,4 +281,4 @@ bool FAndroidJavaMediaFrameData::ExtractToTextureOES(FRHICommandListImmediate& R
+ 	return Converted;
+ }
+ 
+-#endif //USE_ANDROID_JNI
+\ No newline at end of file
++#endif //USE_ANDROID_JNI

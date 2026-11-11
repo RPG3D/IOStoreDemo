@@ -1,0 +1,26 @@
+diff --git a/Engine/Source/Runtime/Launch/Private/Android/LaunchAndroid.cpp b/Engine/Source/Runtime/Launch/Private/Android/LaunchAndroid.cpp
+index dfbad1e76..f502af3c0 100644
+--- a/Engine/Source/Runtime/Launch/Private/Android/LaunchAndroid.cpp
++++ b/Engine/Source/Runtime/Launch/Private/Android/LaunchAndroid.cpp
+@@ -546,6 +546,8 @@ void* AndroidMain(void* param)
+ }
+ 
+ 
++bool (*GAndroidPreInitContent)() = nullptr;
++
+ int32 AndroidMain(struct android_app* state)
+ {
+ 	BootTimingPoint("AndroidMain");
+@@ -667,6 +669,12 @@ int32 AndroidMain(struct android_app* state)
+ 	// Have to use a special initialize if using the PersistentStorageManager
+ 	IPlatformFile::GetPlatformPhysical().Initialize(nullptr, FCommandLine::Get());
+ 
++	// The game may prepare downloaded content before UE mounts Pak files.
++	if (GAndroidPreInitContent && !GAndroidPreInitContent())
++	{
++		return 1;
++	}
++
+ 	if(!FAndroidMisc::UseNewWindowBehavior())
+ 	{
+ 		SCOPED_BOOT_TIMING("Wait for GAndroidWindowLock.Lock()");
