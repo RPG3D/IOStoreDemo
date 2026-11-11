@@ -17,6 +17,36 @@ namespace UnrealGamePatcher
 {
 	namespace
 	{
+		bool IsContentPath(const FString& Path)
+		{
+			// Manifest paths are portable, relative file names. On Windows,
+			// trailing dots and spaces can alias "." and "..".
+			if (Path.IsEmpty() || Path.StartsWith(TEXT("/")) || Path.EndsWith(TEXT("/")) ||
+				Path.Contains(TEXT("\\")) || Path.Contains(TEXT(":")))
+			{
+				return false;
+			}
+			for (TCHAR Character : Path)
+			{
+				if (Character < 32)
+				{
+					return false;
+				}
+			}
+			TArray<FString> Components;
+			Path.ParseIntoArray(Components, TEXT("/"), false);
+			for (const FString& Part : Components)
+			{
+				if (Part.IsEmpty() || Part.EndsWith(TEXT(".")) || Part.EndsWith(TEXT(" ")))
+				{
+					return false;
+				}
+			}
+			return !Components[0].Equals(TEXT(".ugp"), ESearchCase::IgnoreCase) &&
+				!Components[0].Equals(TEXT("UnrealGamePatcher.state.json"), ESearchCase::IgnoreCase) &&
+				!Components[0].StartsWith(TEXT("UnrealGamePatcher.state.json."), ESearchCase::IgnoreCase);
+		}
+
 		/** Builds the canonical JSON body for a manifest. The key order is
 		 *  fixed here, so the XXH3-64 self-check hash is deterministic and
 		 *  both Save and Load use this exact same function to (re)compute it. */
@@ -217,6 +247,11 @@ namespace UnrealGamePatcher
 			}
 			for (const auto& Pair : FilesObj->Values)
 			{
+				if (!IsContentPath(Pair.Key))
+				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: invalid file path '%s'"), *Pair.Key);
+					return false;
+				}
 				if (Pair.Value->Type != EJson::Object)
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: file '%s' is not an object in '%s'"), *Pair.Key, TEXT("<index>"));
@@ -364,6 +399,12 @@ namespace UnrealGamePatcher
 					return false;
 				}
 				ReadStringField(EObj, TEXT("file"), E.File); // optional (legacy manifests)
+				if (!E.File.IsEmpty() && (!IsContentPath(E.File) || E.File.Contains(TEXT("?")) ||
+					E.File.Contains(TEXT("#")) || E.File.Contains(TEXT("%"))))
+				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: invalid chunk path '%s'"), *E.File);
+					return false;
+				}
 				OutManifest.Chunks.Add(FString(Pair.Key), E);
 			}
 		}

@@ -6,7 +6,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 
 namespace UnrealGamePatcher
 {

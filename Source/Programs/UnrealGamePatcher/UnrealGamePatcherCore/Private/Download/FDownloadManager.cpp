@@ -10,7 +10,7 @@
 #include "HAL/PlatformProcess.h"
 #include "HAL/Event.h"
 #include "Misc/ScopeLock.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 
 namespace UnrealGamePatcher
 {
@@ -67,7 +67,8 @@ namespace UnrealGamePatcher
 	bool FDownloadManager::DownloadAll(
 		const TArray<FDownloadRequest>& Requests,
 		FDownloadStats& OutStats,
-		TArray<FString>& OutFailedIds)
+		TArray<FString>& OutFailedIds,
+		TFunction<void(int64, int64)> OnProgress)
 	{
 		OutStats = FDownloadStats();
 		OutFailedIds.Reset();
@@ -81,6 +82,8 @@ namespace UnrealGamePatcher
 		// Tamper/insanity pre-check: a manifest-declared size over the
 		// transport cap (or negative) is refused before any transfer.
 		TArray<FDownloadRequest> ToFetch;
+		int64 TotalBytes = 0;
+		int64 CachedBytes = 0;
 		for (const FDownloadRequest& Request : Requests)
 		{
 			if (Request.Size < 0 || Request.Size > FHttpRangeRequest::MaxResponseBytes)
@@ -90,6 +93,7 @@ namespace UnrealGamePatcher
 					*Request.Id, Request.Size, FHttpRangeRequest::MaxResponseBytes);
 				continue;
 			}
+			TotalBytes += Request.Size;
 
 			bool bCacheOk = false;
 			if (PF.FileExists(*Request.DestFile))
@@ -101,6 +105,7 @@ namespace UnrealGamePatcher
 			if (bCacheOk)
 			{
 				OutStats.SkippedExisting += 1;
+				CachedBytes += Request.Size;
 			}
 			else
 			{
@@ -124,6 +129,7 @@ namespace UnrealGamePatcher
 			std::atomic<int32> Remaining{ 0 };
 			std::atomic<int32> Retries{ 0 };
 			std::atomic<int64> BytesDownloaded{ 0 };
+			std::atomic<int64> CompletedBytes{ 0 };
 			FCriticalSection FailLock;
 			TArray<FString> Failed;
 			TSet<FString> FinishedIds;
@@ -131,6 +137,18 @@ namespace UnrealGamePatcher
 		};
 		TSharedRef<FBatchContext> Ctx = MakeShared<FBatchContext>();
 		Ctx->Remaining.store(ToFetch.Num(), std::memory_order_release);
+		Ctx->CompletedBytes.store(CachedBytes, std::memory_order_release);
+		int64 ReportedBytes = -1;
+		auto ReportProgress = [&]()
+		{
+			const int64 Bytes = Ctx->CompletedBytes.load(std::memory_order_acquire);
+			if (OnProgress && Bytes != ReportedBytes)
+			{
+				ReportedBytes = Bytes;
+				OnProgress(Bytes, TotalBytes);
+			}
+		};
+		ReportProgress();
 
 		TArray<int64> Handles;
 		Handles.Reserve(ToFetch.Num());
@@ -144,10 +162,14 @@ namespace UnrealGamePatcher
 			Job.ExpectedSha1 = Request.ExpectedSha1;
 
 			Handles.Add(Executor.Submit(MoveTemp(Job),
-				[Ctx, Id = Request.Id](const FDownloadResult& Result)
+				[Ctx, Id = Request.Id, Size = Request.Size](const FDownloadResult& Result)
 			{
 				Ctx->Retries.fetch_add(Result.Retries, std::memory_order_release);
 				Ctx->BytesDownloaded.fetch_add(Result.BytesDownloaded, std::memory_order_release);
+				if (Result.bSuccess)
+				{
+					Ctx->CompletedBytes.fetch_add(Size, std::memory_order_release);
+				}
 				{
 					FScopeLock FailScope(&Ctx->FailLock);
 					Ctx->FinishedIds.Add(Id);
@@ -177,7 +199,9 @@ namespace UnrealGamePatcher
 			int64 LastTick = Executor.GetProgressTick();
 			while (Ctx->Remaining.load(std::memory_order_acquire) > 0)
 			{
-				if (Ctx->DoneEvent->Wait(1000))
+				const bool bDone = Ctx->DoneEvent->Wait(OnProgress ? 250 : 1000);
+				ReportProgress();
+				if (bDone)
 				{
 					break;
 				}
@@ -225,6 +249,7 @@ namespace UnrealGamePatcher
 				}
 			}
 		}
+		ReportProgress();
 
 		// Publish results into the caller's array. The pre-check above may
 		// already have added ids here, so merge instead of replace. After

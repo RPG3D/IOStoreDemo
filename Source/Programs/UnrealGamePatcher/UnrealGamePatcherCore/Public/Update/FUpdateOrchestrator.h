@@ -24,11 +24,15 @@ namespace UnrealGamePatcher
 		IChunkDownloader* Downloader = nullptr;
 		FString BaseUrl;       // CDN base, e.g. "http://127.0.0.1:8080/cdn"
 		FString ChunkCacheDir; // where downloaded chunk files are cached
+		FString InstallLockRootDir; // Android internal storage supports flock.
 		int32 MaxConcurrent = 8;
 		int32 MaxRetries = 3;
 		/** Repair mode (task 5.4 `repair`): touch only damaged (Changed)
 		 *  files, never Added/Removed, and rebuild without local reuse. */
 		bool bRepairOnly = false;
+		/** Preserve untracked runtime files in a staged game tree. Extra
+		 *  containers still need removing because the engine scans for them. */
+		bool bPreserveUntrackedFiles = false;
 		/** Force VERIFY mode: full truth extraction (hash every plain file,
 		 *  re-read container structures, data-check ucas chunks) instead of
 		 *  the default trust mode. Implicitly enabled by RepairOnly, the
@@ -44,6 +48,8 @@ namespace UnrealGamePatcher
 		 *  chunks (~110B/chunk+part of JSON => a 100GB game index is ~30MB).
 		 *  The transport's own MaxResponseBytes stays the hard memory bound. */
 		int64 MaxManifestBytes = 64 << 20;
+		/** Optional platform layout conversion after validating the CDN index. */
+		TFunction<bool(FIndexManifest&)> PrepareManifest;
 		/** Event broadcast (task 8.2): stage changes (Manifest/Diff/Download/
 		 *  Apply/Commit/Done), progress ticks (Current/Total) and ERRORS
 		 *  (bIsError + EPatcherError + Message) - the single binding point
@@ -106,6 +112,10 @@ namespace UnrealGamePatcher
 	 */
 	struct FUpdateOrchestrator
 	{
+		/** Checks the committed sidecar and index, file presence, and each Pak
+		 *  footer before allowing the game to continue. */
+		UNREALGAMEPATCHERCORE_API static bool ReadCommittedVersion(const FString& InstallDir, FString& OutVersion);
+
 		/** Runs the full update. CdnDir is ONE CDN base - an HTTP(S) URL
 		 *  (everything, including the version index, is fetched over HTTP via
 		 *  Options.Downloader) or a local directory (bare path or file://...).

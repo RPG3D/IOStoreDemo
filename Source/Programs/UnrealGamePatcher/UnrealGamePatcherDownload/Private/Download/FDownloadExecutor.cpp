@@ -5,7 +5,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/ScopeLock.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 #include "Templates/SharedPointer.h"
 
 namespace UnrealGamePatcher
@@ -490,7 +490,7 @@ namespace UnrealGamePatcher
 			// whole body.
 			const bool bWholeResource = S.bWholeFile || (S.Offset == 0 && S.Size >= J.Total);
 			const int64 WireSize = bWholeResource ? -1 : S.Size;
-			TSharedRef<FExecutorState> State = SharedThis(this);
+			TSharedRef<FExecutorState> ExecutorState = SharedThis(this);
 			// The handle MUST be stored: Cancel() and ~FDownloadExecutor abort
 			// in-flight requests through it. Dropping the return value (review
 			// 2026-10-09 H2) left S.CancelHandle forever null, so "cancel" was
@@ -499,26 +499,26 @@ namespace UnrealGamePatcher
 			// OnDone inline before the assignment lands - the settle does not
 			// read the handle, and a completed request ignores CancelDownload.)
 			S.CancelHandle = Backend.DownloadRangeAsync(J.Job.Url, S.Offset, WireSize,
-				[State, JobPtr, SegIndex](bool bOk, const TArray64<uint8>& Data, const FString& Error)
+				[ExecutorState, JobPtr, SegIndex](bool bOk, const TArray64<uint8>& Data, const FString& Error)
 			{
 				// Engine HTTP thread, serialized with every other settle. The
 				// state ref keeps the executor alive until in-flight requests
 				// have drained (their settles are guarded no-ops by then).
-				FScopeLock Scope(&State->Lock);
-				State->OnSegmentSettled(*JobPtr, SegIndex, bOk, Data, Error);
-				State->Refill();
+				FScopeLock Scope(&ExecutorState->Lock);
+				ExecutorState->OnSegmentSettled(*JobPtr, SegIndex, bOk, Data, Error);
+				ExecutorState->Refill();
 			});
 		}
 
 		void IssueProbe(FJob& J)
 		{
 			FJob* JobPtr = &J;
-			TSharedRef<FExecutorState> State = SharedThis(this);
+			TSharedRef<FExecutorState> ExecutorState = SharedThis(this);
 			Backend.ProbeSizeAsync(J.Job.Url,
-				[State, JobPtr](int64 TotalSize, bool bRangeOk)
+				[ExecutorState, JobPtr](int64 TotalSize, bool bRangeOk)
 			{
-				FScopeLock Scope(&State->Lock);
-				State->OnProbeSettled(*JobPtr, TotalSize, bRangeOk);
+				FScopeLock Scope(&ExecutorState->Lock);
+				ExecutorState->OnProbeSettled(*JobPtr, TotalSize, bRangeOk);
 			});
 		}
 

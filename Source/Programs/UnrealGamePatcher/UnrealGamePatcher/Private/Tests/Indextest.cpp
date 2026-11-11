@@ -63,6 +63,35 @@ namespace UnrealGamePatcher::Tests
 				TEXT("chunk entries roundtrip"));
 		}
 
+		{
+			// Save generates the correct self-check even for these crafted
+			// inputs. The loader must reject the paths themselves.
+			auto CheckRejectedPath = [&](const TCHAR* UnsafePath, bool bChunk)
+			{
+				UnrealGamePatcher::FIndexManifest Unsafe = Sample;
+				if (bChunk)
+				{
+					Unsafe.Chunks.CreateIterator().Value().File = UnsafePath;
+				}
+				else
+				{
+					const auto Entry = Unsafe.Files.CreateConstIterator().Value();
+					Unsafe.Files.Add(UnsafePath, Entry);
+				}
+				UnrealGamePatcher::FIndexManifest Loaded;
+				Check(UnrealGamePatcher::FIndexManifestFile::Save(IndexPath, Unsafe) &&
+					!UnrealGamePatcher::FIndexManifestFile::Load(IndexPath, Loaded),
+					*FString::Printf(TEXT("reject unsafe %s path '%s' with valid self-check"),
+						bChunk ? TEXT("chunk") : TEXT("file"), UnsafePath));
+			};
+			CheckRejectedPath(TEXT("../active/example.bin"), false);
+			CheckRejectedPath(TEXT("/active/example.bin"), false);
+			CheckRejectedPath(TEXT("Content/.. /example.bin"), false);
+			CheckRejectedPath(TEXT(".UGP/index.json"), false);
+			CheckRejectedPath(TEXT("chunks/../active/example.bin"), true);
+			CheckRejectedPath(TEXT("chunks/%2e%2e/example.bin"), true);
+		}
+
 		// --- 2. Empty manifest roundtrip -----------------------------------
 		{
 			UnrealGamePatcher::FIndexManifest Empty;

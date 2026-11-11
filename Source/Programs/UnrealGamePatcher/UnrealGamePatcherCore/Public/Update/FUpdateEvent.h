@@ -19,23 +19,52 @@ namespace UnrealGamePatcher
 		Failed,     // terminal failure (see Error)
 	};
 
-	/** Unified semantic error code. Replaces the bool+log propagation so
-	 *  callers (UI, CLI, scripts) can distinguish failure categories
-	 *  programmatically. Non-zero values are stable process exit codes. */
+	/** Stable diagnostic codes. The thousands digit identifies the failing
+	 *  stage. The CLI translates these to its existing process exit statuses. */
 	enum class EPatcherError : int32
 	{
 		Ok = 0,
-		Usage,              // bad arguments
-		ManifestMissing,    // remote index not found / unreadable
-		ManifestTampered,   // XXH3-64 self-check failed
-		DownloadFailed,     // a chunk download failed permanently
-		ChunkVerifyFailed,  // downloaded/assembled bytes failed verification
-		WriteNoPermission,  // could not open the target for writing
-		WriteNoSpace,       // write failed (disk full / IO error)
-		WriteLocked,        // target cannot be replaced (locked / read-only)
-		ApplyFailed,        // the apply step failed (rolled back)
-		RollbackFailed,     // rolling back the failed transaction failed
-		Internal,           // catch-all
+		Usage = 1,
+
+		VersionUnavailable = 1001,
+		VersionInvalid = 1002,
+
+		ManifestMissing = 2001,
+		ManifestTampered = 2002, // invalid JSON, schema, size or self-check
+		ChunkPlanInvalid = 2003,
+
+		InstallScanFailed = 3001,
+		LocalTruthFailed = 3002,
+
+		DownloadFailed = 4001,
+
+		ApplyFailed = 5001,
+		WriteNoPermission = 5002,
+		WriteNoSpace = 5003, // short write, including disk full or other I/O failures
+		WriteLocked = 5004, // could not replace the destination
+		BackupFailed = 5005,
+		RemoveFailed = 5006,
+		ChunkReadFailed = 5007,
+
+		ChunkVerifyFailed = 6001,
+		FileVerifyFailed = 6002,
+		InstalledContentInvalid = 6003,
+
+		TransactionStateWriteFailed = 7001,
+		CommitStateFailed = 7002,
+		CommitIndexFailed = 7003,
+		ActivateContentFailed = 7004,
+
+		RollbackFailed = 8001,
+		Interrupted = 8002,
+		LegacyMigrationFailed = 8003,
+
+		Internal = 9000,
+		InstallLockFailed = 9001,
+		InstallDirectoryFailed = 9002,
+		InvalidConfiguration = 9003,
+		StagingSnapshotFailed = 9004,
+		StagingCleanupFailed = 9005,
 	};
 
 	/** One broadcast event: a stage change, a progress tick, or an error.

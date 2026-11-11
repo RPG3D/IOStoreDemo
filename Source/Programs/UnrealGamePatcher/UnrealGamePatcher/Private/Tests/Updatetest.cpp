@@ -43,6 +43,25 @@ namespace UnrealGamePatcher::Tests
 		Check(S1.NumChunksReused == 0, TEXT("full update: nothing reused"));
 		Check(PF.FileExists(*(FPaths::Combine(Install, TEXT(".ugp"), TEXT("index.json")))), TEXT("local state file written"));
 
+		{
+			FString CommittedVersion;
+			Check(FUpdateOrchestrator::ReadCommittedVersion(Install, CommittedVersion) && CommittedVersion == Version,
+				TEXT("boot gate accepts the committed install"));
+			const FString Pak = Install / TEXT("pakchunk1-Windows.pak");
+			const FString Backup = WorkDir / TEXT("boot-gate-original.pak");
+			if (PF.MoveFile(*Backup, *Pak))
+			{
+				Check(FFileHelper::SaveStringToFile(TEXT("truncated"), *Pak), TEXT("boot gate: replace pak with truncated file"));
+				Check(!FUpdateOrchestrator::ReadCommittedVersion(Install, CommittedVersion),
+					TEXT("boot gate rejects a truncated pak with matching committed metadata"));
+				Check(PF.DeleteFile(*Pak) && PF.MoveFile(*Pak, *Backup), TEXT("boot gate: restore valid pak"));
+			}
+			else
+			{
+				Check(false, TEXT("boot gate: save the valid pak before truncation"));
+			}
+		}
+
 		// --- 1b. Install lock (fixplan L-M5): one writer per install dir ----
 		{
 			Paths::FInstallLock Lock;

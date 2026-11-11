@@ -60,6 +60,35 @@ namespace
 	constexpr int32 ExitFailure = 1;
 	constexpr int32 ExitUsage = 2;
 
+	int32 UpdateExitStatus(UnrealGamePatcher::EPatcherError Error)
+	{
+		using UnrealGamePatcher::EPatcherError;
+		switch (Error)
+		{
+		case EPatcherError::ManifestMissing: return 2;
+		case EPatcherError::ManifestTampered:
+		case EPatcherError::ChunkPlanInvalid: return 3;
+		case EPatcherError::DownloadFailed: return 4;
+		case EPatcherError::ChunkVerifyFailed:
+		case EPatcherError::FileVerifyFailed: return 5;
+		case EPatcherError::WriteNoPermission:
+		case EPatcherError::BackupFailed: return 6;
+		case EPatcherError::WriteNoSpace: return 7;
+		case EPatcherError::WriteLocked: return 8;
+		case EPatcherError::ApplyFailed:
+		case EPatcherError::RemoveFailed:
+		case EPatcherError::ChunkReadFailed: return 9;
+		case EPatcherError::RollbackFailed: return 10;
+		case EPatcherError::InstallScanFailed:
+		case EPatcherError::LocalTruthFailed:
+		case EPatcherError::TransactionStateWriteFailed:
+		case EPatcherError::CommitStateFailed:
+		case EPatcherError::CommitIndexFailed:
+		case EPatcherError::Internal: return 11;
+		default: return ExitFailure;
+		}
+	}
+
 	// Moved to Tests/TestFramework.h; used by the CLI and the suites.
 	using UnrealGamePatcher::Tests::GetCommandToken;
 
@@ -437,7 +466,6 @@ namespace
 			if (E.bIsError)
 			{
 				LastError = E.Error;
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("update failed: [code %d] %s"), (int32)E.Error, *E.Message);
 			}
 			else
 			{
@@ -466,7 +494,6 @@ namespace
 			// announcement file index/latest.json (same base as everything else).
 			if (!UnrealGamePatcher::FUpdateOrchestrator::ResolveLatest(CdnRoot, Options, Version))
 			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("update: -version= not given and no latest.json on the CDN"));
 				return ExitUsage;
 			}
 			UE_LOG(LogUnrealGamePatcher, Display, TEXT("update: resolved latest version %s"), *Version);
@@ -477,7 +504,7 @@ namespace
 		UnrealGamePatcher::FUpdateOrchestrator::TestCrashAfterWrites = 0;
 		if (!bOk)
 		{
-			return LastError != UnrealGamePatcher::EPatcherError::Ok ? (int32)LastError : ExitFailure;
+			return UpdateExitStatus(LastError);
 		}
 		UE_LOG(LogUnrealGamePatcher, Display,
 			TEXT("update %s: files %d same / %d changed / %d added / %d removed; %d chunks fetched (%lld bytes), %d reused (%lld bytes), %lld bytes written%s"),

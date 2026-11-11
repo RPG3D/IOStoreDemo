@@ -9,6 +9,7 @@
 #include "Formats/Diff/FLocalTruthExtractor.h"
 #include "Formats/Chunk/FChunkDataLoader.h"
 #include "Formats/Pak/FPakRecovery.h"
+#include "Formats/Pak/FPakReader.h"
 #include "Download/FDownloadManager.h"
 #include "State/FPatcherState.h"
 #include "Stats/FIOStats.h"
@@ -20,7 +21,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/Timespan.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 
 namespace UnrealGamePatcher
 {
@@ -29,6 +30,16 @@ namespace UnrealGamePatcher
 
 	namespace
 	{
+		void ReportFailure(const FUpdateOptions& Options, EPatcherError Error, const TCHAR* Message,
+			int32 Current = 0, int32 Total = 0)
+		{
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("[UGP-%04d] %s"), static_cast<int32>(Error), Message);
+			if (Options.Events)
+			{
+				Options.Events({ EUpdatePhase::Failed, Error, true, Current, Total, Message });
+			}
+		}
+
 		// Run-report funnel (fixplan S2): one place binding the I/O snapshot
 		// to the stats copy and the greppable summary line - four call
 		// sites, one contract.
@@ -247,7 +258,7 @@ namespace UnrealGamePatcher
 		 * (with a logged error) when the file has no chunk plan or the source
 		 * data fails verification - the caller must not write anything.
 		 */
-		bool RebuildFileFromChunks(
+		EPatcherError RebuildFileFromChunks(
 			const FIndexManifest& Remote,
 			const FString& ChunkRoot,
 			const FString& InstallDir,
@@ -271,24 +282,30 @@ namespace UnrealGamePatcher
 			if (!Target || (Target->Size > 0 && Target->Parts.Num() == 0))
 			{
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: '%s' has no chunk plan (re-ingest the version)"), *FileId);
-				return false;
+				return EPatcherError::ChunkPlanInvalid;
 			}
 
-			auto GetChunkData = [&](const FString& Guid, const TArray64<uint8>*& OutBytes) -> bool
+			auto GetChunkData = [&](const FString& Guid, const TArray64<uint8>*& OutBytes) -> EPatcherError
 			{
 				if (const TArray64<uint8>* Cached = ChunkCache.Find(Guid))
 				{
 					OutBytes = Cached;
-					return true;
+					return EPatcherError::Ok;
 				}
 				const FIndexChunkEntry* Entry = Remote.Chunks.Find(Guid);
 				if (!Entry || Entry->File.IsEmpty())
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: chunk '%s' missing from remote manifest"), *Guid);
-					return false;
+					return EPatcherError::ChunkPlanInvalid;
+				}
+				const FString ChunkPath = FPaths::Combine(ChunkRoot, Entry->File);
+				if (!PF.FileExists(*ChunkPath))
+				{
+					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: missing chunk file '%s'"), *ChunkPath);
+					return EPatcherError::ChunkReadFailed;
 				}
 				TArray64<uint8> Data;
-				if (!FChunkDataLoader::Load(FPaths::Combine(ChunkRoot, Entry->File), *Entry, Data))
+				if (!FChunkDataLoader::Load(ChunkPath, *Entry, Data))
 				{
 					// The chunk file failed its embedded SHA1 - it is bad data.
 					// When the root is the network download CACHE, remove the
@@ -297,10 +314,10 @@ namespace UnrealGamePatcher
 					// CDN dir (bChunkRootIsCache == false).
 					if (bChunkRootIsCache)
 					{
-						PF.DeleteFile(*(FPaths::Combine(ChunkRoot, Entry->File)));
+						PF.DeleteFile(*ChunkPath);
 						UE_LOG(LogUnrealGamePatcher, Warning, TEXT("FUpdateOrchestrator: removed corrupt cached chunk '%s' - rerun will re-download"), *Guid);
 					}
-					return false;
+					return EPatcherError::ChunkVerifyFailed;
 				}
 				if (bTrackFetchStats)
 				{
@@ -308,7 +325,7 @@ namespace UnrealGamePatcher
 					OutStats.BytesFetched += Entry->Size;
 				}
 				OutBytes = &ChunkCache.Add(Guid, MoveTemp(Data));
-				return true;
+				return EPatcherError::Ok;
 			};
 
 			// Attempt 1 (only with bReuseAllowed) reuses local bytes for
@@ -326,13 +343,17 @@ namespace UnrealGamePatcher
 			int64 PartsTotal = 0;
 			for (const FIndexFileChunkRef& P : Target->Parts)
 			{
+				if (P.Offset < 0 || P.Size < 0 || P.Size > Target->Size - PartsTotal)
+				{
+					return EPatcherError::ChunkPlanInvalid;
+				}
 				PartsTotal += P.Size;
 			}
 			if (PartsTotal != Target->Size || Target->Size < 0)
 			{
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: '%s' parts sum %lld != file size %lld (tampered manifest?)"),
 					*FileId, PartsTotal, Target->Size);
-				return false;
+				return EPatcherError::ChunkPlanInvalid;
 			}
 
 			for (int32 Attempt = 0; Attempt < 2; ++Attempt)
@@ -342,7 +363,6 @@ namespace UnrealGamePatcher
 				FileBytesReused = 0;
 				FileReusedChunks.Reset();
 
-				bool bFailed = false;
 				int64 FileOffset = 0;
 				for (const FIndexFileChunkRef& Part : Target->Parts)
 				{
@@ -385,25 +405,19 @@ namespace UnrealGamePatcher
 					}
 
 					const TArray64<uint8>* ChunkData = nullptr;
-					if (!GetChunkData(Part.Chunk, ChunkData))
+					const EPatcherError ChunkError = GetChunkData(Part.Chunk, ChunkData);
+					if (ChunkError != EPatcherError::Ok)
 					{
-						bFailed = true;
-						break;
+						return ChunkError;
 					}
-					if (Part.Offset + Part.Size > ChunkData->Num())
+					if (Part.Offset > ChunkData->Num() || Part.Size > ChunkData->Num() - Part.Offset)
 					{
-						UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: part range [%lld,%lld) outside chunk '%s' (%lld bytes)"),
-							Part.Offset, Part.Offset + Part.Size, *Part.Chunk, ChunkData->Num());
-						bFailed = true;
-						break;
+						UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: part at %lld (%lld bytes) outside chunk '%s' (%lld bytes)"),
+							Part.Offset, Part.Size, *Part.Chunk, ChunkData->Num());
+						return EPatcherError::ChunkPlanInvalid;
 					}
 					FMemory::Memcpy(Assembled.GetData() + FileOffset, ChunkData->GetData() + Part.Offset, Part.Size);
 					FileOffset += Part.Size;
-				}
-
-				if (bFailed)
-				{
-					return false;
 				}
 
 				const FString Actual = Sha1HexOf(Assembled);
@@ -415,7 +429,7 @@ namespace UnrealGamePatcher
 						OutStats.ReusedChunkGuids.Add(Guid);
 					}
 					OutAssembled = MoveTemp(Assembled);
-					return true;
+					return EPatcherError::Ok;
 				}
 				if (Attempt == 0)
 				{
@@ -428,11 +442,48 @@ namespace UnrealGamePatcher
 					UE_LOG(LogUnrealGamePatcher, Error,
 						TEXT("FUpdateOrchestrator: '%s' rebuilt from source chunks has hash %s (manifest %s) - source data damaged"),
 						*FileId, *Actual, *Target->SHA1);
-					return false;
+					return EPatcherError::FileVerifyFailed;
 				}
 			}
-			return false; // unreachable
+			return EPatcherError::FileVerifyFailed;
 		}
+	}
+
+	bool FUpdateOrchestrator::ReadCommittedVersion(const FString& InstallDir, FString& OutVersion)
+	{
+		IPlatformFile& File = FPlatformFileManager::Get().GetPlatformFile();
+		FPatcherState State;
+		FIndexManifest Index;
+		const FString IndexPath = GetLocalStatePath(InstallDir);
+		if (!File.FileExists(*IndexPath) || !FPatcherStateFile::Load(Paths::GetStatePath(InstallDir), State) ||
+			State.Transaction.Status != ETransactionStatus::Committed || !FIndexManifestFile::Load(IndexPath, Index) ||
+			Index.ContentVersion.IsEmpty() || State.Transaction.ContentVersion != Index.ContentVersion)
+		{
+			return false;
+		}
+		bool bHasPak = false;
+		for (const auto& Entry : Index.Files)
+		{
+			const FString Path = InstallDir / Entry.Key;
+			if (!File.FileExists(*Path))
+			{
+				return false;
+			}
+			if (Entry.Key.EndsWith(TEXT(".pak"), ESearchCase::IgnoreCase))
+			{
+				FPakReader Reader;
+				if (!Reader.Open(Path))
+				{
+					return false;
+				}
+				bHasPak = true;
+			}
+		}
+		if (bHasPak)
+		{
+			OutVersion = Index.ContentVersion;
+		}
+		return bHasPak;
 	}
 
 	bool FUpdateOrchestrator::Update(
@@ -463,8 +514,9 @@ namespace UnrealGamePatcher
 		// interleave transactions, sidecar writes or CoW commits. Check-only
 		// runs stay lock-free read-only. The lock is held for the whole run.
 		Paths::FInstallLock InstallLock;
-		if (bApply && !InstallLock.Acquire(InstallDir))
+		if (bApply && !InstallLock.Acquire(InstallDir, Options.InstallLockRootDir))
 		{
+			ReportFailure(Options, EPatcherError::InstallLockFailed, TEXT("cannot lock the install directory"));
 			return false;
 		}
 
@@ -475,7 +527,7 @@ namespace UnrealGamePatcher
 		// an existing install.
 		if (bApply && !PF.CreateDirectoryTree(*InstallDir))
 		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: cannot create install directory '%s'"), *InstallDir);
+			ReportFailure(Options, EPatcherError::InstallDirectoryFailed, *InstallDir);
 			return false;
 		}
 
@@ -492,7 +544,7 @@ namespace UnrealGamePatcher
 		const bool bNetwork = bCdnIsHttp || (Options.Downloader != nullptr && !Options.BaseUrl.IsEmpty());
 		if (bCdnIsHttp && Options.BaseUrl.IsEmpty())
 		{
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: http(s):// CDN root needs the downloader wired up (Options.Downloader + BaseUrl = the CDN root)"));
+			ReportFailure(Options, EPatcherError::InvalidConfiguration, TEXT("HTTP CDN requires a downloader and base URL"));
 			return false;
 		}
 		const FString CdnRootLocal = LocalCdnRoot(CdnDir);
@@ -508,6 +560,8 @@ namespace UnrealGamePatcher
 			if (bIsError)
 			{
 				LastError = Error;
+				ReportFailure(Options, Error, Message, Current, Total);
+				return;
 			}
 			if (Options.Events)
 			{
@@ -515,6 +569,25 @@ namespace UnrealGamePatcher
 				E.Phase = Phase; E.Error = Error; E.bIsError = bIsError;
 				E.Current = Current; E.Total = Total; E.Message = Message;
 				Options.Events(E);
+			}
+		};
+		int64 PreviousBatchBytes = 0;
+		const auto ReportDownloadProgress = [&Emit, &PreviousBatchBytes](int64 CompletedBytes, int64 TotalBytes)
+		{
+			if (TotalBytes == 0)
+			{
+				return;
+			}
+			const int64 Completed = PreviousBatchBytes + CompletedBytes;
+			const int64 Total = PreviousBatchBytes + TotalBytes;
+			const int32 Progress = Completed == 0 ? 0 : FMath::Max(1, static_cast<int32>(1000.0 * Completed / Total));
+			constexpr double BytesPerMiB = 1024.0 * 1024.0;
+			const TCHAR* Label = PreviousBatchBytes > 0 ? TEXT("Downloading additional content") : TEXT("Downloading");
+			Emit(EUpdatePhase::Download, EPatcherError::Ok, false, Progress, 1000,
+				*FString::Printf(TEXT("%s %.1f / %.1f MiB"), Label, Completed / BytesPerMiB, Total / BytesPerMiB));
+			if (CompletedBytes == TotalBytes)
+			{
+				PreviousBatchBytes += TotalBytes;
 			}
 		};
 
@@ -556,6 +629,11 @@ namespace UnrealGamePatcher
 				return false;
 			}
 		}
+		if (Options.PrepareManifest && !Options.PrepareManifest(Remote))
+		{
+			Emit(EUpdatePhase::Failed, EPatcherError::ManifestTampered, true, 0, 0, TEXT("unsupported content layout"));
+			return false;
+		}
 		Emit(EUpdatePhase::Manifest, EPatcherError::Ok, false, 0, 0, TEXT("manifest loaded"));
 
 		// Where chunk FILES are read from: the CDN root in local mode (chunks
@@ -580,8 +658,9 @@ namespace UnrealGamePatcher
 
 		// Restores every touched target to its pre-transaction bytes, deletes
 		// the backups and marks the transaction rolled-back.
-		auto Rollback = [&](FPatcherState& Txn) -> void
+		auto Rollback = [&](FPatcherState& Txn) -> bool
 		{
+			bool bRestored = true;
 			for (int32 I = Txn.Transaction.Targets.Num() - 1; I >= 0; --I)
 			{
 				const FTransactionTarget& T = Txn.Transaction.Targets[I];
@@ -596,37 +675,22 @@ namespace UnrealGamePatcher
 					// no backup to restore from by design).
 					continue;
 				}
-				if (T.Op == EApplyOp::Delete)
+				if (!T.BackupPath.IsEmpty())
 				{
-					// Removed file: bring it back from its backup.
-					if (!T.BackupPath.IsEmpty() && PF.FileExists(*T.BackupPath))
-					{
-						PF.SetReadOnly(*T.File, false);
-						PF.CopyFile(*T.File, *T.BackupPath);
-					}
-					continue;
-				}
-				// ReplaceFile, decided by the recorded pre-existence (NOT by
-				// OriginalHash emptiness: containers legitimately carry no
-				// whole-file hash, and the old heuristic deleted a pre-existing
-				// pak/ucas whose backup had not been taken yet).
-				if (!T.bPreExisted)
-				{
-					// Was an Added file: remove the new file.
-					if (PF.FileExists(*T.File))
-					{
-						PF.SetReadOnly(*T.File, false);
-						PF.DeleteFile(*T.File);
-					}
-				}
-				else if (!T.BackupPath.IsEmpty() && PF.FileExists(*T.BackupPath))
-				{
-					// Changed file: restore the original bytes.
 					PF.SetReadOnly(*T.File, false);
-					PF.CopyFile(*T.File, *T.BackupPath);
+					bRestored &= PF.CopyFile(*T.File, *T.BackupPath);
+				}
+				else if (T.Op != EApplyOp::Delete && !T.bPreExisted && PF.FileExists(*T.File))
+				{
+					PF.SetReadOnly(*T.File, false);
+					bRestored &= PF.DeleteFile(*T.File);
 				}
 				// Pre-existing file with no backup yet (crash before the backup
 				// was taken): the original bytes are untouched, nothing to do.
+			}
+			if (!bRestored)
+			{
+				return false;
 			}
 			Txn.Transaction.Status = ETransactionStatus::RolledBack;
 			// Persist the RolledBack state BEFORE deleting the backups: the
@@ -636,9 +700,10 @@ namespace UnrealGamePatcher
 			{
 				UE_LOG(LogUnrealGamePatcher, Warning, TEXT("FUpdateOrchestrator: failed persisting rolled-back state '%s' (backups kept)"), *StatePath);
 				// Keep the backups: they are the only remaining recovery data.
-				return;
+				return false;
 			}
 			PF.DeleteDirectoryRecursively(*BackupDir);
+			return true;
 		};
 
 		// --- 1b. Crash recovery (task 5.3), apply runs only: a Pending
@@ -653,7 +718,11 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Warning,
 				TEXT("FUpdateOrchestrator: recovering interrupted transaction (version %s, %d targets)"),
 				*State.Transaction.ContentVersion, State.Transaction.Targets.Num());
-			Rollback(State);
+			if (!Rollback(State))
+			{
+				Emit(EUpdatePhase::Failed, EPatcherError::RollbackFailed, true, 0, 0, TEXT("cannot recover interrupted transaction"));
+				return false;
+			}
 		}
 
 		// --- 1c. CoW v2 container recovery (ROADMAP §5.2): truncate any torn
@@ -728,7 +797,7 @@ namespace UnrealGamePatcher
 			TMap<FString, int64> PlainSizes;
 			if (!FLocalTruthExtractor::ExtractInstallNames(InstallDir, DiskNames, PlainSizes))
 			{
-				Emit(EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0, TEXT("install directory not readable"));
+				Emit(EUpdatePhase::Failed, EPatcherError::InstallScanFailed, true, 0, 0, TEXT("install directory not readable"));
 				return false;
 			}
 			for (auto It = LocalTruth.Files.CreateIterator(); It; ++It)
@@ -755,7 +824,7 @@ namespace UnrealGamePatcher
 		else if (!FLocalTruthExtractor::ExtractInstall(InstallDir, LocalTruth,
 			bHaveLocalIndex ? &LocalIndex : nullptr, bVerify))
 		{
-			Emit(EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0, TEXT("local truth extraction failed"));
+			Emit(EUpdatePhase::Failed, EPatcherError::LocalTruthFailed, true, 0, 0, TEXT("local truth extraction failed"));
 			return false;
 		}
 
@@ -765,6 +834,14 @@ namespace UnrealGamePatcher
 		FDiffResult Diff;
 		FDiffAnalyzer::DiffFilesVirtualDisk(LocalTruth.Files, Remote.Files, Diff.Files);
 		FDiffAnalyzer::DiffChunks(LocalIndex.Chunks, Remote.Chunks, Diff.Chunks);
+		if (Options.bPreserveUntrackedFiles)
+		{
+			Diff.Files.RemoveAll([&LocalIndex](const FDiffEntry& Entry)
+			{
+				return Entry.Kind == EChangeKind::Removed && !LocalIndex.Files.Contains(Entry.Id) &&
+					!Entry.Id.EndsWith(TEXT(".pak")) && !Entry.Id.EndsWith(TEXT(".utoc")) && !Entry.Id.EndsWith(TEXT(".ucas"));
+			});
+		}
 
 		// Verify mode only: a ucas classified Same by its chunk-id set must
 		// also carry intact data - re-hash each local chunk against its utoc
@@ -964,14 +1041,14 @@ namespace UnrealGamePatcher
 		else if (!FPatcherStateFile::Save(StatePath, State))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: cannot log pending transaction '%s'"), *StatePath);
-			Emit(EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0, TEXT("cannot record pending transaction"));
+			Emit(EUpdatePhase::Failed, EPatcherError::TransactionStateWriteFailed, true, 0, 0, TEXT("cannot record pending transaction"));
 			return false;
 		}
 
 		if (!PF.CreateDirectoryTree(*BackupDir))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: cannot create backup dir '%s'"), *BackupDir);
-			Emit(EUpdatePhase::Failed, EPatcherError::WriteNoPermission, true, 0, 0, TEXT("cannot create backup directory"));
+			Emit(EUpdatePhase::Failed, EPatcherError::BackupFailed, true, 0, 0, TEXT("cannot create backup directory"));
 			return false;
 		}
 
@@ -1010,7 +1087,7 @@ namespace UnrealGamePatcher
 				if (!Entry || Entry->File.IsEmpty())
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: chunk '%s' missing from remote manifest"), *Guid);
-					Emit(EUpdatePhase::Failed, EPatcherError::ManifestTampered, true, 0, 0, TEXT("remote manifest references a missing chunk"));
+				Emit(EUpdatePhase::Failed, EPatcherError::ChunkPlanInvalid, true, 0, 0, TEXT("remote manifest references a missing chunk"));
 					return false;
 				}
 				FDownloadRequest Req;
@@ -1169,14 +1246,12 @@ namespace UnrealGamePatcher
 				}
 			}
 
-			Emit(EUpdatePhase::Download, EPatcherError::Ok, false, 0, Requests.Num(), *FString::Printf(TEXT("downloading %d chunks..."), Requests.Num()));
-
 			if (Requests.Num() > 0)
 			{
 				FDownloadManager Manager(*Options.Downloader, Options.MaxConcurrent, Options.MaxRetries);
 				FDownloadStats DownloadStats;
 				TArray<FString> FailedIds;
-				if (!Manager.DownloadAll(Requests, DownloadStats, FailedIds))
+				if (!Manager.DownloadAll(Requests, DownloadStats, FailedIds, ReportDownloadProgress))
 				{
 					UE_LOG(LogUnrealGamePatcher, Error,
 						TEXT("FUpdateOrchestrator: %d chunk downloads failed (e.g. '%s') - update aborted, install untouched"),
@@ -1186,7 +1261,6 @@ namespace UnrealGamePatcher
 						*FString::Printf(TEXT("download failed: %d chunks (e.g. %s)"), FailedIds.Num(), FailedIds.Num() > 0 ? *FailedIds[0] : TEXT("?")));
 					return false;
 				}
-				Emit(EUpdatePhase::Download, EPatcherError::Ok, false, Requests.Num(), Requests.Num(), TEXT("download finished"));
 				OutStats.NumChunksFetched = DownloadStats.Completed - DownloadStats.SkippedExisting;
 				OutStats.BytesFetched = DownloadStats.BytesDownloaded;
 				UE_LOG(LogUnrealGamePatcher, Display,
@@ -1211,13 +1285,19 @@ namespace UnrealGamePatcher
 				return true;
 			}
 			TArray<FDownloadRequest> Requests;
+			TSet<FString> Seen;
 			for (const FIndexFileChunkRef& Part : FileEntry->Parts)
 			{
+				if (Seen.Contains(Part.Chunk))
+				{
+					continue;
+				}
+				Seen.Add(Part.Chunk);
 				const FIndexChunkEntry* Entry = Remote.Chunks.Find(Part.Chunk);
 				if (!Entry || Entry->File.IsEmpty())
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: chunk '%s' missing from remote manifest"), *Part.Chunk);
-					Emit(EUpdatePhase::Failed, EPatcherError::ManifestTampered, true, 0, 0, TEXT("remote manifest references a missing chunk"));
+					Emit(EUpdatePhase::Failed, EPatcherError::ChunkPlanInvalid, true, 0, 0, TEXT("remote manifest references a missing chunk"));
 					return false;
 				}
 				const FString DestFile = FPaths::Combine(ChunkRoot, Entry->File);
@@ -1239,11 +1319,10 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Display,
 				TEXT("FUpdateOrchestrator: lazily fetching %d missing chunks of '%s' for the whole-file rebuild"),
 				Requests.Num(), *FileId);
-			Emit(EUpdatePhase::Download, EPatcherError::Ok, false, 0, Requests.Num(), TEXT("fetching remaining chunks for the rebuild..."));
 			FDownloadManager Manager(*Options.Downloader, Options.MaxConcurrent, Options.MaxRetries);
 			FDownloadStats DownloadStats;
 			TArray<FString> FailedIds;
-			if (!Manager.DownloadAll(Requests, DownloadStats, FailedIds))
+			if (!Manager.DownloadAll(Requests, DownloadStats, FailedIds, ReportDownloadProgress))
 			{
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: %d lazy chunk downloads failed for '%s'"),
 					FailedIds.Num(), *FileId);
@@ -1300,13 +1379,14 @@ namespace UnrealGamePatcher
 			// (disk full) would drop the just-recorded backup paths, converting
 			// an interrupted apply into an unrecoverable one. Treat every save
 			// during the apply as fatal.
-			auto SaveTransactionState = [&State, &StatePath]() -> bool
+			auto SaveTransactionState = [&State, &StatePath, &LastError]() -> bool
 			{
 				if (FPatcherStateFile::Save(StatePath, State))
 				{
 					return true;
 				}
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed saving transaction state '%s' - aborting apply"), *StatePath);
+				LastError = EPatcherError::TransactionStateWriteFailed;
 				return false;
 			};
 			const FString FileId = FPaths::GetCleanFilename(T.File);
@@ -1334,6 +1414,7 @@ namespace UnrealGamePatcher
 					if (!PF.CopyFile(*BackupPath, *T.File))
 					{
 						UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed backing up '%s'"), *T.File);
+						LastError = EPatcherError::BackupFailed;
 						bOk = false;
 						break;
 					}
@@ -1352,6 +1433,7 @@ namespace UnrealGamePatcher
 				if (!PF.DeleteFile(*T.File) && PF.FileExists(*T.File))
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed deleting '%s'"), *T.File);
+					LastError = EPatcherError::RemoveFailed;
 					bOk = false;
 					break;
 				}
@@ -1380,6 +1462,7 @@ namespace UnrealGamePatcher
 					if (!PF.CopyFile(*BackupPath, *T.File))
 					{
 						UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed backing up '%s'"), *T.File);
+					LastError = EPatcherError::BackupFailed;
 						bOk = false;
 						break;
 					}
@@ -1408,18 +1491,20 @@ namespace UnrealGamePatcher
 							FTransactionTarget& UT = State.Transaction.Targets[U];
 							if (UT.File == UtocPath && UT.BackupPath.IsEmpty())
 							{
-								UT.BackupPath = FPaths::Combine(BackupDir,
+								const FString BackupPath = FPaths::Combine(BackupDir,
 									FString::Printf(TEXT("%s.%d.bak"), *FPaths::GetCleanFilename(UtocPath), U));
 								// An unchecked failed backup would leave a
 								// BackupPath pointing at nothing - rollback then
 								// silently skips restoring the utoc while the
 								// patch rewrites it. Fail the apply instead.
-								if (!PF.CopyFile(*UT.BackupPath, *UtocPath))
+								if (!PF.CopyFile(*BackupPath, *UtocPath))
 								{
 									UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed backing up sibling utoc '%s'"), *UtocPath);
+									LastError = EPatcherError::BackupFailed;
 									bOk = false;
 									break;
 								}
+								UT.BackupPath = BackupPath;
 								UT.OriginalHash = FPatcherHash::FileSHA1Hex(UtocPath);
 							}
 							if (!bOk)
@@ -1522,9 +1607,11 @@ namespace UnrealGamePatcher
 						break;
 					}
 					TArray64<uint8> Assembled;
-					if (!RebuildFileFromChunks(Remote, ChunkRoot, InstallDir, FileIdKey,
-						SameChunks, LocalSources, ReplacedFiles, !Options.bRepairOnly, !bNetwork, bNetwork, ChunkCache, OutStats, Assembled))
+					const EPatcherError RebuildError = RebuildFileFromChunks(Remote, ChunkRoot, InstallDir, FileIdKey,
+						SameChunks, LocalSources, ReplacedFiles, !Options.bRepairOnly, !bNetwork, bNetwork, ChunkCache, OutStats, Assembled);
+					if (RebuildError != EPatcherError::Ok)
 					{
+						LastError = RebuildError;
 						bOk = false;
 						break;
 					}
@@ -1560,6 +1647,7 @@ namespace UnrealGamePatcher
 				UE_LOG(LogUnrealGamePatcher, Error,
 					TEXT("FUpdateOrchestrator: simulated crash after %d writes (test hook) - transaction left pending for recovery"),
 					WritesApplied);
+				Emit(EUpdatePhase::Failed, EPatcherError::Interrupted, true, WritesApplied, NumTargets, TEXT("transaction left pending for recovery"));
 				return false;
 			}
 
@@ -1576,11 +1664,13 @@ namespace UnrealGamePatcher
 
 		if (!bOk)
 		{
-			Rollback(State);
-			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: update to %s failed - transaction rolled back"), *Version);
+			const bool bRolledBack = Rollback(State);
+			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: update to %s failed - %s"),
+				*Version, bRolledBack ? TEXT("transaction rolled back") : TEXT("rollback failed"));
 			EmitIORunReport(TEXT("failed-run"), TEXT("update-failed"), OutStats);
-			Emit(EUpdatePhase::Failed, (LastError != EPatcherError::Ok) ? LastError : EPatcherError::ApplyFailed, true,
-				WritesApplied, NumTargets, TEXT("apply failed, rolled back"));
+			const EPatcherError ApplyError = LastError != EPatcherError::Ok ? LastError : EPatcherError::ApplyFailed;
+			Emit(EUpdatePhase::Failed, bRolledBack ? ApplyError : EPatcherError::RollbackFailed, true, WritesApplied, NumTargets,
+				bRolledBack ? TEXT("apply failed, rolled back") : TEXT("apply failed and could not restore all targets"));
 			return false;
 		}
 
@@ -1599,7 +1689,7 @@ namespace UnrealGamePatcher
 		if (!PF.CreateDirectoryTree(*FPaths::Combine(InstallDir, TEXT(".ugp"))))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: cannot create state dir in '%s'"), *InstallDir);
-			Emit(EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0, TEXT("cannot create state directory"));
+			Emit(EUpdatePhase::Failed, EPatcherError::CommitStateFailed, true, 0, 0, TEXT("cannot create state directory"));
 			return false;
 		}
 		State.Transaction.Status = ETransactionStatus::Committed;
@@ -1613,10 +1703,10 @@ namespace UnrealGamePatcher
 		if (!FPatcherStateFile::Save(StatePath, State))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed committing state '%s'"), *StatePath);
-			Emit(EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0, TEXT("cannot commit transaction"));
+			Emit(EUpdatePhase::Failed, EPatcherError::CommitStateFailed, true, 0, 0, TEXT("cannot commit transaction"));
 			return false;
 		}
-		// The sidecar is the committed REMOTE index verbatim: it is the
+		// The sidecar is the committed remote index in the install layout: it is the
 		// trust-mode truth (manifest-to-manifest diff, no disk reads) AND the
 		// chunk-reuse record (Parts + Chunks). Container entry metadata stays
 		// - the in-place patchers consume the remote copy's, and the sidecar's
@@ -1624,7 +1714,7 @@ namespace UnrealGamePatcher
 		if (!FIndexManifestFile::Save(LocalStatePath, Remote))
 		{
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: failed writing local state '%s'"), *LocalStatePath);
-			Emit(EUpdatePhase::Failed, EPatcherError::Internal, true, 0, 0, TEXT("cannot write local state"));
+			Emit(EUpdatePhase::Failed, EPatcherError::CommitIndexFailed, true, 0, 0, TEXT("cannot write local content index"));
 			return false;
 		}
 		PF.DeleteDirectoryRecursively(*GetBackupDir(InstallDir));
@@ -1722,9 +1812,11 @@ namespace UnrealGamePatcher
 		for (const FString& FileId : FileIds)
 		{
 			TArray64<uint8> Assembled;
-			if (!RebuildFileFromChunks(Remote, CdnRootLocal, InstallDir, FileId,
-				SameChunks, LocalSources, ReplacedFiles, /*bReuseAllowed=*/false, /*bTrackFetchStats=*/true, /*bChunkRootIsCache=*/false, ChunkCache, OutStats, Assembled))
+			const EPatcherError RebuildError = RebuildFileFromChunks(Remote, CdnRootLocal, InstallDir, FileId,
+				SameChunks, LocalSources, ReplacedFiles, /*bReuseAllowed=*/false, /*bTrackFetchStats=*/true, /*bChunkRootIsCache=*/false, ChunkCache, OutStats, Assembled);
+			if (RebuildError != EPatcherError::Ok)
 			{
+				ReportFailure({}, RebuildError, *FileId);
 				return -1;
 			}
 			const FString Path = FPaths::Combine(InstallDir, FileId);
@@ -1774,25 +1866,27 @@ namespace UnrealGamePatcher
 		// The target version comes from the server's announcement file
 		// index/latest.json - over HTTP when the CDN root is a URL, from disk
 		// when it is a local directory (bare path or file://...).
-		FLatestVersion Latest;
+		FString Json;
+		bool bReadVersion = false;
 		if (IsHttpCdn(CdnRoot))
 		{
-			FString Json;
-			if (!FetchCdnResource(CdnRoot, TEXT("index/latest.json"), Options, Json) ||
-				!FLatestVersionFile::LoadFromString(Json, Latest))
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: cannot resolve latest version from '%s'"), *CdnRoot);
-				return false;
-			}
+			bReadVersion = FetchCdnResource(CdnRoot, TEXT("index/latest.json"), Options, Json);
 		}
 		else
 		{
 			const FString Path = FPaths::Combine(LocalCdnRoot(CdnRoot), TEXT("index"), TEXT("latest.json"));
-			if (!CheckLocalMetaSize(Path, Options.MaxManifestBytes) || !FLatestVersionFile::Load(Path, Latest))
-			{
-				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: cannot resolve latest version from '%s'"), *Path);
-				return false;
-			}
+			bReadVersion = CheckLocalMetaSize(Path, Options.MaxManifestBytes) && FFileHelper::LoadFileToString(Json, *Path);
+		}
+		if (!bReadVersion)
+		{
+			ReportFailure(Options, EPatcherError::VersionUnavailable, TEXT("cannot read index/latest.json"));
+			return false;
+		}
+		FLatestVersion Latest;
+		if (!FLatestVersionFile::LoadFromString(Json, Latest))
+		{
+			ReportFailure(Options, EPatcherError::VersionInvalid, TEXT("invalid version announcement in index/latest.json"));
+			return false;
 		}
 		OutVersion = Latest.Version;
 		return true;

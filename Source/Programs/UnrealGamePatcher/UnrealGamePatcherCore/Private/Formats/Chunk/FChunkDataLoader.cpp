@@ -10,7 +10,7 @@
 #include "Misc/Compression.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 
 namespace UnrealGamePatcher
 {

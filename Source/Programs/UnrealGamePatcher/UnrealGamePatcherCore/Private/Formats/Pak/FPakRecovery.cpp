@@ -4,7 +4,7 @@
 #include "Stats/FIOStats.h"
 #include "UnrealGamePatcherLog.h"
 #include "HAL/PlatformFileManager.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 
 namespace UnrealGamePatcher
 {

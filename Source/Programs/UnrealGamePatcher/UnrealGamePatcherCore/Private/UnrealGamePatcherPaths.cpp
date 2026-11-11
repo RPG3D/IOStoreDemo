@@ -6,7 +6,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
 #include "Misc/Timespan.h"
-#if PLATFORM_ANDROID
+#if PLATFORM_ANDROID || PLATFORM_IOS
 	#include <fcntl.h>
 	#include <sys/file.h>
 	#include <unistd.h>
@@ -52,15 +52,15 @@ namespace UnrealGamePatcher::Paths
 
 	bool FInstallLock::Acquire(const FString& InstallDir, const FString& LockRootDir)
 	{
-#if PLATFORM_ANDROID
+#if PLATFORM_ANDROID || PLATFORM_IOS
 		// Android: UE::FPlatformSystemWideMutex's POSIX implementation puts the
 		// lock file under FPlatformProcess::ApplicationSettingsDir(), which
 		// Android does not override - it degenerates to RootDir("/"), where an
 		// app cannot create files. Lock a file under LockRootDir instead (the
 		// caller passes the app's INTERNAL files dir: the emulated external
-		// storage is FUSE and silently does not support flock). Same
-		// single-writer semantics; flock releases on process death.
-		if (AndroidLockFd >= 0)
+		// storage is FUSE and silently does not support flock).
+		// iOS uses the app sandbox directly. flock releases on process death.
+		if (PosixLockFd >= 0)
 		{
 			return true;
 		}
@@ -90,7 +90,7 @@ namespace UnrealGamePatcher::Paths
 			UE_LOG(LogUnrealGamePatcher, Error, TEXT("Paths: another patcher instance is working on '%s' - refusing to run concurrently"), *InstallDir);
 			return false;
 		}
-		AndroidLockFd = Fd;
+		PosixLockFd = Fd;
 		return true;
 #else
 		if (Mutex.IsSet())
@@ -128,12 +128,12 @@ namespace UnrealGamePatcher::Paths
 
 	void FInstallLock::Release()
 	{
-#if PLATFORM_ANDROID
-		if (AndroidLockFd >= 0)
+#if PLATFORM_ANDROID || PLATFORM_IOS
+		if (PosixLockFd >= 0)
 		{
-			flock(AndroidLockFd, LOCK_UN);
-			close(AndroidLockFd);
-			AndroidLockFd = -1;
+			flock(PosixLockFd, LOCK_UN);
+			close(PosixLockFd);
+			PosixLockFd = -1;
 		}
 #endif
 		if (Mutex.IsSet())

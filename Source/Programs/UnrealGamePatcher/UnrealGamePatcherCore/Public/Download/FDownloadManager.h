@@ -51,11 +51,14 @@ namespace UnrealGamePatcher
 
 		/** Downloads every request. Returns false when at least one request
 		 *  failed permanently (its id is reported through OutFailedIds; no
-		 *  corrupt bytes are on disk - only fully verified files exist). */
+		 *  corrupt bytes are on disk - only fully verified files exist).
+		 *  OnProgress runs on the caller's thread. CompletedBytes includes
+		 *  usable cache hits and successfully completed requests. */
 		UNREALGAMEPATCHERCORE_API bool DownloadAll(
 			const TArray<FDownloadRequest>& Requests,
 			FDownloadStats& OutStats,
-			TArray<FString>& OutFailedIds);
+			TArray<FString>& OutFailedIds,
+			TFunction<void(int64 CompletedBytes, int64 TotalBytes)> OnProgress = {});
 
 	private:
 		IChunkDownloader& Downloader;

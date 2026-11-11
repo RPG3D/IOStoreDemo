@@ -8,7 +8,7 @@
 #include "Misc/Compression.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
-#include "SecureHash.h"
+#include "Misc/SecureHash.h"
 
 namespace UnrealGamePatcher
 {

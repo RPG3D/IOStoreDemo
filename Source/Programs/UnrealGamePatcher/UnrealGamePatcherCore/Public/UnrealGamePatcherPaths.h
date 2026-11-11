@@ -44,18 +44,13 @@ namespace UnrealGamePatcher::Paths
 		/** Takes the lock; returns false (and logs) when another writer
 		 *  already holds it. Re-entrant within one process is NOT supported
 		 *  - a second Acquire on the same directory fails by design.
-		 *  LockRootDir (Android only): where to place the lock FILE. Must be
-		 *  a path on a filesystem with working POSIX locks - the app's
-		 *  INTERNAL files dir. The emulated external storage (/storage/
-		 *  emulated/0 = FUSE) silently does not support flock. */
+		 *  LockRootDir (Android/iOS) selects the lock file's directory.
+		 *  On Android, use the app's internal files dir for POSIX locks. */
 		bool Acquire(const FString& InstallDir, const FString& LockRootDir = FString());
 		void Release();
 
 	private:
 		TOptional<UE::FPlatformSystemWideMutex> Mutex;
-		// Android only: fd of the flock-ed lock file. The engine's system-wide
-		// mutex degenerates to RootDir("/") on Android (no ApplicationSettingsDir
-		// override), so the lock lives under LockRootDir (default <InstallDir>/.ugp).
-		int AndroidLockFd = -1;
+		int PosixLockFd = -1; // Android/iOS lock file in the app sandbox
 	};
 }

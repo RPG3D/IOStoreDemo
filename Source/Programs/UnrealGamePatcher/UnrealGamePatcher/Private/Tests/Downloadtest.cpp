@@ -140,6 +140,26 @@ namespace UnrealGamePatcher::Tests
 			Check(Stats2.SkippedExisting == NumFixtureChunks && Stats2.BytesDownloaded == 0,
 				TEXT("A: second pass served from cache (0 bytes over the wire)"));
 			Check(CdnServer.Stats().Files == ReqAfterFirst, TEXT("A: no new HTTP requests on cache hit"));
+
+			const FDownloadRequest& Missing = Requests.Last();
+			Check(PF.DeleteFile(*Missing.DestFile), TEXT("A: remove one cached file for byte-progress test"));
+			int64 TotalBytes = 0;
+			for (const FDownloadRequest& Request : Requests)
+			{
+				TotalBytes += Request.Size;
+			}
+			FDownloadStats ResumeStats;
+			TArray<FString> ResumeFailed;
+			TArray<int64> CompletedBytes;
+			bool bTotalsMatch = true;
+			Check(Manager.DownloadAll(Requests, ResumeStats, ResumeFailed, [&](int64 Completed, int64 Total)
+			{
+				bTotalsMatch &= Total == TotalBytes;
+				CompletedBytes.Add(Completed);
+			}), TEXT("A: partial cache download succeeds"));
+			Check(bTotalsMatch && CompletedBytes.Num() == 2 &&
+				CompletedBytes[0] == TotalBytes - Missing.Size && CompletedBytes[1] == TotalBytes,
+				TEXT("A: progress reports actual cached and completed bytes"));
 		}
 
 		// --- B. Journal bitmap resume of an interrupted file (6.1) ----------
@@ -355,9 +375,21 @@ namespace UnrealGamePatcher::Tests
 			// model) - force verify for this interruption+repair scenario.
 			Options.bForceVerify = true;
 			const int32 ReqBeforeRepair = CdnServer.Stats().Files;
+				bool bRetainedPrefetchProgress = false;
+				Options.Events = [&bRetainedPrefetchProgress](const FUpdateEvent& Event)
+				{
+					if (Event.Phase == EUpdatePhase::Download &&
+						Event.Message.StartsWith(TEXT("Downloading additional content")) &&
+						Event.Current > 0 && Event.Current < Event.Total)
+					{
+						bRetainedPrefetchProgress = true;
+					}
+				};
 			FUpdateStats S3;
 			Check(FUpdateOrchestrator::UpdateWithOptions(Cdn, TEXT("1.0.0"), Install, true, Options, S3),
 				TEXT("E: repair over network succeeds"));
+				Options.Events.Reset();
+				Check(bRetainedPrefetchProgress, TEXT("E: supplemental download keeps the completed prefetch bytes"));
 			Check(S3.NumFilesChanged == 2, TEXT("E: damaged ucas + sibling utoc rebuilt"));
 			// The download cache is a TEMP store (no double data on the client),
 			// so a later run re-fetches what the repair rebuilds over HTTP.
