@@ -5,12 +5,14 @@
 #if PLATFORM_WINDOWS
 #include "Windows/WindowsHWrapper.h"
 #elif PLATFORM_MAC
+#include "HAL/PlatformApplicationMisc.h"
 #include "Mac/CocoaThread.h"
 #include "Apple/ApplePlatformMisc.h"
 #include "HAL/PlatformMisc.h"
 #endif
 #include "Modules/ModuleManager.h"
 #include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "UnrealGamePatcherCLI.h"
 #include "UnrealGamePatcherGUI.h"
 
@@ -18,6 +20,28 @@ IMPLEMENT_APPLICATION(UnrealGamePatcher, "UnrealGamePatcher");
 
 namespace
 {
+	FString GetPatcherArgs(const TCHAR* CommandLine, FString* LaunchArgs = nullptr)
+	{
+		const TCHAR* Cursor = CommandLine;
+		for (FString Token; *Cursor;)
+		{
+			const TCHAR* Start = Cursor;
+			if (!FParse::Token(Cursor, Token, false))
+			{
+				break;
+			}
+			if (Token == TEXT("--"))
+			{
+				if (LaunchArgs)
+				{
+					*LaunchArgs = FString(Cursor).TrimStartAndEnd();
+				}
+				return FString(static_cast<int32>(Start - CommandLine), CommandLine);
+			}
+		}
+		return CommandLine;
+	}
+
 	/**
 	 * Shared engine-loop startup + CLI/GUI dispatch + shutdown, in the exact
 	 * order the original WinMain used (Windows behavior is byte-identical).
@@ -27,14 +51,16 @@ namespace
 	{
 		// The CLI/GUI entries parse with FParse straight off the raw line; the
 		// caller hands over the command line without the executable token.
+		FString LaunchArgs;
+		const FString PatcherArgs = GetPatcherArgs(CmdLine, &LaunchArgs);
 		int32 Result = 0;
-		if (FParse::Param(CmdLine, TEXT("cli")))
+		if (FParse::Param(*PatcherArgs, TEXT("cli")))
 		{
 			Result = RunUnrealGamePatcherCLI(CmdLine);
 		}
 		else
 		{
-			Result = RunUnrealGamePatcherGUI(CmdLine);
+			Result = RunUnrealGamePatcherGUI(*PatcherArgs, LaunchArgs);
 		}
 
 		GLog->Flush();
@@ -71,7 +97,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInInstance, _In_opt_ HINSTANCE hPrevInstance,
 {
 	FTaskTagScope Scope(ETaskTag::EGameThread);
 	DisableProxyForLoopback();
-	GEngineLoop.PreInit(GetCommandLineW());
+	GEngineLoop.PreInit(*GetPatcherArgs(GetCommandLineW()));
 	ProcessNewlyLoadedUObjects();
 	FModuleManager::Get().StartProcessingNewlyLoadedObjects();
 
@@ -96,26 +122,30 @@ static FString GMacCommandLine;
 
 - (void)applicationDidFinishLaunching:(NSNotification *)Notification
 {
+	FPlatformApplicationMisc::ActivateApplication();
 	RunGameThread(self, @selector(runGameThread:));
 }
 
 - (void)runGameThread:(id)Arg
 {
 	FTaskTagScope Scope(ETaskTag::EGameThread);
+	FPlatformMisc::SetGracefulTerminationHandler();
 	DisableProxyForLoopback();
-	GEngineLoop.PreInit(*GMacCommandLine);
+	GEngineLoop.PreInit(*GetPatcherArgs(*GMacCommandLine));
 	ProcessNewlyLoadedUObjects();
 	FModuleManager::Get().StartProcessingNewlyLoadedObjects();
-	RunUnrealGamePatcherEntry(*GMacCommandLine);
+	const int32 Result = RunUnrealGamePatcherEntry(*GMacCommandLine);
 
 	dispatch_async(dispatch_get_main_queue(), ^{
-		[NSApp terminate: nil];
+		FTaskTagScope::SetTagStaticInit();
+		::exit(Result);
 	});
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)Sender
 {
-	return NSTerminateNow;
+	RequestEngineExit(TEXT("macOS requested launcher shutdown"));
+	return NSTerminateCancel;
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app
@@ -132,7 +162,7 @@ int main(int argc, char* argv[])
 	// rule as CrashReportClient's Mac main).
 	for (int32 Option = 1; Option < argc; Option++)
 	{
-		FString Argument(ANSI_TO_TCHAR(argv[Option]));
+		FString Argument(UTF8_TO_TCHAR(argv[Option]));
 		if (Argument.Contains(TEXT(" ")))
 		{
 			if (Argument.Contains(TEXT("=")))
@@ -153,17 +183,18 @@ int main(int argc, char* argv[])
 
 	// CLI mode: pure console flow, no Cocoa event loop.
 	const TCHAR* CmdLine = *GMacCommandLine;
-	if (FParse::Param(CmdLine, TEXT("cli")))
+	if (FParse::Param(*GetPatcherArgs(CmdLine), TEXT("cli")))
 	{
 		FTaskTagScope Scope(ETaskTag::EGameThread);
 		DisableProxyForLoopback();
-		GEngineLoop.PreInit(*GMacCommandLine);
+		GEngineLoop.PreInit(*GetPatcherArgs(CmdLine));
 		ProcessNewlyLoadedUObjects();
 		FModuleManager::Get().StartProcessingNewlyLoadedObjects();
 		return RunUnrealGamePatcherEntry(*GMacCommandLine);
 	}
 
 	// GUI mode: Slate runs on the game thread inside the Cocoa run loop.
+	FTaskTagScope::SetTagNone();
 	SCOPED_AUTORELEASE_POOL;
 	[NSApplication sharedApplication];
 	[NSApp setDelegate:[UnrealGamePatcherAppDelegate new]];

@@ -63,6 +63,25 @@ namespace UnrealGamePatcher
 			return FPaths::Combine(InstallDir, TEXT(".ugp"), TEXT("backup"));
 		}
 
+#if PLATFORM_MAC
+		bool IsMacContentId(const FString& FileId)
+		{
+			return !FileId.Equals(TEXT(".ugp"), ESearchCase::IgnoreCase) && !FileId.StartsWith(TEXT(".ugp/")) &&
+				!FileId.EndsWith(TEXT("/.ugp")) && !FileId.Contains(TEXT("/.ugp/"));
+		}
+
+		bool ResolveMacPathBelowRoot(FString& Path, const FString& Root)
+		{
+			FString Resolved;
+			if (!Paths::ResolveMacPath(Path, Resolved) || Resolved == Root || !FPaths::IsUnderDirectory(Resolved, Root))
+			{
+				return false;
+			}
+			Path = MoveTemp(Resolved);
+			return true;
+		}
+#endif
+
 		/** True when the CDN root is an HTTP(S) base: every resource
 		 *  (latest.json, the version index, chunk bytes) is fetched over HTTP. */
 		bool IsHttpCdn(const FString& CdnRoot)
@@ -502,11 +521,21 @@ namespace UnrealGamePatcher
 	bool FUpdateOrchestrator::UpdateWithOptions(
 		const FString& CdnDir,
 		const FString& Version,
-		const FString& InstallDir,
+		const FString& InInstallDir,
 		bool bApply,
 		const FUpdateOptions& Options,
 		FUpdateStats& OutStats)
 	{
+#if PLATFORM_MAC
+		// The install scan derives relative names from the root length. Mac's
+		// file manager omits the trailing slash when joining file names.
+		FString InstallDir = FPaths::ConvertRelativePathToFull(InInstallDir);
+		while (InstallDir.Len() > 1 && InstallDir.RemoveFromEnd(TEXT("/")))
+		{
+		}
+#else
+		const FString& InstallDir = InInstallDir;
+#endif
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
 
 		// Single-writer guard (fixplan L-M5): mutating runs take the install
@@ -516,9 +545,19 @@ namespace UnrealGamePatcher
 		Paths::FInstallLock InstallLock;
 		if (bApply && !InstallLock.Acquire(InstallDir, Options.InstallLockRootDir))
 		{
+#if PLATFORM_MAC
+			ReportFailure(Options, EPatcherError::InstallLockFailed, *InstallLock.GetMacFailureDetail());
+#else
 			ReportFailure(Options, EPatcherError::InstallLockFailed, TEXT("cannot lock the install directory"));
+#endif
 			return false;
 		}
+#if PLATFORM_MAC
+		if (bApply)
+		{
+			InstallDir = InstallLock.GetMacInstallDir();
+		}
+#endif
 
 		// Fresh installs are the PRIMARY scenario (a patcher bootstrapping a
 		// new directory / new player machine): create the install dir instead
@@ -634,6 +673,17 @@ namespace UnrealGamePatcher
 			Emit(EUpdatePhase::Failed, EPatcherError::ManifestTampered, true, 0, 0, TEXT("unsupported content layout"));
 			return false;
 		}
+#if PLATFORM_MAC
+		for (const auto& Entry : Remote.Files)
+		{
+			if (!IsMacContentId(Entry.Key))
+			{
+				Emit(EUpdatePhase::Failed, EPatcherError::ManifestTampered, true, 0, 0,
+					TEXT("content manifest includes reserved install metadata"));
+				return false;
+			}
+		}
+#endif
 		Emit(EUpdatePhase::Manifest, EPatcherError::Ok, false, 0, 0, TEXT("manifest loaded"));
 
 		// Where chunk FILES are read from: the CDN root in local mode (chunks
@@ -715,6 +765,21 @@ namespace UnrealGamePatcher
 		// the next apply run.
 		if (bApply && State.Transaction.Status == ETransactionStatus::Pending)
 		{
+#if PLATFORM_MAC
+			// An older transaction may use an alias for this install, but it
+			// must never restore or remove files from another directory.
+			for (FTransactionTarget& Target : State.Transaction.Targets)
+			{
+				if (!ResolveMacPathBelowRoot(Target.File, InstallDir) ||
+					!IsMacContentId(Target.File.RightChop(InstallDir.Len() + 1)) ||
+					(!Target.BackupPath.IsEmpty() && !ResolveMacPathBelowRoot(Target.BackupPath, BackupDir)))
+				{
+					Emit(EUpdatePhase::Failed, EPatcherError::RollbackFailed, true, 0, 0,
+						TEXT("interrupted transaction references files outside its install tree"));
+					return false;
+				}
+			}
+#endif
 			UE_LOG(LogUnrealGamePatcher, Warning,
 				TEXT("FUpdateOrchestrator: recovering interrupted transaction (version %s, %d targets)"),
 				*State.Transaction.ContentVersion, State.Transaction.Targets.Num());
@@ -1748,13 +1813,43 @@ namespace UnrealGamePatcher
 		return true;
 	}
 
-		int32 FUpdateOrchestrator::Compact(
+	int32 FUpdateOrchestrator::Compact(
 		const FString& CdnDir,
 		const FString& Version,
-		const FString& InstallDir,
+		const FString& InInstallDir,
 		const TArray<FString>& FileIds,
-		FUpdateStats& OutStats)
+		FUpdateStats& OutStats,
+		const Paths::FInstallLock* HeldInstallLock)
 	{
+#if PLATFORM_MAC
+		Paths::FInstallLock OwnInstallLock;
+		if (!HeldInstallLock)
+		{
+			if (!OwnInstallLock.Acquire(InInstallDir))
+			{
+				ReportFailure({}, EPatcherError::InstallLockFailed, *OwnInstallLock.GetMacFailureDetail());
+				return -1;
+			}
+			HeldInstallLock = &OwnInstallLock;
+		}
+		const FString& InstallDir = HeldInstallLock->GetMacInstallDir();
+		FString Resolved;
+		if (!HeldInstallLock->IsMacWriter() || !Paths::ResolveMacPath(InInstallDir, Resolved) || Resolved != InstallDir)
+		{
+			ReportFailure({}, EPatcherError::InstallLockFailed, TEXT("compact requires a writer lock for its install directory"));
+			return -1;
+		}
+		for (const FString& FileId : FileIds)
+		{
+			if (!IsMacContentId(FileId))
+			{
+				ReportFailure({}, EPatcherError::ManifestTampered, TEXT("compact target includes reserved install metadata"));
+				return -1;
+			}
+		}
+#else
+		const FString& InstallDir = InInstallDir;
+#endif
 		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
 		FIOStats::Get().Reset();
 

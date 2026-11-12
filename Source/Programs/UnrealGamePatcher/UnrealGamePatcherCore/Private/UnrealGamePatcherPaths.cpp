@@ -6,7 +6,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
 #include "Misc/Timespan.h"
-#if PLATFORM_ANDROID || PLATFORM_IOS
+#if PLATFORM_ANDROID || PLATFORM_IOS || PLATFORM_MAC
 	#include <fcntl.h>
 	#include <sys/file.h>
 	#include <unistd.h>
@@ -52,7 +52,9 @@ namespace UnrealGamePatcher::Paths
 
 	bool FInstallLock::Acquire(const FString& InstallDir, const FString& LockRootDir)
 	{
-#if PLATFORM_ANDROID || PLATFORM_IOS
+#if PLATFORM_MAC
+		return AcquireMac(InstallDir, false);
+#elif PLATFORM_ANDROID || PLATFORM_IOS
 		// Android: UE::FPlatformSystemWideMutex's POSIX implementation puts the
 		// lock file under FPlatformProcess::ApplicationSettingsDir(), which
 		// Android does not override - it degenerates to RootDir("/"), where an
@@ -128,13 +130,21 @@ namespace UnrealGamePatcher::Paths
 
 	void FInstallLock::Release()
 	{
-#if PLATFORM_ANDROID || PLATFORM_IOS
+#if PLATFORM_ANDROID || PLATFORM_IOS || PLATFORM_MAC
 		if (PosixLockFd >= 0)
 		{
 			flock(PosixLockFd, LOCK_UN);
 			close(PosixLockFd);
 			PosixLockFd = -1;
 		}
+#endif
+#if PLATFORM_MAC
+		for (int Index = MacDirectoryLocks.Num() - 1; Index >= 0; --Index)
+		{
+			close(MacDirectoryLocks[Index]);
+		}
+		MacDirectoryLocks.Reset();
+		MacInstallDir.Reset();
 #endif
 		if (Mutex.IsSet())
 		{

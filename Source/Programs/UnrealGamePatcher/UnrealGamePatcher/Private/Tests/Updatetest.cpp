@@ -7,6 +7,10 @@
 
 #include "Tests/TestFramework.h"
 
+#if PLATFORM_MAC
+#include <unistd.h>
+#endif
+
 namespace UnrealGamePatcher::Tests
 {
 	int32 RunUpdateTest(const TCHAR* /*CmdLine*/)
@@ -37,7 +41,8 @@ namespace UnrealGamePatcher::Tests
 
 		// --- 1. Full update on an empty install ----------------------------
 		FUpdateStats S1;
-		Check(FUpdateOrchestrator::Update(Cdn, Version, Install, true, S1), TEXT("full update on empty install succeeds"));
+		const FString FreshInstallPath = PLATFORM_MAC ? Install + TEXT("/") : Install;
+		Check(FUpdateOrchestrator::Update(Cdn, Version, FreshInstallPath, true, S1), TEXT("full update on empty install succeeds"));
 		Check(S1.NumFilesAdded == Index.Files.Num() && S1.NumFilesSame == 0, TEXT("full update: every manifest file added, 0 same"));
 		Check(S1.NumChunksFetched == Index.Chunks.Num(), TEXT("full update: every chunk fetched (no local state)"));
 		Check(S1.NumChunksReused == 0, TEXT("full update: nothing reused"));
@@ -73,11 +78,66 @@ namespace UnrealGamePatcher::Tests
 				Check(Second.Acquire(Other), TEXT("install lock: different dir acquires"));
 				Second.Release();
 			}
+#if PLATFORM_MAC
+			Paths::FInstallLock Reader;
+			Check(!Reader.AcquireReader(Install), TEXT("install lock: writer excludes a game reader"));
 			Lock.Release();
+			Check(Reader.AcquireReader(Install), TEXT("install lock: game reader acquires after writer exits"));
+			Paths::FInstallLock SecondReader;
+			Check(SecondReader.AcquireReader(Install), TEXT("install lock: games share a reader lock"));
+			Check(!Lock.Acquire(Install), TEXT("install lock: game readers exclude the writer"));
+			SecondReader.Release();
+			Reader.Release();
+#else
+			Lock.Release();
+#endif
 			Check(Lock.Acquire(Install), TEXT("install lock: re-acquire after release succeeds"));
 			Lock.Release();
 		}
 
+#if PLATFORM_MAC
+		{
+			const FString Outside = WorkDir / TEXT("protected.app");
+			const FString ProtectedFile = Outside / TEXT("Info.plist");
+			const FString LinkedInstall = WorkDir / TEXT("linked-install");
+			const FString Link = LinkedInstall / TEXT("GameAlias");
+			Check(PF.CreateDirectoryTree(*Outside) && PF.CreateDirectoryTree(*LinkedInstall) &&
+				FFileHelper::SaveStringToFile(TEXT("protected"), *ProtectedFile), TEXT("Mac install tree: create symlink fixture"));
+			const bool bLinked = symlink(TCHAR_TO_UTF8(*Outside), TCHAR_TO_UTF8(*Link)) == 0;
+			Check(bLinked, TEXT("Mac install tree: link to external bundle"));
+			if (bLinked)
+			{
+				FUpdateStats Stats;
+				Check(!FUpdateOrchestrator::Update(Cdn, Version, LinkedInstall, true, Stats),
+					TEXT("Mac install tree: reject a link before applying"));
+				Check(PF.FileExists(*ProtectedFile) && !PF.DirectoryExists(*(LinkedInstall / TEXT(".ugp"))),
+					TEXT("Mac install tree: preserve external file and leave no metadata"));
+				Check(unlink(TCHAR_TO_UTF8(*Link)) == 0, TEXT("Mac install tree: remove test link"));
+			}
+		}
+		{
+			const FString Parent = WorkDir / TEXT("parent-install");
+			const FString Child = Parent / TEXT("child-install");
+			const FString ChildMetadata = Child / TEXT(".ugp");
+			const FString ChildFile = Child / TEXT("child.txt");
+			Check(PF.CreateDirectoryTree(*ChildMetadata) && FFileHelper::SaveStringToFile(TEXT("child"), *ChildFile),
+				TEXT("Mac install tree: create child install"));
+			Paths::FInstallLock ChildReader;
+			Check(ChildReader.AcquireReader(Child), TEXT("Mac install tree: hold a child reader lock"));
+			FUpdateStats Stats;
+			Check(!FUpdateOrchestrator::Update(Cdn, Version, Parent, true, Stats),
+				TEXT("Mac install tree: reject a parent update while a child reader holds the lock"));
+			Check(PF.FileExists(*ChildFile) && PF.FileExists(*(ChildMetadata / TEXT("install.lock"))) &&
+				!PF.DirectoryExists(*(Parent / TEXT(".ugp"))), TEXT("Mac install tree: preserve child files and lock"));
+			Paths::FInstallLock ChildWriter;
+			Check(!ChildWriter.Acquire(Child), TEXT("Mac install tree: child lock still excludes writers"));
+			ChildReader.Release();
+			Check(!FUpdateOrchestrator::Update(Cdn, Version, Parent, true, Stats),
+				TEXT("Mac install tree: preserve inactive nested installs"));
+			Check(!FUpdateOrchestrator::Update(Cdn, Version, Install / TEXT("child"), true, Stats) &&
+				!PF.DirectoryExists(*(Install / TEXT("child"))), TEXT("Mac install tree: refuse a new install under a managed parent"));
+		}
+#endif
 
 
 		// Every installed file is hash-identical to the manifest.

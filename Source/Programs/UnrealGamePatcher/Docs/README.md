@@ -37,6 +37,7 @@
 - **`review-2026-11-11.md`**：Android 启动前更新链的 3 个 P1 问题及复现条件。
 - **`ios-preinit-runbook.md`**：iOS 启动前更新、CDN 发布和真机验收流程。
 - **`android-s1-runbook.md`**：Android 同进程启动更新、Saved/Paks 迁移和真机验收流程。
+- **`mac-launcher-runbook.md`**：Mac Slate 启动器、外部内容目录和本机验收流程。
 
 ## 构建
 
@@ -82,8 +83,7 @@ UnrealGamePatcher.exe -cli <command> [options]
 | 8xxx | 恢复 | `8001` 回滚失败，`8002` 更新被中断并留下待恢复事务，`8003` 迁移旧目录失败 |
 | 9xxx | 启动准备 | `9000` 内部错误，`9001` 无法锁定目录，`9002` 无法创建安装目录，`9003` 配置无效，`9004` 无法创建更新副本，`9005` 无法清理更新目录 |
 
-GUI：不带 `-cli` 即打开 Slate 窗口（更新按钮 + 进度条 + 完成后启动游戏），
-参数：`-cdn= -version= -install= [-launch=<游戏exe>] [-autoupdate]`（`-cdn` 同上，`-version` 缺省解析 latest）。
+不带 `-cli` 即打开 Slate 窗口。使用 `-cdn= -install= [-version=] [-launch=]` 指定更新源、安装目录和游戏路径。省略 `-version` 时每次尝试都会解析 `latest.json`。`-autoupdate` 打开窗口后立即检查。`-autoplay` 更新成功后启动游戏并退出启动器，更新或进程创建失败时返回非零状态。`--` 后的参数转交给游戏。
 
 
 ## CDN 产物布局

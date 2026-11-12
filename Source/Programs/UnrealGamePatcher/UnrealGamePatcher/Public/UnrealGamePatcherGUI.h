@@ -8,4 +8,4 @@
  * GUI mode entry. Creates a Slate window and drives the shared orchestrator (Core) on a worker thread.
  * Returns the process exit code.
  */
-int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine);
+int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine, const FString& LaunchArgs);

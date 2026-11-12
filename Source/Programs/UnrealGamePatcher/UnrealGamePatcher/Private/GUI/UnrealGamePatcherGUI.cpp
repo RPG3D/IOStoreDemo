@@ -8,296 +8,299 @@
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
 #include "HttpModule.h"
-#include "Misc/App.h"
-#include "Misc/EngineVersion.h"
+#include "Misc/Parse.h"
+#include "Misc/Paths.h"
 #include "StandaloneRenderer.h"
 #include "Stats/StatsSystem.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Input/SButton.h"
-#include "Misc/Parse.h"
 #include "Widgets/Notifications/SProgressBar.h"
 #include "Widgets/Text/STextBlock.h"
 
 #include "Download/FHttpChunkDownloader.h"
-#include "Update/FUpdateEvent.h"
 #include "Update/FUpdateOrchestrator.h"
 #include "UnrealGamePatcherVersion.h"
+#include "UnrealGamePatcherPaths.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogUnrealGamePatcherGUI, Log, All);
 
 namespace
 {
-	FString PhaseToString(UnrealGamePatcher::EUpdatePhase Phase)
+	using namespace UnrealGamePatcher;
+
+	enum class ELauncherState
 	{
-		switch (Phase)
-		{
-		case UnrealGamePatcher::EUpdatePhase::Manifest: return TEXT("加载清单");
-		case UnrealGamePatcher::EUpdatePhase::Diff: return TEXT("差异分析");
-		case UnrealGamePatcher::EUpdatePhase::Download: return TEXT("下载");
-		case UnrealGamePatcher::EUpdatePhase::Apply: return TEXT("应用");
-		case UnrealGamePatcher::EUpdatePhase::Commit: return TEXT("提交");
-		case UnrealGamePatcher::EUpdatePhase::Done: return TEXT("完成");
-		case UnrealGamePatcher::EUpdatePhase::Failed: return TEXT("失败");
-		default: return TEXT("");
-		}
-	}
-
-	/** State shared between the update worker thread and the UI thread.
-	 *  The worker only writes (via OnEvent, under the lock); the Slate tick
-	 *  reads through the getters. */
-	struct FPatcherUIState
-	{
-		std::atomic<bool> bRunning{ false };
-		std::atomic<bool> bDone{ false };
-		std::atomic<bool> bSuccess{ false };
-		std::atomic<bool> bError{ false };
-
-		mutable FCriticalSection Lock;
-		UnrealGamePatcher::EUpdatePhase Phase = UnrealGamePatcher::EUpdatePhase::None;
-		UnrealGamePatcher::EPatcherError Error = UnrealGamePatcher::EPatcherError::Ok;
-		int32 Current = 0;
-		int32 Total = 0;
-		UnrealGamePatcher::FUpdateStats Stats;
-		FString StatusText;
-
-		/** Worker-thread entry: store the latest broadcast event (stage /
-		 *  progress / error) under the lock; the UI tick reads it. */
-		void OnEvent(const UnrealGamePatcher::FUpdateEvent& E)
-		{
-			FScopeLock Scope(&Lock);
-			Phase = E.Phase;
-			Current = E.Current;
-			Total = E.Total;
-			if (E.bIsError || E.Phase == UnrealGamePatcher::EUpdatePhase::Failed)
-			{
-				bError = true;
-				Error = E.Error;
-				StatusText = E.Message.IsEmpty() ? TEXT("更新失败") : E.Message;
-			}
-			else if (E.Phase == UnrealGamePatcher::EUpdatePhase::Done)
-			{
-				bError = false;
-				Error = UnrealGamePatcher::EPatcherError::Ok;
-				StatusText = E.Message;
-			}
-			else if (!E.Message.IsEmpty())
-			{
-				StatusText = E.Message;
-			}
-		}
-
-		void SetStatus(const FString& Text)
-		{
-			FScopeLock Scope(&Lock);
-			StatusText = Text;
-		}
-
-		FString GetStatus() const
-		{
-			FScopeLock Scope(&Lock);
-			return StatusText;
-		}
-
-		FString GetPhaseName() const
-		{
-			FScopeLock Scope(&Lock);
-			return PhaseToString(Phase);
-		}
-
-		UnrealGamePatcher::EPatcherError GetError() const
-		{
-			FScopeLock Scope(&Lock);
-			return Error;
-		}
-
-		void GetProgress(int32& OutCurrent, int32& OutTotal) const
-		{
-			FScopeLock Scope(&Lock);
-			OutCurrent = Current;
-			OutTotal = Total;
-		}
+		Idle,
+		Updating,
+		Ready,
+		UpdateFailed,
+		Playing,
 	};
 
-	/** Runs the update off the UI thread; every stage/progress/error event from
-	 *  the orchestrator is forwarded to the shared UI state (the Slate tick
-	 *  reads it each frame). */
-	class FUpdateWorker : public FRunnable
+	class FUpdateWorker final : public FRunnable
 	{
 	public:
-		FUpdateWorker(
-			FPatcherUIState& InState,
-			const FString& InCdn,
-			const FString& InVersion,
-			const FString& InInstall)
-			: State(InState)
-			, Cdn(InCdn)
-			, Version(InVersion)
-			, Install(InInstall)
+		FUpdateWorker(const FString& InCdn, const FString& InVersion, const FString& InInstall)
+			: Cdn(InCdn), Version(InVersion), Install(InInstall)
 		{
 		}
 
-		virtual uint32 Run() override
+		uint32 Run() override
 		{
-			State.bRunning = true;
-			State.bDone = false;
-			State.bSuccess = false;
-			State.bError = false;
-			State.SetStatus(FString::Printf(TEXT("更新到 %s ..."), *Version));
-
-			UnrealGamePatcher::FUpdateStats Stats;
-			UnrealGamePatcher::FUpdateOptions Options;
-			Options.Events = [this](const UnrealGamePatcher::FUpdateEvent& E) { State.OnEvent(E); };
-			// -cdn is ONE base: an http(s):// URL fetches everything over HTTP,
-			// a local directory (bare path or file://...) is read from disk.
-			const bool bCdnIsHttp = Cdn.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase) ||
-				Cdn.StartsWith(TEXT("https://"), ESearchCase::IgnoreCase);
-			// Function scope on purpose: Options.Downloader stays in use by the
-			// orchestrator below - a block-scoped downloader here would dangle.
-			UnrealGamePatcher::FHttpChunkDownloader Downloader;
-			if (bCdnIsHttp)
+			FHttpChunkDownloader Downloader;
+			FUpdateOptions Options;
+			if (Cdn.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase) ||
+				Cdn.StartsWith(TEXT("https://"), ESearchCase::IgnoreCase))
 			{
-				FHttpModule::Get(); // force-load on the game thread (see downloadtest)
 				Options.Downloader = &Downloader;
 				Options.BaseUrl = Cdn;
 			}
-			const bool bOk = UnrealGamePatcher::FUpdateOrchestrator::UpdateWithOptions(Cdn, Version, Install, true, Options, Stats);
-
+			Options.Events = [this](const FUpdateEvent& Event)
 			{
-				FScopeLock Scope(&State.Lock);
-				State.Stats = Stats;
+				FScopeLock Scope(&Lock);
+				if (Event.bIsError || !Progress.bIsError)
+				{
+					Progress = Event;
+				}
+			};
+
+			FString TargetVersion = Version;
+			if (TargetVersion.IsEmpty() && !FUpdateOrchestrator::ResolveLatest(Cdn, Options, TargetVersion))
+			{
+				bFinished = true;
+				return 0;
 			}
-			State.bSuccess = bOk;
-			State.bDone = true;
-			State.bRunning = false;
-			State.bError = State.bError.load() || !bOk; // the Failed event already carried the detail
+
+			FUpdateStats Stats;
+			bSuccess = FUpdateOrchestrator::UpdateWithOptions(Cdn, TargetVersion, Install, true, Options, Stats);
+			bFinished = true;
 			return 0;
 		}
 
+		FUpdateEvent GetProgress() const
+		{
+			FScopeLock Scope(&Lock);
+			return Progress;
+		}
+
+		std::atomic<bool> bFinished{ false };
+		bool bSuccess = false;
+
 	private:
-		FPatcherUIState& State;
-		FString Cdn;
-		FString Version;
-		FString Install;
+		const FString& Cdn;
+		const FString& Version;
+		const FString& Install;
+		mutable FCriticalSection Lock;
+		FUpdateEvent Progress{ EUpdatePhase::None, EPatcherError::Ok, false, 0, 0,
+			TEXT("Checking content version...") };
 	};
+
+	FString FormatUpdateFailure(const FUpdateEvent& Event)
+	{
+		const EPatcherError Error = Event.Error == EPatcherError::Ok ? EPatcherError::Internal : Event.Error;
+		const TCHAR* Detail = Event.bIsError && !Event.Message.IsEmpty() ? *Event.Message : TEXT("The content update could not finish.");
+		return FString::Printf(TEXT("UGP-%04d\n%s"), static_cast<int32>(Error), Detail);
+	}
+
+#if PLATFORM_MAC
+	FString FindMacBundle(FString Path)
+	{
+		while (!Path.IsEmpty())
+		{
+			if (Path.EndsWith(TEXT(".app"), ESearchCase::IgnoreCase))
+			{
+				return Path;
+			}
+			Path = FPaths::GetPath(Path);
+		}
+		return FString();
+	}
+
+	bool MacBundleOverlapsInstall(const FString& Bundle, const FString& Install)
+	{
+		if (Bundle.IsEmpty())
+		{
+			return false;
+		}
+		const FString BundlePath = Bundle.ToLower();
+		const FString InstallPath = Install.ToLower();
+		return FPaths::IsUnderDirectory(InstallPath, BundlePath) || FPaths::IsUnderDirectory(BundlePath, InstallPath);
+	}
+#endif
 }
 
-int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine)
+int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine, const FString& LaunchArgs)
 {
-	// crank up a normal Slate application using the platform's standalone renderer
 	FSlateApplication::InitializeAsStandaloneApplication(GetStandardStandaloneRenderer());
 	FSlateApplication::InitHighDPI(true);
 	FSlateApplication& SlateApp = FSlateApplication::Get();
 
-	// Update parameters (same scheme as the CLI): -cdn= -version= -install=
-	// (-cdn is ONE base: http(s)://... or a local directory/file://...).
 	FString Cdn, Version, Install, LaunchPath;
 	FParse::Value(CommandLine, TEXT("-cdn="), Cdn);
 	FParse::Value(CommandLine, TEXT("-version="), Version);
 	FParse::Value(CommandLine, TEXT("-install="), Install);
 	FParse::Value(CommandLine, TEXT("-launch="), LaunchPath);
-	// Warm the HTTP module on the GAME thread no matter which path later uses
-	// it: FHttpModule::Get() asserts on first use off the game thread, and with
-	// -version= given the resolve block below is skipped - the first use would
-	// otherwise be the worker thread's downloader.
-	const bool bCdnIsHttp = Cdn.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase) ||
-		Cdn.StartsWith(TEXT("https://"), ESearchCase::IgnoreCase);
-	if (bCdnIsHttp)
+	const bool bAutoPlay = FParse::Param(CommandLine, TEXT("autoplay"));
+	if (!LaunchPath.IsEmpty())
 	{
+		LaunchPath = FPaths::ConvertRelativePathToFull(LaunchPath);
+	}
+	if (Cdn.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase) ||
+		Cdn.StartsWith(TEXT("https://"), ESearchCase::IgnoreCase))
+	{
+		// The HTTP module must first load on the game thread.
 		FHttpModule::Get();
 	}
-	if (Version.IsEmpty())
-	{
-		// No -version= lock: resolve from the CDN announcement
-		// (index/latest.json) when the CDN is given; fall back to the default.
-		UnrealGamePatcher::FUpdateOptions ResolveOptions;
-		UnrealGamePatcher::FHttpChunkDownloader ResolveDownloader;
-		if (bCdnIsHttp)
-		{
-			ResolveOptions.Downloader = &ResolveDownloader;
-			ResolveOptions.BaseUrl = Cdn;
-		}
-		if (Cdn.IsEmpty() || !UnrealGamePatcher::FUpdateOrchestrator::ResolveLatest(Cdn, ResolveOptions, Version))
-		{
-			Version = TEXT("1.0.0");
-		}
-	}
 
-	FPatcherUIState UIState;
-	FUpdateWorker* Worker = nullptr;
-	FRunnableThread* WorkerThread = nullptr;
-	const bool bAutoUpdate = FParse::Param(CommandLine, TEXT("autoupdate"));
+	ELauncherState State = ELauncherState::Idle;
+	FString ErrorText;
+	TUniquePtr<FUpdateWorker> Worker;
+	TUniquePtr<FRunnableThread> WorkerThread;
+	FProcHandle GameProcess;
+	bool bAutoPlaySucceeded = false;
+
+	const auto FailUpdate = [&](EPatcherError Code, const TCHAR* Message)
+	{
+		State = ELauncherState::UpdateFailed;
+		ErrorText = FormatUpdateFailure({ EUpdatePhase::Failed, Code, true, 0, 0, Message });
+		UE_LOG(LogUnrealGamePatcherGUI, Error, TEXT("%s"), *ErrorText);
+	};
+
+	const auto StartUpdate = [&]()
+	{
+		ErrorText.Reset();
+		if (Cdn.IsEmpty() || Install.IsEmpty())
+		{
+			FailUpdate(EPatcherError::InvalidConfiguration, TEXT("Specify the CDN and install directory with -cdn and -install."));
+			return;
+		}
+		if (bAutoPlay && LaunchPath.IsEmpty())
+		{
+			FailUpdate(EPatcherError::InvalidConfiguration, TEXT("Specify the game path with -launch when using -autoplay."));
+			return;
+		}
+#if PLATFORM_MAC
+		FString InstallPath, GamePath, GivenBundlePath;
+		const FString GivenBundle = FindMacBundle(LaunchPath);
+		if (!Paths::ResolveMacPath(Install, InstallPath) || (!LaunchPath.IsEmpty() && !Paths::ResolveMacPath(LaunchPath, GamePath)) ||
+			(!GivenBundle.IsEmpty() && !Paths::ResolveMacPath(GivenBundle, GivenBundlePath)))
+		{
+			FailUpdate(EPatcherError::InvalidConfiguration, TEXT("Could not resolve the install directory or game path."));
+			return;
+		}
+		if (!FindMacBundle(FPaths::ConvertRelativePathToFull(Install)).IsEmpty() || !FindMacBundle(InstallPath).IsEmpty() ||
+			MacBundleOverlapsInstall(FindMacBundle(GamePath), InstallPath) || MacBundleOverlapsInstall(GivenBundlePath, InstallPath))
+		{
+			FailUpdate(EPatcherError::InvalidConfiguration, TEXT("Choose an install directory separate from the game bundle."));
+			return;
+		}
+		Install = MoveTemp(InstallPath);
+		LaunchPath = MoveTemp(GamePath);
+#endif
+		Worker = MakeUnique<FUpdateWorker>(Cdn, Version, Install);
+		WorkerThread.Reset(FRunnableThread::Create(Worker.Get(), TEXT("UGP-GUIUpdate"), 0, TPri_Normal));
+		if (!WorkerThread)
+		{
+			Worker.Reset();
+			FailUpdate(EPatcherError::Internal, TEXT("Could not start the update worker."));
+			return;
+		}
+		State = ELauncherState::Updating;
+	};
+
+	const auto LaunchGame = [&]()
+	{
+		uint32 ProcessId = 0;
+		const FString WorkingDirectory = FPaths::GetPath(LaunchPath);
+		FString GameArgs = LaunchArgs;
+#if PLATFORM_MAC
+		GameArgs += FString::Printf(TEXT(" -ugpinstall=\"%s\""), *Install);
+#endif
+		GameProcess = FPlatformProcess::CreateProc(*LaunchPath, *GameArgs, true, false, false,
+			&ProcessId, 0, *WorkingDirectory, nullptr);
+		if (!GameProcess.IsValid())
+		{
+			ErrorText = FString::Printf(TEXT("Could not launch the game.\n%s"), *LaunchPath);
+			UE_LOG(LogUnrealGamePatcherGUI, Error, TEXT("Could not launch %s"), *LaunchPath);
+			return false;
+		}
+		ErrorText.Reset();
+		State = ELauncherState::Playing;
+		UE_LOG(LogUnrealGamePatcherGUI, Display, TEXT("Launched %s (PID %u)"), *LaunchPath, ProcessId);
+		return true;
+	};
 
 	TSharedRef<SWindow> Window = SNew(SWindow)
-		.Title(FText::Format(NSLOCTEXT("UnrealGamePatcher", "AppTitle", "UnrealGamePatcher {0}"), FText::FromString(UnrealGamePatcher::ProgramVersion)))
-		.ClientSize(FVector2D(640, 460))
+		.Title(FText::Format(NSLOCTEXT("UnrealGamePatcher", "AppTitle", "UnrealGamePatcher {0}"),
+			FText::FromString(UnrealGamePatcher::ProgramVersion)))
+		.ClientSize(FVector2D(540, 250))
 		.SupportsMaximize(false)
 		.SupportsMinimize(true);
+	Window->SetRequestDestroyWindowOverride(FRequestDestroyWindowOverride::CreateLambda([](const TSharedRef<SWindow>&)
+	{
+		RequestEngineExit(TEXT("Launcher window closed"));
+	}));
 
-	// UI reads the shared state every frame; the worker only writes it (via events).
 	Window->SetContent(
 		SNew(SVerticalBox)
 		+ SVerticalBox::Slot()
-			.Padding(16)
-			.AutoHeight()
+			.FillHeight(1)
+			.VAlign(VAlign_Center)
+			.Padding(24, 16)
 			[
-				SNew(STextBlock)
-					.Text(NSLOCTEXT("UnrealGamePatcher", "Header", "UnrealGamePatcher - 增量更新"))
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+							.AutoWrapText(true)
+							.Text_Lambda([&]()
+							{
+								if (!ErrorText.IsEmpty())
+								{
+									return FText::FromString(ErrorText);
+								}
+								switch (State)
+								{
+								case ELauncherState::Updating:
+									return FText::FromString(Worker->GetProgress().Message);
+								case ELauncherState::Ready:
+									return NSLOCTEXT("UnrealGamePatcher", "Ready", "Game content is up to date.");
+								case ELauncherState::Playing:
+									return NSLOCTEXT("UnrealGamePatcher", "Playing", "The game is running.");
+								default:
+									return NSLOCTEXT("UnrealGamePatcher", "Idle", "Check for game content updates.");
+								}
+							})
+					]
+				+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0, 12, 0, 0)
+					[
+						SNew(SProgressBar)
+							.Visibility_Lambda([&]()
+							{
+								return State == ELauncherState::Updating ? EVisibility::Visible : EVisibility::Collapsed;
+							})
+							.Percent_Lambda([&]() -> TOptional<float>
+							{
+								if (State == ELauncherState::Updating)
+								{
+									const FUpdateEvent Progress = Worker->GetProgress();
+									if (Progress.Phase == EUpdatePhase::Download && Progress.Total > 0)
+									{
+										return FMath::Clamp(float(Progress.Current) / Progress.Total, 0.0f, 1.0f);
+									}
+								}
+								return {};
+							})
+					]
 			]
 		+ SVerticalBox::Slot()
-			.Padding(16)
 			.AutoHeight()
-			[
-				SNew(STextBlock)
-					.Text_Lambda([&UIState]() { return FText::FromString(UIState.GetStatus()); })
-			]
-		+ SVerticalBox::Slot()
-			.Padding(16)
-			.AutoHeight()
-			[
-				SNew(SProgressBar)
-					.Percent_Lambda([&UIState]() -> TOptional<float>
-					{
-						int32 C = 0, T = 0;
-						UIState.GetProgress(C, T);
-						if (T > 0 && !UIState.bDone.load())
-						{
-							return (float)C / (float)T;
-						}
-						return UIState.bDone.load() && UIState.bSuccess.load() ? TOptional<float>(1.0f) : TOptional<float>();
-					})
-			]
-		+ SVerticalBox::Slot()
-			.Padding(16)
-			.AutoHeight()
-			[
-				SNew(STextBlock)
-					.Text_Lambda([&UIState]()
-					{
-						int32 C = 0, T = 0;
-						UIState.GetProgress(C, T);
-						return FText::FromString(FString::Printf(TEXT("阶段：%s  %d/%d"), *UIState.GetPhaseName(), C, T));
-					})
-			]
-		+ SVerticalBox::Slot()
-			.Padding(16)
-			.AutoHeight()
-			[
-				SNew(STextBlock)
-					.ColorAndOpacity(FLinearColor(1.0f, 0.35f, 0.35f))
-					.Text_Lambda([&UIState]()
-					{
-						if (!UIState.bError.load())
-						{
-							return FText::GetEmpty();
-						}
-						return FText::FromString(FString::Printf(TEXT("错误码 %d：%s"),
-							(int32)UIState.GetError(), *UIState.GetStatus()));
-					})
-			]
-		+ SVerticalBox::Slot()
-			.Padding(16)
-			.AutoHeight()
+			.HAlign(HAlign_Right)
+			.Padding(24, 0, 24, 24)
 			[
 				SNew(SHorizontalBox)
 				+ SHorizontalBox::Slot()
@@ -305,24 +308,19 @@ int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine)
 					.Padding(0, 0, 8, 0)
 					[
 						SNew(SButton)
-							.Text(NSLOCTEXT("UnrealGamePatcher", "UpdateBtn", "更新"))
-							.IsEnabled_Lambda([&UIState]() { return !UIState.bRunning.load(); })
-							.OnClicked_Lambda([&]() -> FReply
+							.Text_Lambda([&]()
 							{
-								if (UIState.bRunning.load())
-								{
-									return FReply::Handled();
-								}
-								if (WorkerThread)
-								{
-									WorkerThread->WaitForCompletion();
-									delete WorkerThread;
-									WorkerThread = nullptr;
-									delete Worker;
-									Worker = nullptr;
-								}
-								Worker = new FUpdateWorker(UIState, Cdn, Version, Install);
-								WorkerThread = FRunnableThread::Create(Worker, TEXT("UGP-GUIUpdate"), 0, TPri_Normal);
+								return State == ELauncherState::UpdateFailed
+									? NSLOCTEXT("UnrealGamePatcher", "Retry", "Retry")
+									: NSLOCTEXT("UnrealGamePatcher", "UpdateBtn", "Check for Updates");
+							})
+							.IsEnabled_Lambda([&]()
+							{
+								return !IsEngineExitRequested() && State != ELauncherState::Updating && State != ELauncherState::Playing;
+							})
+							.OnClicked_Lambda([&]()
+							{
+								StartUpdate();
 								return FReply::Handled();
 							})
 					]
@@ -331,17 +329,12 @@ int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine)
 					.Padding(0, 0, 8, 0)
 					[
 						SNew(SButton)
-							.Text(NSLOCTEXT("UnrealGamePatcher", "LaunchBtn", "启动游戏"))
-							.IsEnabled_Lambda([&UIState]()
+							.Visibility(LaunchPath.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible)
+							.Text(NSLOCTEXT("UnrealGamePatcher", "LaunchBtn", "Play"))
+							.IsEnabled_Lambda([&]() { return !IsEngineExitRequested() && State == ELauncherState::Ready; })
+							.OnClicked_Lambda([&]()
 							{
-								return UIState.bDone.load() && UIState.bSuccess.load();
-							})
-							.OnClicked_Lambda([&]() -> FReply
-							{
-								if (!LaunchPath.IsEmpty())
-								{
-									FPlatformProcess::CreateProc(*LaunchPath, nullptr, true, false, false, nullptr, 0, nullptr, nullptr);
-								}
+								LaunchGame();
 								return FReply::Handled();
 							})
 					]
@@ -349,8 +342,8 @@ int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine)
 					.AutoWidth()
 					[
 						SNew(SButton)
-							.Text(NSLOCTEXT("UnrealGamePatcher", "QuitBtn", "退出"))
-							.OnClicked_Lambda([]() -> FReply
+							.Text(NSLOCTEXT("UnrealGamePatcher", "QuitBtn", "Quit"))
+							.OnClicked_Lambda([]()
 							{
 								RequestEngineExit(TEXT("User clicked Quit"));
 								return FReply::Handled();
@@ -360,38 +353,59 @@ int32 RunUnrealGamePatcherGUI(const TCHAR* CommandLine)
 	);
 
 	SlateApp.AddWindow(Window);
-
-	if (bAutoUpdate)
+	if (bAutoPlay || FParse::Param(CommandLine, TEXT("autoupdate")))
 	{
-		Worker = new FUpdateWorker(UIState, Cdn, Version, Install);
-		WorkerThread = FRunnableThread::Create(Worker, TEXT("UGP-GUIUpdate"), 0, TPri_Normal);
+		StartUpdate();
 	}
 
-	// loop while the patcher does the rest
-	while (!IsEngineExitRequested())
+	while (!IsEngineExitRequested() || WorkerThread)
 	{
+		const double FrameStart = FPlatformTime::Seconds();
 		BeginExitIfRequested();
+		if (Worker && Worker->bFinished.load())
+		{
+			WorkerThread->WaitForCompletion();
+			WorkerThread.Reset();
+			State = Worker->bSuccess ? ELauncherState::Ready : ELauncherState::UpdateFailed;
+			if (!Worker->bSuccess)
+			{
+				ErrorText = FormatUpdateFailure(Worker->GetProgress());
+			}
+			Worker.Reset();
+			if (bAutoPlay && State == ELauncherState::Ready && !IsEngineExitRequested())
+			{
+				bAutoPlaySucceeded = LaunchGame();
+				RequestEngineExit(TEXT("Automatic game launch completed"));
+			}
+		}
+		if (GameProcess.IsValid() && !FPlatformProcess::IsProcRunning(GameProcess))
+		{
+			int32 ExitCode = 0;
+			if (FPlatformProcess::GetProcReturnCode(GameProcess, &ExitCode) && ExitCode != 0)
+			{
+				ErrorText = FString::Printf(TEXT("The game exited with code %d."), ExitCode);
+			}
+			FPlatformProcess::CloseProc(GameProcess);
+			State = ELauncherState::Ready;
+		}
+		if ((IsEngineExitRequested() && !WorkerThread) || (bAutoPlay && State == ELauncherState::UpdateFailed))
+		{
+			break;
+		}
 
 		FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
 		UE::Stats::FStats::AdvanceFrame(false);
-		FTSTicker::GetCoreTicker().Tick(FApp::GetDeltaTime());
+		FTSTicker::GetCoreTicker().Tick(SlateApp.GetDeltaTime());
 		SlateApp.PumpMessages();
 		SlateApp.Tick();
-
-		FPlatformProcess::Sleep(0.01f);
+		constexpr double FrameInterval = 1.0 / 30.0;
+		FPlatformProcess::Sleep(static_cast<float>(FMath::Max(0.0, FrameInterval - (FPlatformTime::Seconds() - FrameStart))));
 	}
 
-	if (WorkerThread)
+	if (GameProcess.IsValid())
 	{
-		WorkerThread->WaitForCompletion();
-		delete WorkerThread;
-		delete Worker;
+		FPlatformProcess::CloseProc(GameProcess);
 	}
-
 	FSlateApplication::Shutdown();
-	// Propagate the update result as the process exit code (the header
-	// documents this contract): launchers can branch on success. No worker =
-	// nothing attempted = success.
-	const bool bUpdateOk = !Worker || (UIState.bDone.load() && UIState.bSuccess.load());
-	return bUpdateOk ? 0 : 1;
+	return State == ELauncherState::UpdateFailed || (bAutoPlay && !bAutoPlaySucceeded) ? 1 : 0;
 }

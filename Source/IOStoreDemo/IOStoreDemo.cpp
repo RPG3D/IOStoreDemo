@@ -3,6 +3,18 @@
 #include "IOStoreDemo.h"
 #include "Modules/ModuleManager.h"
 
+#if PLATFORM_MAC && !WITH_EDITOR
+#include "Misc/CoreDelegates.h"
+
+extern void LockUGPMacContentBeforeMount();
+
+namespace
+{
+	const FDelegateHandle MacContentLockRegistration =
+		FCoreDelegates::GetPreMainInitDelegate().AddStatic(&LockUGPMacContentBeforeMount);
+}
+#endif
+
 #if PLATFORM_ANDROID
 extern bool (*GAndroidPreInitContent)();
 extern bool RunUGPAndroidBeforeEnginePreInit();

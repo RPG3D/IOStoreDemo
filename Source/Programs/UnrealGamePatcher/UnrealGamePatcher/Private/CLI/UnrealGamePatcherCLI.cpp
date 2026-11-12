@@ -606,6 +606,18 @@ namespace
 
 		if (Command == TEXT("compact"))
 		{
+#if PLATFORM_MAC
+			UnrealGamePatcher::Paths::FInstallLock InstallLock;
+			if (!InstallLock.Acquire(InstallDir))
+			{
+				UE_LOG(LogUnrealGamePatcher, Error, TEXT("[UGP-9001] compact: %s"), *InstallLock.GetMacFailureDetail());
+				return ExitFailure;
+			}
+			InstallDir = InstallLock.GetMacInstallDir();
+			const UnrealGamePatcher::Paths::FInstallLock* HeldInstallLock = &InstallLock;
+#else
+			const UnrealGamePatcher::Paths::FInstallLock* HeldInstallLock = nullptr;
+#endif
 			UnrealGamePatcher::FPatcherState State;
 			const FString StatePath = UnrealGamePatcher::Paths::GetStatePath(InstallDir);
 			if (!UnrealGamePatcher::FPatcherStateFile::Load(StatePath, State))
@@ -643,7 +655,7 @@ namespace
 			}
 
 			UnrealGamePatcher::FUpdateStats Stats;
-			const int32 Rebuilt = UnrealGamePatcher::FUpdateOrchestrator::Compact(CdnRoot, Version, InstallDir, Files, Stats);
+			const int32 Rebuilt = UnrealGamePatcher::FUpdateOrchestrator::Compact(CdnRoot, Version, InstallDir, Files, Stats, HeldInstallLock);
 			if (Rebuilt < 0)
 			{
 				return ExitFailure;

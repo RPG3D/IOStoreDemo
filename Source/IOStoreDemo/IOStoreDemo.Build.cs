@@ -17,5 +17,9 @@ public class IOStoreDemo : ModuleRules
 		{
 			PrivateDependencyModuleNames.AddRange(new[] { "UnrealGamePatcherCore", "UnrealGamePatcherDownload" });
 		}
+		else if (Target.Platform == UnrealTargetPlatform.Mac && !Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.Add("UnrealGamePatcherCore");
+		}
 	}
 }

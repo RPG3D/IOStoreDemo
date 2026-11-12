@@ -11,6 +11,8 @@
 
 namespace UnrealGamePatcher
 {
+	namespace Paths { struct FInstallLock; }
+
 	/** Optional transport configuration for the update flow (tasks 6.1-6.6).
 	 *  Defaults to local-directory mode: every resource is read straight from
 	 *  the local CDN root. Set Downloader + BaseUrl (the http(s):// CDN root)
@@ -168,13 +170,15 @@ namespace UnrealGamePatcher
 		 *  (task 5.4 `compact`): temp file + whole-file hash verify + atomic
 		 *  swap, reclaiming any dead weight (recorded holes) in the on-disk
 		 *  files. Returns the number of files rebuilt, or -1 on any failure
-		 *  (nothing is written for the failing file). */
+		 *  (nothing is written for the failing file). A Mac caller that already
+		 *  holds the writer lock may pass it to cover its sidecar handling. */
 		UNREALGAMEPATCHERCORE_API static int32 Compact(
 			const FString& CdnDir,
 			const FString& Version,
 			const FString& InstallDir,
 			const TArray<FString>& FileIds,
-			FUpdateStats& OutStats);
+			FUpdateStats& OutStats,
+			const Paths::FInstallLock* HeldInstallLock = nullptr);
 
 		/** TEST-ONLY failure injection (task 5.2 verification): when > 0,
 		 *  the apply fails after that many successful target writes, forcing
