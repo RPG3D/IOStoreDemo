@@ -468,7 +468,7 @@ namespace UnrealGamePatcher
 		}
 	}
 
-	bool FUpdateOrchestrator::ReadCommittedVersion(const FString& InstallDir, FString& OutVersion)
+	bool FUpdateOrchestrator::ReadCommittedVersion(const FString& InstallDir, FString& OutVersion, FIndexManifest* OutIndex)
 	{
 		IPlatformFile& File = FPlatformFileManager::Get().GetPlatformFile();
 		FPatcherState State;
@@ -501,6 +501,10 @@ namespace UnrealGamePatcher
 		if (bHasPak)
 		{
 			OutVersion = Index.ContentVersion;
+			if (OutIndex)
+			{
+				*OutIndex = MoveTemp(Index);
+			}
 		}
 		return bHasPak;
 	}

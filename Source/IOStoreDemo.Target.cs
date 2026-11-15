@@ -15,7 +15,7 @@ public class IOStoreDemoTarget : TargetRules
 
 		bCompileIoStoreOnDemand = true;
 
-		// Mobile packages download their game containers into ProjectSavedDir/Paks.
+		// Mobile packages download their game containers before UE mounts them.
 		// Enable the Pak platform file even when the app ships without containers.
 		GlobalDefinitions.Add("UE_FORCE_USE_PAKS=1");
 

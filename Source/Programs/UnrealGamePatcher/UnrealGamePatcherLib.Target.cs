@@ -20,13 +20,15 @@ public class UnrealGamePatcherLibTarget : TargetRules
 
 		// Same capability set as the standalone patcher: engine Core only,
 		// no Engine module, no Slate/UI. The JNI bootstrap drives the engine
-		// loop explicitly. Java ends the dedicated process after handoff.
+		// loop explicitly. Java hands off to the separate game process.
 		bCompileAgainstEngine = false;
 		bCompileAgainstCoreUObject = true;
 		bCompileAgainstApplicationCore = true;
 		bBuildWithEditorOnlyData = false;
 		// The updater runs before any cooked data is installed.
 		bCompileICU = false;
+		// Override UBT's default Android game library SONAME.
+		AdditionalLinkerArguments = " -Wl,-soname,libugp.so";
 
 		bBuildDeveloperTools = false;
 		bUseLoggingInShipping = true;

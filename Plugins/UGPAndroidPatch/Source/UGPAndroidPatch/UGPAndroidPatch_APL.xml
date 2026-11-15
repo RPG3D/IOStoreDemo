@@ -3,6 +3,39 @@
 	<androidManifestUpdates>
 		<!-- The local QA CDN is accessed through adb reverse. -->
 		<addAttribute tag="application" name="android:usesCleartextTraffic" value="true"/>
+		<loopElements tag="activity">
+			<setStringFromAttribute result="UGPActivityName" tag="$" name="android:name"/>
+			<setBoolIsEqual result="UGPGameActivity" arg1="$S(UGPActivityName)" arg2="com.epicgames.unreal.GameActivity"/>
+			<setBoolIsEqual result="UGPSplashActivity" arg1="$S(UGPActivityName)" arg2="com.epicgames.unreal.SplashActivity"/>
+			<if condition="UGPSplashActivity"><true><removeElement tag="$"/></true></if>
+			<if condition="UGPGameActivity">
+				<true>
+					<addAttribute tag="$" name="android:exported" value="false"/>
+					<loopElements tag="intent-filter">
+						<loopElements tag="category">
+							<setStringFromAttribute result="UGPCategory" tag="$" name="android:name"/>
+							<setBoolIsEqual result="UGPIsLauncher" arg1="$S(UGPCategory)" arg2="android.intent.category.LAUNCHER"/>
+							<if condition="UGPIsLauncher"><true><removeElement tag="$"/></true></if>
+						</loopElements>
+					</loopElements>
+				</true>
+			</if>
+		</loopElements>
+		<addElements tag="application">
+			<meta-data android:name="com.epicgames.unreal.patch.CdnUrl" android:value="http://127.0.0.1:18080"/>
+			<activity android:name="com.epicgames.unreal.patch.PatchActivity"
+				android:label="@string/app_name"
+				android:exported="true"
+				android:launchMode="singleTask"
+				android:taskAffinity="${applicationId}.ugppatch"
+				android:excludeFromRecents="true"
+				android:process=":ugppatch">
+				<intent-filter>
+					<action android:name="android.intent.action.MAIN"/>
+					<category android:name="android.intent.category.LAUNCHER"/>
+				</intent-filter>
+			</activity>
+		</addElements>
 		<loopElements tag="meta-data">
 			<setStringFromAttribute result="UGPMetadataName" tag="$" name="android:name"/>
 			<setBoolIsEqual result="UGPInsideApk" arg1="$S(UGPMetadataName)" arg2="com.epicgames.unreal.GameActivity.bPackageDataInsideApk"/>
@@ -15,8 +48,18 @@
 			</if>
 		</loopElements>
 	</androidManifestUpdates>
+	<resourceCopies>
+		<copyFile src="$S(AbsPluginDir)/libs/$S(Architecture)/libugp.so" dst="$S(BuildDir)/libs/$S(Architecture)/libugp.so"/>
+		<copyFile src="$S(ProjectDir)/IOStoreDemo.uproject" dst="$S(BuildDir)/assets/UGPProject.uproject"/>
+	</resourceCopies>
+	<gameActivityOnCreateBeforeProcessSystemInfoAdditions>
+		<insert>if (!com.epicgames.unreal.patch.UGPStartupGate.enterGame(this)) return;</insert>
+		<insertNewline/>
+	</gameActivityOnCreateBeforeProcessSystemInfoAdditions>
 	<proguardAdditions>
-		<insert>-keep class com.epicgames.unreal.patch.UGPStartupView { *; }</insert>
+		<insert>-keep class com.epicgames.unreal.patch.PatchActivity { *; }</insert>
+		<insertNewline/>
+		<insert>-keep class com.epicgames.unreal.patch.PatchActivity$OnUpdateEventListener { *; }</insert>
 		<insertNewline/>
 	</proguardAdditions>
 
@@ -31,9 +74,20 @@ tasks.named('preBuild').configure {
         if (useAppFiles.'@android:value'.text() != 'true') {
             throw new GradleException('UGP requires app-specific files storage. Package with UAT and bUseExternalFilesDir=True.')
         }
+        def ugpLibraries = fileTree('src/main/libs') { include '**/libugp.so' }.files
+        fileTree('src/main/jniLibs') { include '**/libUnreal.so' }.files.each { unreal ->
+            if (!ugpLibraries.any { it.parentFile.name == unreal.parentFile.name && it.length() > 0 }) {
+                throw new GradleException("Missing libugp.so for ${unreal.parentFile.name}. Build UnrealGamePatcherLib and copy it into the plugin libs directory.")
+            }
+        }
         // UAT keeps the cooked OBB for staging and publication. The APK
         // only needs its bootstrap assets and the game libraries.
         delete fileTree('src/main/assets') { include '*.obb.png' }
+        ['UGPProject.uproject', 'UECommandLine.txt'].each { asset ->
+            if (!file("src/main/assets/${asset}").isFile()) {
+                throw new GradleException("Missing UGP bootstrap asset ${asset}. Package a staged game with UAT.")
+            }
+        }
     }
 }
 		]]></insert>

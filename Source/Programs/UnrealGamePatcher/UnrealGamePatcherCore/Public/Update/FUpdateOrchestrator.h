@@ -115,8 +115,10 @@ namespace UnrealGamePatcher
 	struct FUpdateOrchestrator
 	{
 		/** Checks the committed sidecar and index, file presence, and each Pak
-		 *  footer before allowing the game to continue. */
-		UNREALGAMEPATCHERCORE_API static bool ReadCommittedVersion(const FString& InstallDir, FString& OutVersion);
+		 *  footer before allowing the game to continue. On success, callers
+		 *  can reuse the checked index for additional format validation. */
+		UNREALGAMEPATCHERCORE_API static bool ReadCommittedVersion(const FString& InstallDir, FString& OutVersion,
+			FIndexManifest* OutIndex = nullptr);
 
 		/** Runs the full update. CdnDir is ONE CDN base - an HTTP(S) URL
 		 *  (everything, including the version index, is fetched over HTTP via

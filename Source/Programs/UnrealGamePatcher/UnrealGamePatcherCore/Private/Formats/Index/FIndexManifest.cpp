@@ -247,7 +247,8 @@ namespace UnrealGamePatcher
 			}
 			for (const auto& Pair : FilesObj->Values)
 			{
-				if (!IsContentPath(Pair.Key))
+				FString FilePath(Pair.Key);
+				if (!IsContentPath(FilePath))
 				{
 					UE_LOG(LogUnrealGamePatcher, Error, TEXT("FIndexManifest: invalid file path '%s'"), *Pair.Key);
 					return false;
@@ -365,7 +366,7 @@ namespace UnrealGamePatcher
 						E.IoStoreChunks.Add(IC);
 					}
 				}
-				OutManifest.Files.Add(FString(Pair.Key), E);
+				OutManifest.Files.Add(MoveTemp(FilePath), E);
 			}
 		}
 

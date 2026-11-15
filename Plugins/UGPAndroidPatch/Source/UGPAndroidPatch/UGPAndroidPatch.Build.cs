@@ -1,6 +1,6 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-// Registers the packaging rules for the in-process startup updater.
+// Registers the packaging rules for PatchActivity and libugp.
 //
 // UBT 不会自动发现 APL 文件：必须像引擎的 AndroidPermission 插件那样，在
 // Build.cs 里把 APL 登记进 target receipt（AndroidPlugin 属性），

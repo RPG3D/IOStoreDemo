@@ -115,8 +115,8 @@ namespace UnrealGamePatcher
 					}
 					// Semantic validation happens in the caller (sync checks /
 					// async callback) - delivery is unconditional, exactly once.
-					UE_LOG(LogUnrealGamePatcherDownload, Verbose, TEXT("FHttpRangeRequest: '%s' settled (ok=%d, status=%d, tooLarge=%d, %d bytes)"),
-						*Url, Res->bOk ? 1 : 0, Res->Status, Res->bTooLarge ? 1 : 0, Res->Content.Num());
+					UE_LOG(LogUnrealGamePatcherDownload, Verbose, TEXT("FHttpRangeRequest: '%s' settled (ok=%d, status=%d, tooLarge=%d, %lld bytes)"),
+						*Url, Res->bOk ? 1 : 0, Res->Status, Res->bTooLarge ? 1 : 0, static_cast<int64>(Res->Content.Num()));
 					Res->DeliverOnce();
 				});
 			// The HTTP manager runs its own I/O thread; dispatch the completion
@@ -161,7 +161,7 @@ namespace UnrealGamePatcher
 			}
 			if (Size >= 0 && Res.Content.Num() != Size)
 			{
-				return FString::Printf(TEXT("returned %d bytes, expected %lld"), Res.Content.Num(), Size);
+				return FString::Printf(TEXT("returned %lld bytes, expected %lld"), static_cast<int64>(Res.Content.Num()), Size);
 			}
 			if (Res.Content.Num() == 0)
 			{

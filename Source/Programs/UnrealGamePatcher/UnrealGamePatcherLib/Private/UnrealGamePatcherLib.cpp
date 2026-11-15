@@ -4,21 +4,26 @@
 //
 // Lifecycle (docs/android-port-feasibility-2026-11-02.md §2.3):
 //   PatchActivity (own ":ugppatch" process) -> System.loadLibrary("ugp")
-//   -> nativeRunPatch(...): engine-lite init (JNI env + PreInit with -NoPak,
+//   -> nativeRunPatchV2(...): engine-lite init (JNI env + PreInit with -NoPak,
 //   no window, no pak mount) -> FUpdateOrchestrator::UpdateWithOptions
 //   (progress via FUpdateOptions::Events -> JNI callback).
-//   Java records readiness and finishes the process. GameActivity boots the real engine, which
-//   mounts the freshly patched containers in the Android staged tree.
+//   Java records readiness and starts GameActivity. Unreal mounts the
+//   freshly patched containers from Content/Paks.
 //
 // The whole patch runs ON the calling (Java) thread: Java spawns the worker
 // thread, so JNI callbacks need no extra attach and no engine threading
 // beyond the task-tag scope.
 
 #include "RequiredProgramMainCPPInclude.h"
+#include "Algo/AllOf.h"
 #include "HAL/PlatformFileManager.h"
+#include "Formats/Index/FIndexManifest.h"
+#include "Formats/IoStore/FIoStoreReader.h"
+#include "Misc/AES.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
+#include "State/FPatcherState.h"
 #include "UnrealGamePatcherLog.h"
 #include "UnrealGamePatcherPaths.h"
 #include "Update/FUpdateOrchestrator.h"
@@ -119,10 +124,186 @@ namespace
 		return false;
 	}
 
-	bool RunContentUpdate(const FString& Cdn, const FString& InstallDir, const FString& InternalDir,
+	bool DiscardDirectory(IPlatformFile& File, const FString& Path)
+	{
+		return !File.DirectoryExists(*Path) || File.DeleteDirectoryRecursively(*Path);
+	}
+
+	bool MapPakIndex(UnrealGamePatcher::FIndexManifest& Index, const FString& Prefix, bool bAllowFlat)
+	{
+		using namespace UnrealGamePatcher;
+		TMap<FString, FIndexFileEntry> Containers;
+		bool bHasPak = false;
+		for (auto& Entry : Index.Files)
+		{
+			const FString Name = FPaths::GetCleanFilename(Entry.Key);
+			const FString Extension = FPaths::GetExtension(Name);
+			if (Extension != TEXT("pak") && Extension != TEXT("ucas") && Extension != TEXT("utoc") && Extension != TEXT("sig"))
+			{
+				continue;
+			}
+			if (Entry.Key != Prefix + Name && (!bAllowFlat || Entry.Key != Name))
+			{
+				continue;
+			}
+			if (Containers.Contains(Name))
+			{
+				return false;
+			}
+			bHasPak |= Extension == TEXT("pak");
+			Containers.Add(Name, MoveTemp(Entry.Value));
+		}
+		if (!bHasPak || !Containers.Contains(TEXT("global.utoc")) || !Containers.Contains(TEXT("global.ucas")))
+		{
+			return false;
+		}
+		Index.Files = MoveTemp(Containers);
+		return true;
+	}
+
+	bool ReadReadyVersion(const FString& Dir, FString& Version, const FString& Prefix = FString())
+	{
+		using namespace UnrealGamePatcher;
+		FIndexManifest Index;
+		FString ContentVersion;
+		if (!FUpdateOrchestrator::ReadCommittedVersion(Dir, ContentVersion, &Index) ||
+			!Index.Files.Contains(Prefix + TEXT("global.utoc")))
+		{
+			return false;
+		}
+
+		IPlatformFile& File = FPlatformFileManager::Get().GetPlatformFile();
+		for (const auto& Entry : Index.Files)
+		{
+			const FString& TocName = Entry.Key;
+			if (!TocName.EndsWith(TEXT(".utoc"), ESearchCase::IgnoreCase) ||
+				(!Prefix.IsEmpty() && !TocName.StartsWith(Prefix, ESearchCase::CaseSensitive)))
+			{
+				continue;
+			}
+
+			const FString DataName = FPaths::ChangeExtension(TocName, TEXT("ucas"));
+			const FString DataPath = Dir / DataName;
+			FIoStoreReader Reader;
+			if (!Index.Files.Contains(DataName) || !Reader.Open(Dir / TocName, DataPath))
+			{
+				UE_LOG(LogUnrealGamePatcher, Warning, TEXT("UGP Android: invalid IoStore container '%s' in '%s'"), *TocName, *Dir);
+				return false;
+			}
+
+			const int64 DataSize = File.FileSize(*DataPath);
+			const bool bBlocksFit = DataSize > 0 && Algo::AllOf(Reader.GetBlocks(), [DataSize](const FIoStoreBlock& Block)
+			{
+				return Block.FileOffset >= 0 && Block.FileOffset <= DataSize &&
+					Block.CompressedSize > 0 &&
+					Align(static_cast<int64>(Block.CompressedSize), FAES::AESBlockSize) <= DataSize - Block.FileOffset;
+			});
+			if (!bBlocksFit)
+			{
+				UE_LOG(LogUnrealGamePatcher, Warning, TEXT("UGP Android: IoStore block extends beyond '%s'"), *DataPath);
+				return false;
+			}
+		}
+		Version = MoveTemp(ContentVersion);
+		return true;
+	}
+
+	bool RestorePreviousContent(IPlatformFile& File, const FString& InstallDir)
+	{
+		const FString Previous = InstallDir + TEXT(".ugp-previous");
+		FString Version;
+		if (ReadReadyVersion(InstallDir, Version) || !ReadReadyVersion(Previous, Version))
+		{
+			return true;
+		}
+
+		const FString Candidate = InstallDir + TEXT(".ugp-update");
+		return DiscardDirectory(File, Candidate) &&
+			(!File.DirectoryExists(*InstallDir) || RenameDirectory(InstallDir, Candidate)) &&
+			RenameDirectory(Previous, InstallDir);
+	}
+
+	bool MigrateContent(IPlatformFile& File, const FString& StageRoot, const FString& Prefix,
+		const FString& SavedPaks, const FString& InstallDir)
+	{
+		using namespace UnrealGamePatcher;
+		FString Version;
+		if (!ReadReadyVersion(InstallDir, Version))
+		{
+			FString Source;
+			FString SourcePrefix;
+			for (const FString& Saved : {SavedPaks, SavedPaks + TEXT(".ugp-previous")})
+			{
+				if (ReadReadyVersion(Saved, Version))
+				{
+					Source = Saved;
+					break;
+				}
+			}
+			if (Source.IsEmpty() && ReadReadyVersion(StageRoot, Version, Prefix))
+			{
+				Source = StageRoot;
+				SourcePrefix = Prefix;
+			}
+			if (!Source.IsEmpty())
+			{
+				const FString Candidate = InstallDir + TEXT(".ugp-migrate");
+				FIndexManifest Index;
+				FPatcherState State;
+				if (!FIndexManifestFile::Load(Source / TEXT(".ugp/index.json"), Index) ||
+					!MapPakIndex(Index, SourcePrefix, SourcePrefix.IsEmpty()) ||
+					!FPatcherStateFile::Load(Paths::GetStatePath(Source), State) ||
+					!DiscardDirectory(File, Candidate) || !File.CreateDirectoryTree(*(Candidate / TEXT(".ugp"))))
+				{
+					return false;
+				}
+				ON_SCOPE_EXIT { DiscardDirectory(File, Candidate); };
+				for (const auto& Entry : Index.Files)
+				{
+					if (!File.CopyFile(*(Candidate / Entry.Key), *(Source / (SourcePrefix + Entry.Key))))
+					{
+						return false;
+					}
+				}
+				State.Holes.RemoveAll([&](FHole& Hole)
+				{
+					return (!SourcePrefix.IsEmpty() && !Hole.File.RemoveFromStart(SourcePrefix)) ||
+						!Index.Files.Contains(Hole.File);
+				});
+				State.Transaction.Targets.Reset();
+				if (!FPatcherStateFile::Save(Paths::GetStatePath(Candidate), State) ||
+					!FIndexManifestFile::Save(Candidate / TEXT(".ugp/index.json"), Index) ||
+					!ReadReadyVersion(Candidate, Version))
+				{
+					return false;
+				}
+				// An earlier staged installation can already have files at the
+				// destination. Keep its bytes until the new layout is published.
+				const FString Previous = InstallDir + TEXT(".ugp-previous");
+				if (!DiscardDirectory(File, Previous) ||
+					(File.DirectoryExists(*InstallDir) && !RenameDirectory(InstallDir, Previous)) ||
+					!RenameDirectory(Candidate, InstallDir))
+				{
+					if (!File.DirectoryExists(*InstallDir) && File.DirectoryExists(*Previous))
+					{
+						RenameDirectory(Previous, InstallDir);
+					}
+					return false;
+				}
+				UE_LOG(LogUnrealGamePatcher, Display, TEXT("UGP Android: migrated %s from %s to %s"), *Version, *Source, *InstallDir);
+			}
+		}
+		return true;
+	}
+
+	bool RunContentUpdate(const FString& Cdn, const FString& StageRoot, const FString& InternalDir,
 		const FJavaEventSink& Sink)
 	{
 		using namespace UnrealGamePatcher;
+		const FString ProjectName = FPaths::GetCleanFilename(StageRoot);
+		const FString Prefix = ProjectName + TEXT("/Content/Paks/");
+		const FString InstallDir = StageRoot / Prefix.LeftChop(1);
+		const FString SavedPaks = StageRoot / ProjectName / TEXT("Saved/Paks");
 
 		const auto Fail = [&Sink](EPatcherError Error, const TCHAR* Message)
 		{
@@ -138,29 +319,35 @@ namespace
 		}
 
 		IPlatformFile& File = FPlatformFileManager::Get().GetPlatformFile();
-		const FString StagedDir = InstallDir + TEXT(".ugp-update");
-		const FString PreviousDir = InstallDir + TEXT(".ugp-previous");
-		// If the process died between the two directory renames, restore
-		// the old root before resolving a CDN version or starting the game.
-		if (File.DirectoryExists(*PreviousDir) && !File.DirectoryExists(*InstallDir) &&
-			!RenameDirectory(PreviousDir, InstallDir))
+		// Recover a historical staged-tree publish before making directories
+		// in the old root. Its Saved directory may hold the player's saves.
+		const FString PreviousStage = StageRoot + TEXT(".ugp-previous");
+		if (!File.DirectoryExists(*StageRoot) && File.DirectoryExists(*PreviousStage) &&
+			!RenameDirectory(PreviousStage, StageRoot))
+		{
+			return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous staged installation."));
+		}
+		if (!RestorePreviousContent(File, InstallDir))
 		{
 			return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous game content."));
 		}
-		FString LocalVersion;
-		bool bInstalled = FUpdateOrchestrator::ReadCommittedVersion(InstallDir, LocalVersion);
-		if (File.DirectoryExists(*PreviousDir) && !bInstalled)
+		if (!MigrateContent(File, StageRoot, Prefix, SavedPaks, InstallDir))
 		{
-			FString PreviousVersion;
-			if (!FUpdateOrchestrator::ReadCommittedVersion(PreviousDir, PreviousVersion) ||
-				(File.DirectoryExists(*StagedDir) && !File.DeleteDirectoryRecursively(*StagedDir)) ||
-				!RenameDirectory(InstallDir, StagedDir) || !RenameDirectory(PreviousDir, InstallDir))
-			{
-				return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous game content."));
-			}
-			LocalVersion = MoveTemp(PreviousVersion);
-			bInstalled = true;
+			return Fail(EPatcherError::LegacyMigrationFailed, TEXT("Could not migrate the previous game content."));
 		}
+		const auto ReadyToLaunch = [&]() -> bool
+		{
+			if (File.DirectoryExists(*SavedPaks) && !RenameDirectory(SavedPaks,
+				SavedPaks + TEXT(".ugp-legacy-") + FGuid::NewGuid().ToString()))
+			{
+				return Fail(EPatcherError::LegacyMigrationFailed, TEXT("Could not retire the old Saved/Paks directory."));
+			}
+			return true;
+		};
+		const FString StagedDir = InstallDir + TEXT(".ugp-update");
+		const FString PreviousDir = InstallDir + TEXT(".ugp-previous");
+		FString LocalVersion;
+		const bool bInstalled = ReadReadyVersion(InstallDir, LocalVersion);
 
 		const bool bStagingAvailable =
 			(!File.DirectoryExists(*StagedDir) || File.DeleteDirectoryRecursively(*StagedDir)) &&
@@ -174,7 +361,7 @@ namespace
 		Options.ChunkCacheDir = InstallDir + TEXT(".ugp-cache");
 		Options.InstallLockRootDir = InternalDir;
 		Options.bForceVerify = !bInstalled;
-		Options.bPreserveUntrackedFiles = true;
+		Options.PrepareManifest = [&Prefix](FIndexManifest& Index) { return MapPakIndex(Index, Prefix, true); };
 		EPatcherError LastError = EPatcherError::Internal;
 		Options.Events = [&Sink, &LastError](const FUpdateEvent& Event)
 		{
@@ -184,11 +371,11 @@ namespace
 			}
 			Sink(Event);
 		};
-		const auto UseOldVersion = [&LocalVersion](EPatcherError Error)
+		const auto UseOldVersion = [&](EPatcherError Error)
 		{
 			UE_LOG(LogUnrealGamePatcher, Warning, TEXT("UGP Android: [UGP-%04d] using committed content %s"),
 				static_cast<int32>(Error), *LocalVersion);
-			return true;
+			return ReadyToLaunch();
 		};
 		FString Version;
 		if (!FUpdateOrchestrator::ResolveLatest(Cdn, Options, Version))
@@ -197,7 +384,7 @@ namespace
 		}
 		if (bInstalled && LocalVersion == Version)
 		{
-			return true;
+			return ReadyToLaunch();
 		}
 
 		const auto Apply = [&](const FString& TargetDir)
@@ -209,49 +396,46 @@ namespace
 				return false;
 			}
 			FString InstalledVersion;
-			if (!FUpdateOrchestrator::ReadCommittedVersion(TargetDir, InstalledVersion) || InstalledVersion != Version)
+			if (!ReadReadyVersion(TargetDir, InstalledVersion) || InstalledVersion != Version)
 			{
 				LastError = EPatcherError::InstalledContentInvalid;
 				return Fail(LastError, TEXT("The installed content is missing a mountable Pak or has an invalid version."));
 			}
 			return true;
 		};
-		if (!bInstalled)
-		{
-			// Legacy pending transactions store absolute paths, so only
-			// recover them in their original directory, with the CDN online.
-			return Apply(InstallDir);
-		}
 		if (!bStagingAvailable)
 		{
-			return UseOldVersion(EPatcherError::StagingCleanupFailed);
+			return bInstalled ? UseOldVersion(EPatcherError::StagingCleanupFailed) :
+				Fail(EPatcherError::StagingCleanupFailed, TEXT("Could not clear the update directory."));
 		}
 
 		ON_SCOPE_EXIT { File.DeleteDirectoryRecursively(*StagedDir); };
 		Sink({ EUpdatePhase::Diff, EPatcherError::Ok, false, 0, 0, TEXT("Preparing installed content...") });
-		if (!File.CopyDirectoryTree(*StagedDir, *InstallDir, false))
+		if (bInstalled && !File.CopyDirectoryTree(*StagedDir, *InstallDir, false))
 		{
 			return UseOldVersion(EPatcherError::StagingSnapshotFailed);
 		}
 		if (!Apply(StagedDir))
 		{
-			return UseOldVersion(LastError);
+			return bInstalled && UseOldVersion(LastError);
 		}
-		if (!RenameDirectory(InstallDir, PreviousDir))
+		if (File.DirectoryExists(*InstallDir) && !RenameDirectory(InstallDir, PreviousDir))
 		{
-			return UseOldVersion(EPatcherError::ActivateContentFailed);
+			return bInstalled ? UseOldVersion(EPatcherError::ActivateContentFailed) :
+				Fail(EPatcherError::ActivateContentFailed, TEXT("Could not activate updated game content."));
 		}
 		if (!RenameDirectory(StagedDir, InstallDir))
 		{
-			if (!RenameDirectory(PreviousDir, InstallDir))
+			if (File.DirectoryExists(*PreviousDir) && !RenameDirectory(PreviousDir, InstallDir))
 			{
 				return Fail(EPatcherError::RollbackFailed, TEXT("Could not restore the previous game content."));
 			}
-			return UseOldVersion(EPatcherError::ActivateContentFailed);
+			return bInstalled ? UseOldVersion(EPatcherError::ActivateContentFailed) :
+				Fail(EPatcherError::ActivateContentFailed, TEXT("Could not activate updated game content."));
 		}
 		File.DeleteDirectoryRecursively(*PreviousDir);
 		UE_LOG(LogUnrealGamePatcher, Display, TEXT("UGP Android: activated content %s in %s"), *Version, *InstallDir);
-		return true;
+		return ReadyToLaunch();
 	}
 
 	jboolean RunPatch(JNIEnv* Env, jstring JCmdline, jstring JCdn,
@@ -313,8 +497,7 @@ namespace
 		}
 		const bool bOk = RunContentUpdate(Cdn, InstallDir, InternalDir, Sink);
 		GLog->Flush();
-		// Keep the updater initialized until Java records readiness and ends
-		// this process, so failure to record readiness can still be retried.
+		// Keep the updater initialized for a retry if Java cannot record readiness.
 		return bOk ? JNI_TRUE : JNI_FALSE;
 	}
 }

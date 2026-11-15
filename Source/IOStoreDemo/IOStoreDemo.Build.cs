@@ -13,11 +13,7 @@ public class IOStoreDemo : ModuleRules
 			"IoStoreOnDemandCore",
 		});
 
-		if (Target.Platform == UnrealTargetPlatform.Android)
-		{
-			PrivateDependencyModuleNames.AddRange(new[] { "UnrealGamePatcherCore", "UnrealGamePatcherDownload" });
-		}
-		else if (Target.Platform == UnrealTargetPlatform.Mac && !Target.bBuildEditor)
+		if (Target.Platform == UnrealTargetPlatform.Mac && !Target.bBuildEditor)
 		{
 			PrivateDependencyModuleNames.Add("UnrealGamePatcherCore");
 		}

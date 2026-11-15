@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"FriendlyName": "UGP Android Patch",
-	"Description": "Android packaging configuration for the in-process UGP startup updater.",
+	"Description": "Packages the independent UGP updater and its pre-game Android launcher.",
 	"VersionName": "1.0",
 	"Version": 1,
 	"CanContainContent": false,

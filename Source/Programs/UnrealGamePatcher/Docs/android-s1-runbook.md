@@ -1,6 +1,41 @@
 # S1 真机全链 runbook（2026-11-02）
 
-## Android 同进程启动更新器（2026-11-12）
+## 当前方案：独立 PatchActivity + 原版 UE
+
+桌面入口由 UPL 指向 `PatchActivity`。更新器在 `:ugppatch` 进程只加载
+`libugp.so`，提交内容或确认可用旧版后才交接给 `GameActivity`。
+UPL 在加载游戏库前注入启动门控。最近任务恢复若没有一次有效交接，
+会回到更新器。两个进程通过应用内部存储上的同一把锁协调。
+
+容器落在原版 UE 的 `ProjectContentDir()/Paks`，物理目录为
+`<AppFiles>/UnrealGame/<Project>/<Project>/Content/Paks`。
+Development 使用 `getExternalFilesDir(null)`，Shipping 使用 `getFilesDir()`。
+发布端可用标准 Android stage 根目录，或单独的容器目录，二者均需包含
+`global.utoc` 和 `global.ucas`。UGP 只发布 Pak 目录，存档仍在原 Saved 目录。
+已有 `Saved/Paks` 的有效安装会复制到新布局，校验后将旧 Pak 目录改名。
+启动前校验已提交索引中的每个 IoStore TOC，并确认它引用的数据块落在
+对应 UCAS 的实际文件范围内。活动容器损坏时先尝试恢复有效的上一版本。
+
+构建同一配置及 ABI 的独立库，并复制到 Android 插件，再走 UAT：
+
+```powershell
+$ue = 'D:/Code/UE5/Engine'
+& "$ue/Build/BatchFiles/Build.bat" UnrealGamePatcherLib Android Development "-Project=$PWD/IOStoreDemo.uproject" -architecture=arm64 -SkipDeploy -WaitMutex
+$libs = 'Plugins/UGPAndroidPatch/Source/UGPAndroidPatch/libs/arm64-v8a'
+New-Item -ItemType Directory -Path $libs -Force | Out-Null
+Copy-Item Binaries/Android/UnrealGamePatcherLib-arm64.so "$libs/libugp.so"
+& "$ue/Build/BatchFiles/RunUAT.bat" BuildCookRun "-project=$PWD/IOStoreDemo.uproject" -noP4 -platform=Android -clientconfig=Development -architecture=arm64 -build -cook -stage -pak -package -unattended
+```
+
+单独重编 `libugp.so` 后，先移走 `Binaries/Android/IOStoreDemo-arm64.apk` 再打包，
+以免 UAT 复用旧 APK。已有有效 Android stage 时可用
+`-skipbuild -skipcook -skipstage -skippak -package` 直接重新封装。
+
+当前测试 APK 的 CDN 地址为 `http://127.0.0.1:18080`。启动本地
+`cdn_server.py` 并执行 `adb reverse tcp:18080 tcp:18080` 后启动 APK。
+Android 运行流程不依赖 `AndroidPreInit` 或 `MobileSavedPaks` 补丁。
+
+## 历史方案：Android 同进程启动更新器（2026-11-12）
 
 Android 的 `GameActivity` 和 UGP 使用同一游戏进程。游戏线程在平台文件初始化后、`GEngineLoop.PreInit()` 前运行 UGP，UI 线程绘制启动覆盖层和 Retry 对话框。完成更新或选择可用的旧版后，游戏线程继续启动并挂载容器。iOS 同样在游戏进程内更新。桌面独立更新器使用显式指定的游戏安装路径。
 
