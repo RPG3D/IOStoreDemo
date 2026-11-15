@@ -16,6 +16,8 @@ Development 使用 `getExternalFilesDir(null)`，Shipping 使用 `getFilesDir()`
 启动前校验已提交索引中的每个 IoStore TOC，并确认它引用的数据块落在
 对应 UCAS 的实际文件范围内。活动容器损坏时先尝试恢复有效的上一版本。
 
+选型、验收状态和 iOS 对照见 [移动端后台下载方案](mobile-background-download-design.md)。
+
 构建同一配置及 ABI 的独立库，并复制到 Android 插件，再走 UAT：
 
 ```powershell

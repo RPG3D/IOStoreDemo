@@ -37,6 +37,7 @@
 - **`review-2026-11-11.md`**：Android 启动前更新链的 3 个 P1 问题及复现条件。
 - **`ios-preinit-runbook.md`**：iOS 启动前更新、CDN 发布和真机验收流程。
 - **`android-s1-runbook.md`**：Android 独立 PatchActivity、Content/Paks 布局迁移和真机验收流程。
+- [移动端后台下载方案](mobile-background-download-design.md) 记录 Android 和 iOS 的系统接口、CDN 聚合和分批续投。
 - **`mac-launcher-runbook.md`**：Mac Slate 启动器、外部内容目录和本机验收流程。
 
 ## 构建
