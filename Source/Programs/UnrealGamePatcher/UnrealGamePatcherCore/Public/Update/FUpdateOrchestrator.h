@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 #include "Formats/Index/FIndexManifest.h"
 #include "Formats/Diff/FDiffAnalyzer.h"
-#include "Download/IChunkDownloader.h"
+#include "Download/FDownloadManager.h"
 #include "Stats/FIOStats.h"
 #include "Update/FUpdateEvent.h"
 
@@ -26,6 +26,16 @@ namespace UnrealGamePatcher
 		IChunkDownloader* Downloader = nullptr;
 		FString BaseUrl;       // CDN base, e.g. "http://127.0.0.1:8080/cdn"
 		FString ChunkCacheDir; // where downloaded chunk files are cached
+		TFunction<bool()> ShouldCancel; // polled on the update thread
+		bool bKeepChunkCache = false; // the caller cleans up after activation
+		/** A previously validated, pinned index for this version, usable offline. */
+		const FIndexManifest* PinnedManifest = nullptr;
+		/** Optional platform transfer of a complete batch. The caller owns the
+		 *  explicit ChunkCacheDir and keeps it until activation succeeds. */
+		TFunction<EPatcherError(const TArray<FDownloadRequest>&, FDownloadStats&, TArray<FString>&,
+			const TFunction<void(int64, int64)>&)> DownloadChunks;
+		/** Called after prefetch, before starting writes to the install targets. */
+		TFunction<void()> BeforeApply;
 		FString InstallLockRootDir; // Android internal storage supports flock.
 		int32 MaxConcurrent = 8;
 		int32 MaxRetries = 3;

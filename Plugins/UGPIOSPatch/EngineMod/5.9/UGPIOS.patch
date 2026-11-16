@@ -1,0 +1,40 @@
+diff --git a/Engine/Source/Runtime/ApplicationCore/Private/IOS/IOSAppDelegate.cpp b/Engine/Source/Runtime/ApplicationCore/Private/IOS/IOSAppDelegate.cpp
+index 1012585bf..39dc46197 100644
+--- a/Engine/Source/Runtime/ApplicationCore/Private/IOS/IOSAppDelegate.cpp
++++ b/Engine/Source/Runtime/ApplicationCore/Private/IOS/IOSAppDelegate.cpp
+@@ -1957,4 +1957,15 @@ extern double GCStartTime;
+ #if !PLATFORM_TVOS
++// UGP Begin
++extern bool UGPIOSHandleBackgroundSession(NSString* Identifier, void (^Completion)(void)) __attribute__((weak_import));
++// UGP End
++
+ - (void)application:(UIApplication *)application handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void(^)(void))completionHandler
+ {
++	// UGP Begin
++	// This callback can arrive before the game thread starts.
++	if (UGPIOSHandleBackgroundSession && UGPIOSHandleBackgroundSession(identifier, completionHandler))
++	{
++		return;
++	}
++	// UGP End
+     //Save off completionHandler so that a future call to FCoreDelegates::ApplicationBackgroundSessionEventsAllSentDelegate can execute it
+diff --git a/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp b/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp
+index faa58d205..e56182473 100644
+--- a/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp
++++ b/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp
+@@ -541,2 +541,6 @@ static bool ShouldUseLoggingThread()
+ 
++// UGP Begin
++extern void RunUGPIOSBeforeEnginePreInit() __attribute__((weak_import));
++// UGP End
++
+ void FAppEntry::Init()
+@@ -544,2 +548,8 @@ void FAppEntry::Init()
+ 	SCOPED_BOOT_TIMING("FAppEntry::Init()");
++	// UGP Begin
++	if (RunUGPIOSBeforeEnginePreInit)
++	{
++		RunUGPIOSBeforeEnginePreInit();
++	}
++	// UGP End
+ 	

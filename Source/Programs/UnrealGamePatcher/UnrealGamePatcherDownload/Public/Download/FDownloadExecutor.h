@@ -43,6 +43,7 @@ namespace UnrealGamePatcher
 		 *  aborted and no further segments are issued. OnDone still fires
 		 *  exactly once (with a canceled-failure result). */
 		UNREALGAMEPATCHERDOWNLOAD_API void Cancel(int64 Handle);
+		UNREALGAMEPATCHERDOWNLOAD_API void CancelAll();
 
 	private:
 		struct FExecutorState;                 // defined in the cpp

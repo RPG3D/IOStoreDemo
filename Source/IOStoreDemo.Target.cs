@@ -22,7 +22,6 @@ public class IOStoreDemoTarget : TargetRules
 		if (Target.Platform == UnrealTargetPlatform.IOS)
 		{
 			ExtraModuleNames.Add("UGPIOSPatch");
-			GlobalDefinitions.Add("WITH_UGP_IOS_PREINIT=1");
 		}
     }
 }

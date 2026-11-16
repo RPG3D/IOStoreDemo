@@ -3,6 +3,7 @@
 #pragma once
 
 #include "Download/IChunkDownloader.h"
+#include <atomic>
 
 // UE HTTP needs GConfig. This transport is available before engine PreInit.
 class FUGPIOSDownload final : public UnrealGamePatcher::IChunkDownloader
@@ -12,4 +13,8 @@ public:
 	FCancelHandle DownloadRangeAsync(const FString& Url, int64 Offset, int64 Size,
 		TFunction<void(bool, const TArray64<uint8>&, const FString&)>&& OnDone) override;
 	void CancelDownload(const FCancelHandle& Handle) override;
+	int32 GetLastHttpStatus() const { return LastHttpStatus.load(); }
+
+private:
+	std::atomic<int32> LastHttpStatus{0};
 };

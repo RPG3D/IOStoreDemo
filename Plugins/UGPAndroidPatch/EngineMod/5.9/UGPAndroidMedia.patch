@@ -1,0 +1,20 @@
+diff --git a/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp b/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp
+index 07b4662ab..9a8c42661 100644
+--- a/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp
++++ b/Engine/Source/Runtime/ApplicationCore/Private/Android/AndroidJavaMediaFrameData.cpp
+@@ -158,2 +158,5 @@ bool FAndroidJavaMediaFrameData::ExtractToTextureVulkan(FRHICommandListImmediate
+ 
++					// UGP Begin
++					// The standalone updater builds ApplicationCore without Engine media converters.
++#if WITH_ENGINE
+ 					if (TextureSample->GetMediaTextureSampleColorConverter())
+@@ -163,2 +166,4 @@ bool FAndroidJavaMediaFrameData::ExtractToTextureVulkan(FRHICommandListImmediate
+ 					else
++#endif
++					// UGP End
+ 					{
+@@ -281,2 +286,2 @@ bool FAndroidJavaMediaFrameData::ExtractToTextureOES(FRHICommandListImmediate& R
+ 
+-#endif //USE_ANDROID_JNI
+\ No newline at end of file
++#endif //USE_ANDROID_JNI

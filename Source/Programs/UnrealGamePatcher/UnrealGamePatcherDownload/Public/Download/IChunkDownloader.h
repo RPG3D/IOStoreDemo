@@ -6,6 +6,11 @@
 
 namespace UnrealGamePatcher
 {
+	inline bool IsHttpMissingResource(int32 Status)
+	{
+		return Status == 404 || Status == 410;
+	}
+
 	/**
 	 * Pluggable byte-range download backend (design D9 / task 6.5). The whole
 	 * update pipeline (download scheduling, concurrency, resume, hash verify)

@@ -36,7 +36,7 @@ namespace UnrealGamePatcher
 		 *  never fires. WeakRequest mirrors it for Cancel(). */
 		TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> StrongRequest;
 		TWeakPtr<IHttpRequest, ESPMode::ThreadSafe> WeakRequest; // for Cancel()
-		TFunction<void()> Deliver;           // internal: exactly-once delivery
+		TFunction<void(const FHttpAsyncRequest&)> Deliver;
 
 		/** Delivers the result exactly once (atomic guard). */
 		UNREALGAMEPATCHERDOWNLOAD_API void DeliverOnce();
@@ -72,7 +72,8 @@ namespace UnrealGamePatcher
 		 *  Fails (logged) on transport errors, non-2xx status, a response that
 		 *  does not carry the requested bytes, or one exceeding
 		 *  MaxResponseBytes. */
-		UNREALGAMEPATCHERDOWNLOAD_API bool DownloadRange(const FString& Url, int64 Offset, int64 Size, TArray64<uint8>& OutData);
+		UNREALGAMEPATCHERDOWNLOAD_API bool DownloadRange(const FString& Url, int64 Offset, int64 Size,
+			TArray64<uint8>& OutData, const TFunction<bool()>& ShouldCancel = {}, int32* OutHttpStatus = nullptr);
 
 		/** Size probe: `Range: bytes=0-0` - delivers the total size (parsed
 		 *  from Content-Range/Content-Length at HEADER time, then the request
@@ -86,7 +87,8 @@ namespace UnrealGamePatcher
 		 *  thread. Never blocks, never uses a pooled event. Returns false
 		 *  only when the request could not even be created - OnDone has
 		 *  already fired with the failure in that case. */
-		UNREALGAMEPATCHERDOWNLOAD_API bool RequestAsync(const FString& Url, int64 Offset, int64 Size, FOnRequestDone OnDone);
+		UNREALGAMEPATCHERDOWNLOAD_API bool RequestAsync(const FString& Url, int64 Offset, int64 Size,
+			FOnRequestDone OnDone, TSharedPtr<FHttpAsyncRequest>* OutHandle = nullptr);
 
 		/** Serializes request creation: the curl backend runs its easy-handle
 		 *  setup on the calling thread and races when several download-pool

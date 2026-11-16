@@ -28,29 +28,35 @@ UGP 在副本中写入容器和索引。全部提交后原子交换两个目录�
 日志记录诊断码和启动版本。
 各阶段含义见 [更新错误码](README.md#更新错误码)。
 
-系统后台下载的选型、队列方案和待验场景见 [移动端后台下载方案](mobile-background-download-design.md)。
+UE 5.9 用前台会话请求版本和索引，后台会话下载 chunk。锁屏或退到桌面后，系统继续传输。
+已完成的 chunk 经 SHA-1 校验后写入 `Library/Application Support/UGPBackground/cache`。
+待更新索引及批次计划保存在同层目录。回到前台时，按字节显示下载进度，复用已落盘的 chunk，
+并继续安装之前选定的版本。已有可用旧版且下载失败时，本次可进入旧版，下次冷启动继续更新。
+后台会话事件可在游戏线程启动前处理。[iPad 验收](mobile-background-download-design.md#ipad-验收)
 
 ## 构建
 
-使用 UE 5.7 源码引擎、iPhoneOS SDK 和该应用的开发签名。以下命令从项目根目录执行。
+后台下载使用 UE 5.9 源码引擎、iPhoneOS SDK 和该应用的开发签名。以下命令从项目根目录执行。
 
 ```sh
 PROJECT_DIR="$PWD"
 UGP_DIR="$PROJECT_DIR/Source/Programs/UnrealGamePatcher"
-ENGINE_ROOT=/path/to/UE5
+ENGINE_ROOT=/path/to/UE5.9
 
 # 每个引擎工作区应用一次。已应用时可以用 git apply --reverse --check 确认。
-git -C "$ENGINE_ROOT" apply "$UGP_DIR/Scripts/UE5.7-UGPIOSPreInit.patch"
-git -C "$ENGINE_ROOT" apply "$UGP_DIR/Scripts/UE5.7-UGPMobileSavedPaks.patch"
+MODS="$PROJECT_DIR/Plugins/UGPIOSPatch/EngineMod/5.9"
+git -C "$ENGINE_ROOT" apply "$MODS/UGPMobileSavedPaks.patch"
+git -C "$ENGINE_ROOT" apply "$MODS/UGPIOS.patch"
 
 "$ENGINE_ROOT/Engine/Build/BatchFiles/Mac/Build.sh" IOStoreDemo IOS Development \
   -Project="$PROJECT_DIR/IOStoreDemo.uproject" -Architecture=arm64
 ```
 
-旧版 `UE5.7-UGPIOSPreInit.patch` 曾同时修改 `IPlatformFilePak.cpp`。如果引擎已经有该修改，
-将已有的 `WITH_UGP_IOS_PREINIT` 条件更新为共享补丁中的条件即可。
+完整引擎文件、基线版本和重放命令见 [插件的引擎修改目录](../../../../Plugins/UGPIOSPatch/EngineMod/5.9/README.md)。
+UE 5.7 的前台更新使用 `Scripts/UE5.7-UGPIOSPreInit.patch` 和 `Scripts/UE5.7-UGPMobileSavedPaks.patch`。
+如果此前已应用过这两个补丁，先用当时版本的补丁反向撤销对应改动，再应用当前版本。
 
-`IOStoreDemo` 的 iOS Target 链接 `UGPIOSPatch` 并启用引擎钩子。对于测试包，在
+`IOStoreDemo` 的 iOS Target 链接 `UGPIOSPatch`。对于测试包，在
 `Config/IOS/IOSEngine.ini` 的 `AdditionalPlistData` 中加入 `UGPCdnURL`，填入设备可访问的 HTTPS CDN 根路径。
 
 ```ini
@@ -58,7 +64,8 @@ git -C "$ENGINE_ROOT" apply "$UGP_DIR/Scripts/UE5.7-UGPMobileSavedPaks.patch"
 AdditionalPlistData=<key>UGPCdnURL</key><string>https://cdn.example.com/ugp-ios</string>
 ```
 
-Development 也支持从 Xcode 或 `devicectl` 启动时传入 `-ugpcdn=<CDN URL>`。URL 未配置时
+Development 也支持从 Xcode 或 `devicectl` 启动时传入 `-ugpcdn=<CDN URL>`。
+UE 5.9 可加 `-ugpbackgroundtasks=4` 用小队列覆盖续投。URL 未配置时
 会走普通游戏启动，适用于包含容器的常规包。
 
 ## 发布 iOS 内容和打包
@@ -100,6 +107,22 @@ Development 也支持从 Xcode 或 `devicectl` 启动时传入 `-ugpcdn=<CDN URL
 `.ucas` 或散装地图文件。
 
 首轮验证使用未签名、未加密的 UGP 内容容器。应用本身仍使用正常的 iOS 签名。
+
+## UE 5.9 后台下载测试包（2026-11-16）
+
+本机生成了 iPhoneOS arm64 Development 包 `Saved/UGPIOSBackgroundQA/IOStoreDemo-UGP-5.9-BackgroundQA.ipa`。
+完整编译和链接通过。用现有 QA 描述文件开发签名，解包后检查了签名，确认没有 `cookeddata`、Pak 或 IoStore 容器。
+配套 CDN 位于同目录的 `CDN`，版本为 `5.9.0-bg-qa`。Mac CLI 从 58 个 chunk 重建了 8 个容器，
+每个文件的 SHA-256 均与发布输入一致。
+
+同日用修正后的 IPA 在 iPad Air 上完成首装。从没有已提交容器的 `Saved_BG59QA/Paks` 启动，队列限制为
+`-ugpbackgroundtasks=4`，CDN 每条 chunk 连接限速 24 KiB/s。切到系统设置后有 4 个请求完成。
+发送 SIGKILL 时仍有 2 个响应在传。杀进程前从沙盒取出的 5 个已校验 chunk 与 CDN 逐字节一致，
+重启后 CDN 没有重发这 5 个 chunk。本轮验证到了 chunk 级复用，CDN 未收到 HTTP Range 请求。
+
+重启后安装提交为 `5.9.0-bg-qa`。已安装的 8 个容器 SHA-256 全部匹配发布输入。
+UE 从该 Saved 路径挂载 `global.utoc`、两个 Pak 及对应 IoStore 容器，并进入 `/Game/ThirdPerson/Lvl_ThirdPerson`。
+修正版 IPA、CDN 请求、启动日志和游戏日志保存在本机 `Saved/UGPIOSBackgroundQA/first-install.e4qrnF/`。
 
 ## 本机验证（2026-11-11）
 

@@ -1,21 +1,23 @@
 diff --git a/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp b/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp
-index 4cbb05494..c2e5839dc 100644
 --- a/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp
 +++ b/Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp
-@@ -470,9 +470,17 @@ static void ApplyIOSCompatConfigRules()
+@@ -470,9 +470,20 @@ static void ApplyIOSCompatConfigRules()
  }
  
  
-+#if defined(WITH_UGP_IOS_PREINIT) && WITH_UGP_IOS_PREINIT
-+extern void RunUGPIOSBeforeEnginePreInit();
-+#endif
++// UGP Begin
++extern void RunUGPIOSBeforeEnginePreInit() __attribute__((weak_import));
++// UGP End
 +
  void FAppEntry::Init()
  {
  	SCOPED_BOOT_TIMING("FAppEntry::Init()");
-+#if defined(WITH_UGP_IOS_PREINIT) && WITH_UGP_IOS_PREINIT
-+	::RunUGPIOSBeforeEnginePreInit();
-+#endif
++	// UGP Begin
++	if (RunUGPIOSBeforeEnginePreInit)
++	{
++		RunUGPIOSBeforeEnginePreInit();
++	}
++	// UGP End
 +
  	
  	FDelegateHandle ConfigReadyHandle = FCoreDelegates::TSConfigReadyForUse().AddStatic(&ApplyIOSCompatConfigRules);

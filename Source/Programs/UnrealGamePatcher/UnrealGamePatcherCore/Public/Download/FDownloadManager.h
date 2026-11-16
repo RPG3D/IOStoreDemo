@@ -58,7 +58,8 @@ namespace UnrealGamePatcher
 			const TArray<FDownloadRequest>& Requests,
 			FDownloadStats& OutStats,
 			TArray<FString>& OutFailedIds,
-			TFunction<void(int64 CompletedBytes, int64 TotalBytes)> OnProgress = {});
+			TFunction<void(int64 CompletedBytes, int64 TotalBytes)> OnProgress = {},
+			const TFunction<bool()>& ShouldCancel = {});
 
 	private:
 		IChunkDownloader& Downloader;

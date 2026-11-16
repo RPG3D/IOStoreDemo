@@ -3,6 +3,7 @@
 package com.epicgames.unreal.patch;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.util.AtomicFile;
@@ -31,7 +32,7 @@ public final class UGPStartupGate implements Closeable
 		Lock = lock;
 	}
 
-	static UGPStartupGate tryAcquire(Activity activity) throws IOException
+	static UGPStartupGate tryAcquire(Context activity) throws IOException
 	{
 		RandomAccessFile file = new RandomAccessFile(new File(activity.getFilesDir(), "ugp-startup.lock"), "rw");
 		boolean acquired = false;
@@ -67,12 +68,12 @@ public final class UGPStartupGate implements Closeable
 		}
 	}
 
-	private static AtomicFile readyFile(Activity activity)
+	private static AtomicFile readyFile(Context activity)
 	{
 		return new AtomicFile(new File(activity.getFilesDir(), "ugp-content-ready"));
 	}
 
-	private static String apkStamp(Activity activity) throws IOException
+	private static String apkStamp(Context activity) throws IOException
 	{
 		try
 		{
@@ -84,7 +85,7 @@ public final class UGPStartupGate implements Closeable
 		}
 	}
 
-	static void invalidate(Activity activity) throws IOException
+	static void invalidate(Context activity) throws IOException
 	{
 		AtomicFile ready = readyFile(activity);
 		ready.delete();
@@ -95,7 +96,7 @@ public final class UGPStartupGate implements Closeable
 		}
 	}
 
-	static String markReady(Activity activity) throws IOException
+	static String markReady(Context activity) throws IOException
 	{
 		String token = apkStamp(activity) + ":" + java.util.UUID.randomUUID();
 		byte[] stamp = token.getBytes(StandardCharsets.UTF_8);

@@ -122,3 +122,7 @@ Source/Programs/UnrealGamePatcher/Scripts/rustfs.exe
 # UGP Android: libugp.so 是构建产物（Binaries/Android/UnrealGamePatcherLib-arm64.so 的拷贝），
 # 不入库；打包前见 Docs/android-s1-runbook.md §二 第 1 步
 Plugins/UGPAndroidPatch/Source/UGPAndroidPatch/libs/
+
+# Complete UE source snapshots are local. Replay uses the adjacent Git patches.
+/Plugins/UGPAndroidPatch/EngineMod/*/Engine/
+/Plugins/UGPIOSPatch/EngineMod/*/Engine/

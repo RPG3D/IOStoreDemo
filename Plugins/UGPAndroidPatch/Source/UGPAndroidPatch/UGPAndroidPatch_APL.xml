@@ -3,6 +3,12 @@
 	<androidManifestUpdates>
 		<!-- The local QA CDN is accessed through adb reverse. -->
 		<addAttribute tag="application" name="android:usesCleartextTraffic" value="true"/>
+		<addPermission android:name="android.permission.RUN_USER_INITIATED_JOBS"/>
+		<addPermission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+		<addPermission android:name="android.permission.FOREGROUND_SERVICE"/>
+		<addPermission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+		<addPermission android:name="android.permission.POST_NOTIFICATIONS"/>
+		<addPermission android:name="android.permission.WAKE_LOCK"/>
 		<loopElements tag="activity">
 			<setStringFromAttribute result="UGPActivityName" tag="$" name="android:name"/>
 			<setBoolIsEqual result="UGPGameActivity" arg1="$S(UGPActivityName)" arg2="com.epicgames.unreal.GameActivity"/>
@@ -23,6 +29,12 @@
 		</loopElements>
 		<addElements tag="application">
 			<meta-data android:name="com.epicgames.unreal.patch.CdnUrl" android:value="http://127.0.0.1:18080"/>
+			<service android:name="com.epicgames.unreal.patch.UGPTransfer$UserTransfer"
+				android:permission="android.permission.BIND_JOB_SERVICE"
+				android:exported="false" android:process=":ugppatch"/>
+			<service android:name="com.epicgames.unreal.patch.UGPTransfer$ForegroundTransfer"
+				android:foregroundServiceType="dataSync"
+				android:exported="false" android:process=":ugppatch"/>
 			<activity android:name="com.epicgames.unreal.patch.PatchActivity"
 				android:label="@string/app_name"
 				android:exported="true"
@@ -53,13 +65,17 @@
 		<copyFile src="$S(ProjectDir)/IOStoreDemo.uproject" dst="$S(BuildDir)/assets/UGPProject.uproject"/>
 	</resourceCopies>
 	<gameActivityOnCreateBeforeProcessSystemInfoAdditions>
+		<insert>// UGP Begin</insert>
+		<insertNewline/>
 		<insert>if (!com.epicgames.unreal.patch.UGPStartupGate.enterGame(this)) return;</insert>
+		<insertNewline/>
+		<insert>// UGP End</insert>
 		<insertNewline/>
 	</gameActivityOnCreateBeforeProcessSystemInfoAdditions>
 	<proguardAdditions>
-		<insert>-keep class com.epicgames.unreal.patch.PatchActivity { *; }</insert>
+		<insert>-keep class com.epicgames.unreal.patch.UGPUpdate { *; }</insert>
 		<insertNewline/>
-		<insert>-keep class com.epicgames.unreal.patch.PatchActivity$OnUpdateEventListener { *; }</insert>
+		<insert>-keep class com.epicgames.unreal.patch.UGPUpdate$OnUpdateEventListener { *; }</insert>
 		<insertNewline/>
 	</proguardAdditions>
 

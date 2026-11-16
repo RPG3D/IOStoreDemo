@@ -68,7 +68,8 @@ namespace UnrealGamePatcher
 		const TArray<FDownloadRequest>& Requests,
 		FDownloadStats& OutStats,
 		TArray<FString>& OutFailedIds,
-		TFunction<void(int64, int64)> OnProgress)
+		TFunction<void(int64, int64)> OnProgress,
+		const TFunction<bool()>& ShouldCancel)
 	{
 		OutStats = FDownloadStats();
 		OutFailedIds.Reset();
@@ -86,6 +87,10 @@ namespace UnrealGamePatcher
 		int64 CachedBytes = 0;
 		for (const FDownloadRequest& Request : Requests)
 		{
+			if (ShouldCancel && ShouldCancel())
+			{
+				return false;
+			}
 			if (Request.Size < 0 || Request.Size > FHttpRangeRequest::MaxResponseBytes)
 			{
 				OutFailedIds.AddUnique(Request.Id);
@@ -150,10 +155,13 @@ namespace UnrealGamePatcher
 		};
 		ReportProgress();
 
-		TArray<int64> Handles;
-		Handles.Reserve(ToFetch.Num());
 		for (const FDownloadRequest& Request : ToFetch)
 		{
+			if (ShouldCancel && ShouldCancel())
+			{
+				Executor.CancelAll();
+				return false;
+			}
 			FDownloadJob Job;
 			Job.Id = Request.Id;
 			Job.Url = Request.Url;
@@ -161,7 +169,7 @@ namespace UnrealGamePatcher
 			Job.ExpectedSize = Request.Size;
 			Job.ExpectedSha1 = Request.ExpectedSha1;
 
-			Handles.Add(Executor.Submit(MoveTemp(Job),
+			Executor.Submit(MoveTemp(Job),
 				[Ctx, Id = Request.Id, Size = Request.Size](const FDownloadResult& Result)
 			{
 				Ctx->Retries.fetch_add(Result.Retries, std::memory_order_release);
@@ -183,10 +191,10 @@ namespace UnrealGamePatcher
 				{
 					Ctx->DoneEvent->Trigger();
 				}
-			}));
+			});
 		}
 
-		bool bStalled = false;
+		bool bAbort = false;
 		if (ToFetch.Num() > 0)
 		{
 			// Watchdog: a transport that loses its settle callback would hang
@@ -199,7 +207,12 @@ namespace UnrealGamePatcher
 			int64 LastTick = Executor.GetProgressTick();
 			while (Ctx->Remaining.load(std::memory_order_acquire) > 0)
 			{
-				const bool bDone = Ctx->DoneEvent->Wait(OnProgress ? 250 : 1000);
+				if (ShouldCancel && ShouldCancel())
+				{
+					bAbort = true;
+					break;
+				}
+				const bool bDone = Ctx->DoneEvent->Wait(OnProgress || ShouldCancel ? 250 : 1000);
 				ReportProgress();
 				if (bDone)
 				{
@@ -217,16 +230,13 @@ namespace UnrealGamePatcher
 					UE_LOG(LogUnrealGamePatcher, Error,
 						TEXT("FDownloadManager: batch stalled for %.0fs with %d job(s) unfinished - failing the batch"),
 						Now - LastProgress, Ctx->Remaining.load(std::memory_order_acquire));
-					for (const int64 Handle : Handles)
-					{
-						Executor.Cancel(Handle);
-					}
-					bStalled = true;
+					bAbort = true;
 					break;
 				}
 			}
-			if (bStalled)
+			if (bAbort)
 			{
+				Executor.CancelAll();
 				// Grace drain: canceled jobs on a healthy transport settle
 				// within moments; a genuinely hung one never does - its late
 				// callbacks only touch the heap context, so returning is safe.
@@ -275,6 +285,6 @@ namespace UnrealGamePatcher
 		FIOStats::Get().AddNetDownload(OutStats.BytesDownloaded);
 		FIOStats::Get().AddDiskWrite(OutStats.BytesDownloaded);
 
-		return OutFailedIds.Num() == 0;
+		return !bAbort && !(ShouldCancel && ShouldCancel()) && OutFailedIds.Num() == 0;
 	}
 }

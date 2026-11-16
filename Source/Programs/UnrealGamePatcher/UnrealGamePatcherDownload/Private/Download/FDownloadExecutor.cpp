@@ -4,6 +4,8 @@
 #include "UnrealGamePatcherDownload.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/SecureHash.h"
 #include "Templates/SharedPointer.h"
@@ -240,12 +242,9 @@ namespace UnrealGamePatcher
 					Backend.CancelDownload(S.CancelHandle);
 				}
 			}
-			// No in-flight request to settle into the finish path - finish now.
-			if (J.InFlight == 0)
-			{
-				Finish(J, false, TEXT("canceled"));
-			}
-			// With in-flight segments, the first settle callback finishes the job.
+			// Retire the staging paths under this lock. A late transport callback
+			// must not touch files after a new batch is allowed to reuse them.
+			Finish(J, false, TEXT("canceled"));
 		}
 
 		void OnProbeSettled(FJob& J, int64 TotalSize, bool bRangeOk)
@@ -273,11 +272,17 @@ namespace UnrealGamePatcher
 			WindowInFlight -= 1;
 			// Paired with IssueSegment's += 1: every issued segment settles
 			// exactly once, so the decrement must happen before the early
-			// returns below or a canceled/paused job's count goes stale and
-			// Cancel's InFlight==0 check never fires.
+			// returns below or a canceled job can keep the window occupied.
 			J.InFlight -= 1;
 			ProgressTick += 1;
 
+			if (!J.Segments.IsValidIndex(SegmentIndex))
+			{
+				return;
+			}
+			FSegment& S = J.Segments[SegmentIndex];
+			S.bInFlight = false;
+			S.CancelHandle.Reset();
 			if (J.bFinished)
 			{
 				return; // canceled job whose in-flight request still settled
@@ -287,13 +292,6 @@ namespace UnrealGamePatcher
 				Finish(J, false, TEXT("canceled"));
 				return;
 			}
-
-			if (SegmentIndex < 0 || SegmentIndex >= J.Segments.Num())
-			{
-				return;
-			}
-			FSegment& S = J.Segments[SegmentIndex];
-			S.bInFlight = false;
 
 			if (!bOk || Data.Num() != S.Size)
 			{
@@ -491,14 +489,8 @@ namespace UnrealGamePatcher
 			const bool bWholeResource = S.bWholeFile || (S.Offset == 0 && S.Size >= J.Total);
 			const int64 WireSize = bWholeResource ? -1 : S.Size;
 			TSharedRef<FExecutorState> ExecutorState = SharedThis(this);
-			// The handle MUST be stored: Cancel() and ~FDownloadExecutor abort
-			// in-flight requests through it. Dropping the return value (review
-			// 2026-10-09 H2) left S.CancelHandle forever null, so "cancel" was
-			// bookkeeping-only and the HTTP transfer ran to completion.
-			// (Safe even for the synchronous fallback backends, which fire
-			// OnDone inline before the assignment lands - the settle does not
-			// read the handle, and a completed request ignores CancelDownload.)
-			S.CancelHandle = Backend.DownloadRangeAsync(J.Job.Url, S.Offset, WireSize,
+			const int32 Attempt = S.Attempts;
+			IChunkDownloader::FCancelHandle Handle = Backend.DownloadRangeAsync(J.Job.Url, S.Offset, WireSize,
 				[ExecutorState, JobPtr, SegIndex](bool bOk, const TArray64<uint8>& Data, const FString& Error)
 			{
 				// Engine HTTP thread, serialized with every other settle. The
@@ -508,6 +500,11 @@ namespace UnrealGamePatcher
 				ExecutorState->OnSegmentSettled(*JobPtr, SegIndex, bOk, Data, Error);
 				ExecutorState->Refill();
 			});
+			// A synchronous backend can settle or reissue the segment inline.
+			if (S.bInFlight && S.Attempts == Attempt)
+			{
+				S.CancelHandle = MoveTemp(Handle);
+			}
 		}
 
 		void IssueProbe(FJob& J)
@@ -729,6 +726,15 @@ void UnrealGamePatcher::FDownloadExecutor::Cancel(int64 Handle)
 {
 	FScopeLock Scope(&State->Lock);
 	State->Cancel(Handle);
+}
+
+void UnrealGamePatcher::FDownloadExecutor::CancelAll()
+{
+	FScopeLock Scope(&State->Lock);
+	for (const TUniquePtr<FJob>& Job : State->Jobs)
+	{
+		State->Cancel(Job->Handle);
+	}
 }
 
 int64 UnrealGamePatcher::FDownloadExecutor::GetProgressTick()

@@ -1,24 +1,32 @@
 # S1 真机全链 runbook（2026-11-02）
 
-## 当前方案：独立 PatchActivity + 原版 UE
+## 当前方案：独立 PatchActivity + Saved/Paks
 
 桌面入口由 UPL 指向 `PatchActivity`。更新器在 `:ugppatch` 进程只加载
 `libugp.so`，提交内容或确认可用旧版后才交接给 `GameActivity`。
 UPL 在加载游戏库前注入启动门控。最近任务恢复若没有一次有效交接，
 会回到更新器。两个进程通过应用内部存储上的同一把锁协调。
 
-容器落在原版 UE 的 `ProjectContentDir()/Paks`，物理目录为
-`<AppFiles>/UnrealGame/<Project>/<Project>/Content/Paks`。
+容器落在 `FPaths::ProjectSavedDir()/Paks`，物理目录为
+`<AppFiles>/UnrealGame/<Project>/<Project>/Saved/Paks`。
 Development 使用 `getExternalFilesDir(null)`，Shipping 使用 `getFilesDir()`。
 发布端可用标准 Android stage 根目录，或单独的容器目录，二者均需包含
 `global.utoc` 和 `global.ucas`。UGP 只发布 Pak 目录，存档仍在原 Saved 目录。
-已有 `Saved/Paks` 的有效安装会复制到新布局，校验后将旧 Pak 目录改名。
+已有 `Content/Paks` 的有效安装会迁入 Saved 布局，校验后将旧 Pak 目录改名。
 启动前校验已提交索引中的每个 IoStore TOC，并确认它引用的数据块落在
 对应 UCAS 的实际文件范围内。活动容器损坏时先尝试恢复有效的上一版本。
+应用要求 Android 10（API 29）。启动时检查版本，发现更新后显示
+`Download update`。Android 14+ 为已确认的版本安排一个 UIDT Job，
+Android 10–13 使用 `dataSync` 前台服务。两条路径共用同一个工作线程，
+进度显示在界面和通知中。后台更新完成后，等 Activity 回到前台再进入游戏。
+确认后的版本和下载索引持久化。系统中断时取消请求，缓存留到新目录正式发布成功。
+任务管理器直接结束进程后，重开更新页可继续已确认的版本。重试次数由更新会话保存，
+Activity 重建时会还原阶段和失败计数。
 
 选型、验收状态和 iOS 对照见 [移动端后台下载方案](mobile-background-download-design.md)。
 
-构建同一配置及 ABI 的独立库，并复制到 Android 插件，再走 UAT：
+首次构建前，用 [Android 插件的 5.9 引擎重放说明](../../../../Plugins/UGPAndroidPatch/EngineMod/5.9/README.md)
+应用 Saved/Paks、独立库 Media 和 GameActivity 权限补丁。之后构建同一配置及 ABI 的独立库，复制到插件，再走 UAT。
 
 ```powershell
 $ue = 'D:/Code/UE5/Engine'
@@ -35,7 +43,19 @@ Copy-Item Binaries/Android/UnrealGamePatcherLib-arm64.so "$libs/libugp.so"
 
 当前测试 APK 的 CDN 地址为 `http://127.0.0.1:18080`。启动本地
 `cdn_server.py` 并执行 `adb reverse tcp:18080 tcp:18080` 后启动 APK。
-Android 运行流程不依赖 `AndroidPreInit` 或 `MobileSavedPaks` 补丁。
+启动交接由独立进程和 UPL 完成。构建时使用与当前 JNI 接口匹配的 `libugp.so`。
+
+### UE 5.9 后台下载 QA
+
+本机构建的独立 ARM64 QA 包位于
+`Saved/AndroidBackgroundTransferQA/apk-output/IOStoreDemo-UGP-BackgroundTransfer-QA-arm64.apk`。
+它从 Windows 的 UE 5.9 游戏包工程重新组装，使用 Mac 重编的 `libugp.so` 和当前 Java 源码。
+包名带 `.ugpbackgroundqa`，使用独立沙盒。配套 CDN 为同层 `CDN`，版本 `3.0.3`，
+通过 `adb reverse tcp:18080 tcp:18080` 由手机访问。
+
+Android 16 真机上点 `Download update`，退到桌面后检查系统通知和已下载字节。
+用系统任务管理器停止下载，再次打开更新页并继续。核对 CDN 已完整下载的对象请求、
+提交版本、`Saved/Paks` 挂载和地图加载日志。有旧版本时另测发布前中断，并核对旧容器、索引和存档。
 
 ## 历史方案：Android 同进程启动更新器（2026-11-12）
 

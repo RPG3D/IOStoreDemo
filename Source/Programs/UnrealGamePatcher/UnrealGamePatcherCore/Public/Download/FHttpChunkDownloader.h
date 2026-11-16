@@ -17,7 +17,13 @@ namespace UnrealGamePatcher
 	{
 		bool DownloadRange(const FString& Url, int64 Offset, int64 Size, TArray64<uint8>& OutData) override
 		{
-			return Request.DownloadRange(Url, Offset, Size, OutData);
+			int32 HttpStatus = 0;
+			const bool bOk = Request.DownloadRange(Url, Offset, Size, OutData, ShouldCancel, &HttpStatus);
+			if (IsHttpMissingResource(HttpStatus))
+			{
+				MissingResource->store(true);
+			}
+			return bOk;
 		}
 
 		FCancelHandle DownloadRangeAsync(const FString& Url, int64 Offset, int64 Size,
@@ -27,9 +33,13 @@ namespace UnrealGamePatcher
 			// adapter folds semantic validation (status/length) into the
 			// delivered bOk - the executor re-checks length against its own
 			// expected size anyway.
-			const TSharedRef<FHttpAsyncRequest> Res = MakeShared<FHttpAsyncRequest>();
-			Request.RequestAsync(Url, Offset, Size, [Res, Offset, Size, OnDone = MoveTemp(OnDone)](const FHttpAsyncRequest& R)
+			TSharedPtr<FHttpAsyncRequest> Handle;
+			Request.RequestAsync(Url, Offset, Size, [Offset, Size, MissingResource = MissingResource, OnDone = MoveTemp(OnDone)](const FHttpAsyncRequest& R)
 			{
+				if (IsHttpMissingResource(R.Status))
+				{
+					MissingResource->store(true);
+				}
 				FString Error;
 				bool bOk = R.bOk && !R.bTooLarge;
 				if (bOk && !R.bStatusOk)
@@ -57,8 +67,8 @@ namespace UnrealGamePatcher
 					Error = TEXT("empty response");
 				}
 				OnDone(bOk, R.Content, Error);
-			});
-			return Res;
+			}, &Handle);
+			return Handle;
 		}
 
 		void CancelDownload(const FCancelHandle& Handle) override
@@ -75,5 +85,12 @@ namespace UnrealGamePatcher
 		}
 
 		FHttpRangeRequest Request;
+		TFunction<bool()> ShouldCancel;
+
+		bool SawMissingResource() const { return MissingResource->load(); }
+
+	private:
+		// HTTP callbacks may settle after an interrupted update returns.
+		TSharedRef<std::atomic<bool>> MissingResource = MakeShared<std::atomic<bool>>(false);
 	};
 }

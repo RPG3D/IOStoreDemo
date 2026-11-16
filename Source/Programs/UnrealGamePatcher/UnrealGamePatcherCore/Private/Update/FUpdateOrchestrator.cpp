@@ -637,7 +637,16 @@ namespace UnrealGamePatcher
 		// --- 1. Remote manifest (metadata lives under <base>/index/<version>/).
 		const FString IndexRel = FString::Printf(TEXT("index/%s/UnrealGamePatcher.index.json"), *Version);
 		FIndexManifest Remote;
-		if (bCdnIsHttp)
+		if (Options.PinnedManifest)
+		{
+			if (Options.PinnedManifest->ContentVersion != Version)
+			{
+				Emit(EUpdatePhase::Failed, EPatcherError::ManifestTampered, true, 0, 0, *IndexRel);
+				return false;
+			}
+			Remote = *Options.PinnedManifest;
+		}
+		else if (bCdnIsHttp)
 		{
 			// HTTP mode: the manifest is fetched like any other resource.
 			FString Json;
@@ -700,6 +709,23 @@ namespace UnrealGamePatcher
 				? FPaths::Combine(InstallDir, TEXT(".ugp"), TEXT("chunkcache"))
 				: Options.ChunkCacheDir;
 		}
+		auto DownloadChunks = [&](const TArray<FDownloadRequest>& Requests, FDownloadStats& Stats, TArray<FString>& FailedIds)
+		{
+			if (Options.ShouldCancel && Options.ShouldCancel())
+			{
+				return EPatcherError::Interrupted;
+			}
+			if (Options.DownloadChunks)
+			{
+				return Options.DownloadChunks(Requests, Stats, FailedIds, ReportDownloadProgress);
+			}
+			FDownloadManager Manager(*Options.Downloader, Options.MaxConcurrent, Options.MaxRetries);
+			if (Manager.DownloadAll(Requests, Stats, FailedIds, ReportDownloadProgress, Options.ShouldCancel))
+			{
+				return EPatcherError::Ok;
+			}
+			return Options.ShouldCancel && Options.ShouldCancel() ? EPatcherError::Interrupted : EPatcherError::DownloadFailed;
+		};
 
 		// Transaction machinery (design D5, tasks 5.2/5.3). Loaded early so a
 		// pending (interrupted) transaction can be resolved BEFORE the local
@@ -1317,15 +1343,20 @@ namespace UnrealGamePatcher
 
 			if (Requests.Num() > 0)
 			{
-				FDownloadManager Manager(*Options.Downloader, Options.MaxConcurrent, Options.MaxRetries);
 				FDownloadStats DownloadStats;
 				TArray<FString> FailedIds;
-				if (!Manager.DownloadAll(Requests, DownloadStats, FailedIds, ReportDownloadProgress))
+				const EPatcherError DownloadError = DownloadChunks(Requests, DownloadStats, FailedIds);
+				if (DownloadError != EPatcherError::Ok)
 				{
+					if (DownloadError == EPatcherError::Interrupted)
+					{
+						Emit(EUpdatePhase::Failed, DownloadError, true, 0, 0, TEXT("download paused"));
+						return false;
+					}
 					UE_LOG(LogUnrealGamePatcher, Error,
 						TEXT("FUpdateOrchestrator: %d chunk downloads failed (e.g. '%s') - update aborted, install untouched"),
 						FailedIds.Num(), FailedIds.Num() > 0 ? *FailedIds[0] : TEXT("?"));
-					Emit(EUpdatePhase::Failed, EPatcherError::DownloadFailed, true,
+					Emit(EUpdatePhase::Failed, DownloadError, true,
 						FailedIds.Num(), FailedIds.Num() > 0 ? FailedIds.Num() : 0,
 						*FString::Printf(TEXT("download failed: %d chunks (e.g. %s)"), FailedIds.Num(), FailedIds.Num() > 0 ? *FailedIds[0] : TEXT("?")));
 					return false;
@@ -1336,6 +1367,11 @@ namespace UnrealGamePatcher
 					TEXT("FUpdateOrchestrator: downloaded %d chunks (%lld bytes, %d from cache)"),
 					OutStats.NumChunksFetched, OutStats.BytesFetched, DownloadStats.SkippedExisting);
 			}
+		}
+
+		if (Options.BeforeApply)
+		{
+			Options.BeforeApply();
 		}
 
 		// Lazy completion (network mode): downloads every part of FileId not
@@ -1388,14 +1424,19 @@ namespace UnrealGamePatcher
 			UE_LOG(LogUnrealGamePatcher, Display,
 				TEXT("FUpdateOrchestrator: lazily fetching %d missing chunks of '%s' for the whole-file rebuild"),
 				Requests.Num(), *FileId);
-			FDownloadManager Manager(*Options.Downloader, Options.MaxConcurrent, Options.MaxRetries);
 			FDownloadStats DownloadStats;
 			TArray<FString> FailedIds;
-			if (!Manager.DownloadAll(Requests, DownloadStats, FailedIds, ReportDownloadProgress))
+			const EPatcherError DownloadError = DownloadChunks(Requests, DownloadStats, FailedIds);
+			if (DownloadError != EPatcherError::Ok)
 			{
+				if (DownloadError == EPatcherError::Interrupted)
+				{
+					Emit(EUpdatePhase::Failed, DownloadError, true, 0, 0, TEXT("download paused"));
+					return false;
+				}
 				UE_LOG(LogUnrealGamePatcher, Error, TEXT("FUpdateOrchestrator: %d lazy chunk downloads failed for '%s'"),
 					FailedIds.Num(), *FileId);
-				Emit(EUpdatePhase::Failed, EPatcherError::DownloadFailed, true, FailedIds.Num(), Requests.Num(),
+				Emit(EUpdatePhase::Failed, DownloadError, true, FailedIds.Num(), Requests.Num(),
 					*FString::Printf(TEXT("lazy chunk fetch failed: %d chunks"), FailedIds.Num()));
 				return false;
 			}
@@ -1443,6 +1484,12 @@ namespace UnrealGamePatcher
 
 		for (int32 TI = 0; TI < NumTargets && bOk; ++TI)
 		{
+			if (Options.ShouldCancel && Options.ShouldCancel())
+			{
+				LastError = EPatcherError::Interrupted;
+				bOk = false;
+				break;
+			}
 			FTransactionTarget& T = State.Transaction.Targets[TI];
 			// The sidecar IS the rollback record: a save that silently fails
 			// (disk full) would drop the just-recorded backup paths, converting
@@ -1731,6 +1778,11 @@ namespace UnrealGamePatcher
 			Emit(EUpdatePhase::Apply, EPatcherError::Ok, false, WritesApplied, NumTargets, TEXT("applying..."));
 		}
 
+		if (Options.ShouldCancel && Options.ShouldCancel())
+		{
+			LastError = EPatcherError::Interrupted;
+			bOk = false;
+		}
 		if (!bOk)
 		{
 			const bool bRolledBack = Rollback(State);
@@ -1799,7 +1851,7 @@ namespace UnrealGamePatcher
 		// (reuse never reads from them; it slices the installed containers).
 		// Deleting after a successful commit is safe: resume only matters for
 		// interrupted runs, which the download phase re-covers anyway.
-		if (bNetwork)
+		if (bNetwork && !Options.bKeepChunkCache && !Options.DownloadChunks)
 		{
 			PF.DeleteDirectoryRecursively(*ChunkRoot);
 		}

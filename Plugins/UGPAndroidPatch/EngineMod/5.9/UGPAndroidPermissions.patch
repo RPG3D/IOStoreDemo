@@ -1,0 +1,25 @@
+diff --git a/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template b/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template
+index 96042c42a..25d5b70d9 100644
+--- a/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template
++++ b/Engine/Build/Android/Java/src/com/epicgames/unreal/GameActivity.java.template
+@@ -188,3 +188,5 @@ import com.google.android.gms.games.Games;
+ 
+-import com.google.vr.sdk.samples.permission.PermissionHelper;
++// UGP Begin
++// Use Android's native permission checks in engine builds without Google VR.
++// UGP End
+ 
+@@ -4143,3 +4145,5 @@ Trace.endSection();
+ 
+-		if (!isStandalone && PermissionHelper.checkPermission("android.permission.CHANGE_WIFI_MULTICAST_STATE"))
++		// UGP Begin
++		if (!isStandalone && checkSelfPermission("android.permission.CHANGE_WIFI_MULTICAST_STATE") == PackageManager.PERMISSION_GRANTED)
++		// UGP End
+ 		{
+@@ -4232,3 +4236,5 @@ Trace.endSection();
+ 				// For non-shipping builds we may need this permission because we write to the sdcard for logs
+-				if (!PermissionHelper.checkPermission("android.permission.WRITE_EXTERNAL_STORAGE"))
++				// UGP Begin
++				if (checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") != PackageManager.PERMISSION_GRANTED)
++				// UGP End
+ 				{

@@ -8,6 +8,9 @@
 #include "HAL/PlatformApplicationMisc.h"
 #include "Mac/CocoaThread.h"
 #include "Apple/ApplePlatformMisc.h"
+#ifndef SCOPED_AUTORELEASE_POOL
+#include "Apple/ScopeAutoreleasePool.h"
+#endif
 #include "HAL/PlatformMisc.h"
 #endif
 #include "Modules/ModuleManager.h"

@@ -68,6 +68,72 @@ namespace UnrealGamePatcher::Tests
 
 		}
 
+		{
+			FHttpChunkDownloader StatusProbe;
+			TArray64<uint8> Bytes;
+			StatusProbe.DownloadRange(BaseUrl + TEXT("/__ctl/fail_next"), 0, -1, Bytes);
+			Check(!StatusProbe.DownloadRange(BaseUrl + TEXT("/index/1.0.0/UnrealGamePatcher.index.json"), 0, -1, Bytes) &&
+				!StatusProbe.SawMissingResource(), TEXT("temporary CDN errors do not retire the approved version"));
+			Check(!StatusProbe.DownloadRange(BaseUrl + TEXT("/index/removed/UnrealGamePatcher.index.json"), 0, -1, Bytes) &&
+				StatusProbe.SawMissingResource(), TEXT("missing version index is distinguishable from transport errors"));
+
+			FHttpChunkDownloader ChunkProbe;
+			const FSharedEventRef Completed(EEventMode::ManualReset);
+			const auto bSucceeded = MakeShared<std::atomic<bool>>(true);
+			const auto Handle = ChunkProbe.DownloadRangeAsync(BaseUrl + TEXT("/chunks/removed.chunk"), 0, -1,
+				[Completed, bSucceeded](bool bOk, const TArray64<uint8>&, const FString&)
+				{
+					bSucceeded->store(bOk);
+					Completed->Trigger();
+				});
+			const bool bCompleted = Completed->Wait(2500);
+			Check(bCompleted && !bSucceeded->load() && ChunkProbe.SawMissingResource(),
+				TEXT("missing chunk is reported to the owning update attempt"));
+			if (!bCompleted)
+			{
+				ChunkProbe.CancelDownload(Handle);
+			}
+		}
+
+		// Android's job stop path must cancel the real HTTP request.
+		{
+			const FString Name = TEXT("cancel-http.bin");
+			TArray<uint8> Data;
+			Data.SetNumZeroed(256 * 1024);
+			Check(FFileHelper::SaveArrayToFile(Data, *(Cdn / Name)), TEXT("HTTP cancellation fixture written"));
+			const FString Url = BaseUrl + TEXT("/") + Name;
+			const FString ThrottleUrl = BaseUrl + TEXT("/__ctl/throttle?kbps=");
+			TArray64<uint8> Control;
+			Http.DownloadRange(ThrottleUrl + TEXT("32"), 0, -1, Control);
+			const FSharedEventRef Completed(EEventMode::ManualReset);
+			const auto bSucceeded = MakeShared<std::atomic<bool>>(true);
+			const IChunkDownloader::FCancelHandle Handle = Http.DownloadRangeAsync(Url, 0, -1,
+				[Completed, bSucceeded](bool bOk, const TArray64<uint8>&, const FString&)
+				{
+					bSucceeded->store(bOk);
+					Completed->Trigger();
+				});
+			FPlatformProcess::Sleep(0.1f);
+			Http.CancelDownload(Handle);
+			Check(Completed->Wait(2500) && !bSucceeded->load(), TEXT("HTTP cancel handle aborts the throttled request"));
+
+			FDownloadRequest Request;
+			Request.Id = Name;
+			Request.Url = Url;
+			Request.Size = Data.Num();
+			Request.DestFile = Cache / Name;
+			FDownloadStats Stats;
+			TArray<FString> FailedIds;
+			const double CancelAt = FPlatformTime::Seconds() + 0.15;
+			Check(!Manager.DownloadAll({Request}, Stats, FailedIds, {},
+				[CancelAt]() { return FPlatformTime::Seconds() >= CancelAt; }),
+				TEXT("batch cancellation stops the transfer"));
+			Check(!PF.FileExists(*Request.DestFile), TEXT("canceled batch publishes no incomplete file"));
+			Http.DownloadRange(ThrottleUrl + TEXT("0"), 0, -1, Control);
+			Check(Manager.DownloadAll({Request}, Stats, FailedIds) && PF.FileSize(*Request.DestFile) == Data.Num(),
+				TEXT("a new batch succeeds after cancellation"));
+		}
+
 		auto MakeChunkRequests = [&](const FString& CacheDir, TArray<FDownloadRequest>& OutRequests)
 		{
 			OutRequests.Reset();

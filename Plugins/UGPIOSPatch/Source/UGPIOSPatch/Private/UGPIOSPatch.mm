@@ -1,6 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "UGPIOSDownload.h"
+#include "UGPIOSBackground.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformFile.h"
 #include "HAL/PlatformFileManager.h"
 #include "IOS/IOSAppDelegate.h"
@@ -131,7 +133,16 @@
 	self.statusLabel.text = self.retryInFlight
 		? [NSString stringWithFormat:@"Retry %lu: %@", (unsigned long)(self.failedRetryCount + 1), Status]
 		: Status;
-	self.progress.progress = Progress;
+	self.progress.hidden = Progress < 0;
+	if (self.progress.hidden)
+	{
+		[self.retryActivity startAnimating];
+	}
+	else
+	{
+		[self.retryActivity stopAnimating];
+		self.progress.progress = Progress;
+	}
 }
 
 - (void)retry
@@ -143,8 +154,7 @@
 	self.retryInFlight = YES;
 	self.retryButton.enabled = NO;
 	self.failureDialog.hidden = YES;
-	[self.retryActivity startAnimating];
-	[self updateStatus:@"Starting..." progress:0];
+	[self updateStatus:@"Starting..." progress:-1];
 	NSLog(@"UGP: retry %lu started", (unsigned long)(self.failedRetryCount + 1));
 	dispatch_semaphore_signal(self.retrySignal);
 }
@@ -165,7 +175,7 @@ namespace
 		return PhysicalPath;
 	}
 
-	void SetStatus(UGPIOSStartupView* View, NSString* Text, float Progress = 0)
+	void SetStatus(UGPIOSStartupView* View, NSString* Text, float Progress = -1)
 	{
 		dispatch_async(dispatch_get_main_queue(), ^{
 			[View updateStatus:Text progress:Progress];
@@ -236,7 +246,7 @@ namespace
 		return true;
 	}
 
-	bool RunUpdate(UGPIOSStartupView* View, const FString& Cdn, const FString& InstallDir)
+	bool RunUpdate(UGPIOSStartupView* View, const FString& Cdn, const FString& InstallDir, FString& ReplacementVersion)
 	{
 		SetStatus(View, @"Checking content version...");
 		Paths::FInstallLock StartupLock;
@@ -270,12 +280,123 @@ namespace
 			}
 			else
 			{
-				SetStatus(View, Event.Message.GetNSString(), Event.Total > 0 ? float(Event.Current) / Event.Total : 0);
+				SetStatus(View, Event.Message.GetNSString(), Event.Total > 0 ? float(Event.Current) / Event.Total : -1);
 			}
 		};
 
-		FString Latest;
-		if (!FUpdateOrchestrator::ResolveLatest(Cdn, Options, Latest))
+		FString Latest = MoveTemp(ReplacementVersion);
+		ReplacementVersion.Reset();
+		bool bResolvedVersion = !Latest.IsEmpty();
+		auto Apply = [&](const FString& Directory)
+		{
+			return ApplyUpdate(Cdn, Latest, Directory, Options, Failure);
+		};
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+		if (!UGPIOSPrepareBackgroundStorage())
+		{
+			if (bInstalled)
+			{
+				NSLog(@"UGP: [UGP-9002] background storage unavailable, using committed content %@", LocalVersion.GetNSString());
+				return true;
+			}
+			ShowRetryDialog(View, EPatcherError::InstallDirectoryFailed, @"Could not create the background download directory.");
+			return false;
+		}
+
+		const FString IndexPath = UGPIOSPendingIndexPath(Cdn);
+		const bool bCanRefreshTarget = !bResolvedVersion;
+		FIndexManifest PinnedIndex;
+		const int64 IndexSize = IFileManager::Get().FileSize(*IndexPath);
+		if (!bResolvedVersion && IndexSize > 0 && IndexSize <= Options.MaxManifestBytes &&
+			FIndexManifestFile::Load(IndexPath, PinnedIndex))
+		{
+			if (bInstalled && PinnedIndex.ContentVersion == LocalVersion)
+			{
+				UGPIOSClearBackgroundTransfer(Cdn + TEXT("\n") + LocalVersion, IndexPath);
+			}
+			else
+			{
+				Latest = PinnedIndex.ContentVersion;
+				Options.PinnedManifest = &PinnedIndex;
+				bResolvedVersion = true;
+				NSLog(@"UGP: resuming pinned content version %@", Latest.GetNSString());
+			}
+		}
+		if (!bResolvedVersion)
+		{
+			bResolvedVersion = FUpdateOrchestrator::ResolveLatest(Cdn, Options, Latest);
+		}
+		const FString TransferKey = Cdn + TEXT("\n") + Latest;
+		const auto TryReplaceRetiredTarget = [&](EPatcherError Error)
+		{
+			const bool bMissing = Error == EPatcherError::DownloadSourceUnavailable ||
+				(Error == EPatcherError::ManifestMissing && IsHttpMissingResource(Downloader.GetLastHttpStatus()));
+			if (!bCanRefreshTarget || !bResolvedVersion || !bMissing)
+			{
+				return false;
+			}
+			FString NewLatest;
+			FUpdateOptions CheckOptions;
+			CheckOptions.Downloader = &Downloader;
+			if (!FUpdateOrchestrator::ResolveLatest(Cdn, CheckOptions, NewLatest) || NewLatest == Latest)
+			{
+				return false;
+			}
+			UGPIOSClearBackgroundTransfer(TransferKey, IndexPath, /*bKeepCache=*/true);
+			NSLog(@"UGP: content %@ is unavailable, switching to %@", Latest.GetNSString(), NewLatest.GetNSString());
+			ReplacementVersion = MoveTemp(NewLatest);
+			return true;
+		};
+		int32 Window = 0;
+#if !UE_BUILD_SHIPPING
+		FParse::Value(FCommandLine::Get(), TEXT("-ugpbackgroundtasks="), Window);
+#endif
+		Options.ChunkCacheDir = UGPIOSBackgroundCacheDir();
+		Options.BeforeApply = UGPIOSWaitUntilActive;
+		Options.DownloadChunks = [&TransferKey, Window](const TArray<FDownloadRequest>& Requests, FDownloadStats& Stats,
+			TArray<FString>& Failed, const TFunction<void(int64, int64)>& Progress)
+		{
+			return UGPIOSDownloadBackgroundBatch(TransferKey, Window, Requests, Stats, Failed, Progress);
+		};
+		bool bPinWriteFailed = false;
+		Options.PrepareManifest = [&](FIndexManifest& Remote)
+		{
+			if (Remote.ContentVersion != Latest)
+			{
+				return false;
+			}
+			bPinWriteFailed = !Options.PinnedManifest && !FIndexManifestFile::Save(IndexPath, Remote);
+			return !bPinWriteFailed;
+		};
+		EPatcherError ResumeError = EPatcherError::Ok;
+		if (bResolvedVersion && !(bInstalled && Latest == LocalVersion))
+		{
+			ResumeError = UGPIOSResumeBackgroundBatch(TransferKey, [View](int64 Current, int64 Total)
+			{
+				constexpr double MiB = 1024.0 * 1024.0;
+				NSString* Status = [NSString stringWithFormat:@"Downloading %.1f / %.1f MiB", Current / MiB, Total / MiB];
+				SetStatus(View, Status, float(double(Current) / Total));
+			});
+		}
+		if (ResumeError != EPatcherError::Ok)
+		{
+			if (TryReplaceRetiredTarget(ResumeError))
+			{
+				return false;
+			}
+			if (bInstalled)
+			{
+				NSLog(@"UGP: [UGP-%04d] resumed transfer pending or failed, using committed content %@",
+					static_cast<int32>(ResumeError), LocalVersion.GetNSString());
+				return true;
+			}
+			ShowRetryDialog(View, ResumeError, @"Could not finish preparing game content. Please retry.");
+			return false;
+		}
+#else
+		bResolvedVersion = FUpdateOrchestrator::ResolveLatest(Cdn, Options, Latest);
+#endif
+		if (!bResolvedVersion)
 		{
 			if (bInstalled)
 			{
@@ -291,10 +412,19 @@ namespace
 		}
 		else if (!bInstalled)
 		{
-			if (ApplyUpdate(Cdn, Latest, InstallDir, Options, Failure))
+			if (Apply(InstallDir))
 			{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+				UGPIOSClearBackgroundTransfer(TransferKey, IndexPath);
+#endif
 				return true;
 			}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+			if (TryReplaceRetiredTarget(Failure.Error))
+			{
+				return false;
+			}
+#endif
 		}
 		else
 		{
@@ -309,10 +439,16 @@ namespace
 					Failure.Error = EPatcherError::StagingSnapshotFailed;
 					NSLog(@"UGP: could not clone installed content for update (errno %d)", errno);
 				}
-				else if (ApplyUpdate(Cdn, Latest, UpdateDir, Options, Failure))
+			else if (Apply(UpdateDir))
 				{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+				UGPIOSWaitUntilActive();
+#endif
 					if (renamex_np(TCHAR_TO_UTF8(*UpdateDir), TCHAR_TO_UTF8(*InstallDir), RENAME_SWAP) == 0)
 					{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+					UGPIOSClearBackgroundTransfer(TransferKey, IndexPath);
+#endif
 						NSLog(@"UGP: activated content %@ in %@", Latest.GetNSString(), InstallDir.GetNSString());
 						return true;
 					}
@@ -324,10 +460,23 @@ namespace
 			{
 				Failure.Error = EPatcherError::StagingCleanupFailed;
 			}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+			if (TryReplaceRetiredTarget(Failure.Error))
+			{
+				return false;
+			}
+#endif
 			NSLog(@"UGP: [UGP-%04d] update to %@ failed, using committed content %@",
 				static_cast<int32>(Failure.Error), Latest.GetNSString(), LocalVersion.GetNSString());
 			return true;
 		}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+		if (bPinWriteFailed)
+		{
+			ShowRetryDialog(View, EPatcherError::WriteNoSpace, @"Could not save the pending content index.");
+			return false;
+		}
+#endif
 		ShowRetryDialog(View, Failure.Error, Failure.Message.GetNSString());
 		return false;
 	}
@@ -368,6 +517,7 @@ void RunUGPIOSBeforeEnginePreInit()
 			[Window addSubview:View];
 		});
 		NSLog(@"UGP: before engine PreInit, install=%@", InstallDir.GetNSString());
+		FString ReplacementVersion;
 		for (;;)
 		{
 			@autoreleasepool
@@ -384,16 +534,33 @@ void RunUGPIOSBeforeEnginePreInit()
 				{
 					ShowRetryDialog(View, EPatcherError::LegacyMigrationFailed, @"Could not move previously downloaded game content.");
 				}
-				else if (RunUpdate(View, Cdn, InstallDir))
+				else
 				{
-					break;
+					if (RunUpdate(View, Cdn, InstallDir, ReplacementVersion))
+					{
+						break;
+					}
+					if (!ReplacementVersion.IsEmpty())
+					{
+						continue;
+					}
 				}
 			}
 			dispatch_semaphore_wait(View.retrySignal, DISPATCH_TIME_FOREVER);
 		}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+		UGPIOSWaitUntilActive();
+#endif
 		NSLog(@"UGP: content ready, continuing engine PreInit");
 		dispatch_sync(dispatch_get_main_queue(), ^{ [View removeFromSuperview]; });
 	}
 }
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 9
+bool UGPIOSHandleBackgroundSession(NSString* Identifier, void (^Completion)(void))
+{
+	return UGPIOSDispatchBackgroundSession(Identifier, Completion);
+}
+#endif
 
 IMPLEMENT_MODULE(FDefaultModuleImpl, UGPIOSPatch)

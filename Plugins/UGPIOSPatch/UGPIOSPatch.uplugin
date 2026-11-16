@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"FriendlyName": "UGP iOS Patch",
+	"Description": "Runs UGP before Unreal mounts game content on iOS.",
+	"VersionName": "1.0",
+	"Version": 1,
+	"CanContainContent": false,
+	"EnabledByDefault": true,
+	"SupportedTargetPlatforms": ["IOS"],
+	"Modules": [
+		{
+			"Name": "UGPIOSPatch",
+			"Type": "Runtime",
+			"LoadingPhase": "None",
+			"PlatformAllowList": ["IOS"]
+		}
+	]
+}

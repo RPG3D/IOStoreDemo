@@ -14,6 +14,7 @@ namespace
 		TArray64<uint8> Bytes;
 		int64 Offset = 0;
 		int64 Size = -1;
+		int32 HttpStatus = 0;
 		FString Error;
 		TFunction<void(bool, const TArray64<uint8>&, const FString&)> OnDone;
 
@@ -35,6 +36,7 @@ namespace
 {
 	NSHTTPURLResponse* Http = [Response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse*)Response : nil;
 	const NSInteger Code = Http.statusCode;
+	Request->HttpStatus = static_cast<int32>(Code);
 	const bool bRange = Request->Size >= 0 || Request->Offset > 0;
 	bool bValid = bRange ? Code == 206 : Code == 200;
 	if (bValid && bRange)
@@ -126,7 +128,7 @@ bool FUGPIOSDownload::DownloadRange(const FString& Url, int64 Offset, int64 Size
 {
 	dispatch_semaphore_t Done = dispatch_semaphore_create(0);
 	bool bSuccess = false;
-	DownloadRangeAsync(Url, Offset, Size, [Done, &bSuccess, &OutData](bool bOk, const TArray64<uint8>& Bytes, const FString&)
+	const FCancelHandle Handle = DownloadRangeAsync(Url, Offset, Size, [Done, &bSuccess, &OutData](bool bOk, const TArray64<uint8>& Bytes, const FString&)
 	{
 		bSuccess = bOk;
 		if (bOk)
@@ -136,6 +138,7 @@ bool FUGPIOSDownload::DownloadRange(const FString& Url, int64 Offset, int64 Size
 		dispatch_semaphore_signal(Done);
 	});
 	dispatch_semaphore_wait(Done, DISPATCH_TIME_FOREVER);
+	LastHttpStatus = Handle ? StaticCastSharedPtr<FRequest>(Handle)->HttpStatus : 0;
 	return bSuccess;
 }
 

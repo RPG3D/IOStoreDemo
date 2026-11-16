@@ -4,6 +4,7 @@
 #include "UnrealGamePatcherDownload.h"
 #include "HAL/Event.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/ScopeLock.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
@@ -118,6 +119,7 @@ namespace UnrealGamePatcher
 					UE_LOG(LogUnrealGamePatcherDownload, Verbose, TEXT("FHttpRangeRequest: '%s' settled (ok=%d, status=%d, tooLarge=%d, %lld bytes)"),
 						*Url, Res->bOk ? 1 : 0, Res->Status, Res->bTooLarge ? 1 : 0, static_cast<int64>(Res->Content.Num()));
 					Res->DeliverOnce();
+					Res->StrongRequest.Reset();
 				});
 			// The HTTP manager runs its own I/O thread; dispatch the completion
 			// there so no game-thread ticking is needed (safe from any thread).
@@ -175,13 +177,18 @@ namespace UnrealGamePatcher
 	{
 		bool bExpected = false;
 		const bool bCas = bSettled.compare_exchange_strong(bExpected, true);
-		if (bCas && Deliver)
+		if (bCas)
 		{
-			Deliver();
+			FOnRequestDone Completion = MoveTemp(Deliver);
+			if (Completion)
+			{
+				Completion(*this);
+			}
 		}
 	}
 
-	bool FHttpRangeRequest::RequestAsync(const FString& Url, int64 Offset, int64 Size, FOnRequestDone OnDone)
+	bool FHttpRangeRequest::RequestAsync(const FString& Url, int64 Offset, int64 Size,
+		FOnRequestDone OnDone, TSharedPtr<FHttpAsyncRequest>* OutHandle)
 	{
 		if (Size == 0)
 		{
@@ -189,10 +196,11 @@ namespace UnrealGamePatcher
 			return false; // no callback: a Size==0 request is a caller bug
 		}
 		const TSharedRef<FHttpAsyncRequest> Res = MakeShared<FHttpAsyncRequest>();
-		Res->Deliver = [Res, OnDone]() mutable
+		if (OutHandle)
 		{
-			OnDone(*Res);
-		};
+			*OutHandle = Res;
+		}
+		Res->Deliver = MoveTemp(OnDone);
 		TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> Request;
 		const bool bIssued = IssueRequest(Url, Offset, Size, Res, Request);
 		// Whether the completion lands inline (failed ProcessRequest) or on the
@@ -200,11 +208,20 @@ namespace UnrealGamePatcher
 		return bIssued;
 	}
 
-	bool FHttpRangeRequest::DownloadRange(const FString& Url, int64 Offset, int64 Size, TArray64<uint8>& OutData)
+	bool FHttpRangeRequest::DownloadRange(const FString& Url, int64 Offset, int64 Size,
+		TArray64<uint8>& OutData, const TFunction<bool()>& ShouldCancel, int32* OutHttpStatus)
 	{
+		if (OutHttpStatus)
+		{
+			*OutHttpStatus = 0;
+		}
+		if (ShouldCancel && ShouldCancel())
+		{
+			return false;
+		}
 		const TSharedRef<FHttpAsyncRequest> Res = MakeShared<FHttpAsyncRequest>();
-		FEvent* WaitEvent = FPlatformProcess::GetSynchEventFromPool(true);
-		Res->Deliver = [WaitEvent]()
+		const FSharedEventRef WaitEvent(EEventMode::ManualReset);
+		Res->Deliver = [WaitEvent](const FHttpAsyncRequest&)
 		{
 			WaitEvent->Trigger();
 		};
@@ -214,23 +231,26 @@ namespace UnrealGamePatcher
 
 		// Wait for completion (with a generous timeout so a hung server cannot
 		// stall the caller forever).
-		const bool bCompleted = WaitEvent->Wait(60 * 1000);
-		if (!bCompleted)
+		const double Deadline = FPlatformTime::Seconds() + 60.0;
+		while (!WaitEvent->Wait(ShouldCancel ? 100 : 60 * 1000))
 		{
-			// Abandon the transfer: cancel it, and DO NOT return the event to
-			// the pool. The completion lambda still holds the event pointer and
-			// its DeliverOnce will fire when the (cancelled) request settles -
-			// handing that event to the next waiter would corrupt the pool. One
-			// leaked event per timeout is the safe trade.
-			if (TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> Req = Res->WeakRequest.Pin())
+			if (ShouldCancel && ShouldCancel())
 			{
-				Req->CancelRequest();
+				Res->Cancel();
+				return false;
 			}
-			UE_LOG(LogUnrealGamePatcherDownload, Error, TEXT("FHttpRangeRequest: timeout downloading '%s' (request cancelled, event abandoned)"), *Url);
-			return false;
+			if (FPlatformTime::Seconds() >= Deadline)
+			{
+				Res->Cancel();
+				UE_LOG(LogUnrealGamePatcherDownload, Error, TEXT("FHttpRangeRequest: timeout downloading '%s'"), *Url);
+				return false;
+			}
 		}
-		FPlatformProcess::ReturnSynchEventToPool(WaitEvent);
 
+		if (OutHttpStatus)
+		{
+			*OutHttpStatus = Res->Status;
+		}
 		const FString Error = ValidateResponse(*Res, Offset, Size, Offset > 0);
 		if (!Error.IsEmpty())
 		{

@@ -8,6 +8,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
+import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -21,9 +22,8 @@ public final class UGPStartupView
 	private TextView Status;
 	private ProgressBar Spinner;
 	private ProgressBar Bar;
+	private Button Download;
 	private AlertDialog Failure;
-	private int FailedRetries;
-	private boolean Retrying;
 
 	public UGPStartupView(Activity activity, Runnable retry)
 	{
@@ -58,9 +58,14 @@ public final class UGPStartupView
 		Status = new TextView(Activity);
 		Status.setTextColor(0xffffffff);
 		Status.setText("Checking content version...");
+		Download = new Button(Activity);
+		Download.setText("Download update");
+		Download.setVisibility(View.GONE);
+		Download.setOnClickListener(view -> Retry.run());
 		bottom.addView(Spinner, new LinearLayout.LayoutParams(-2, -2));
 		bottom.addView(Bar, new LinearLayout.LayoutParams(-1, -2));
 		bottom.addView(Status, new LinearLayout.LayoutParams(-2, -2));
+		bottom.addView(Download, new LinearLayout.LayoutParams(-2, -2));
 		Overlay.addView(bottom, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
 		Activity.addContentView(Overlay, new ViewGroup.LayoutParams(-1, -1));
 	}
@@ -68,8 +73,10 @@ public final class UGPStartupView
 	public void status(String text, int current, int total)
 	{
 		Activity.runOnUiThread(() -> {
+			dismissFailure();
 			boolean downloading = total > 0;
-			Status.setText(Retrying ? "Retry " + (FailedRetries + 1) + ": " + text : text);
+			Status.setText(text);
+			Download.setVisibility(View.GONE);
 			Spinner.setVisibility(downloading ? View.GONE : View.VISIBLE);
 			Bar.setVisibility(downloading ? View.VISIBLE : View.GONE);
 			if (downloading)
@@ -79,25 +86,28 @@ public final class UGPStartupView
 		});
 	}
 
-	public void failure(int code, String detail)
+	public void offer(String text)
+	{
+		dismissFailure();
+		Status.setText(text);
+		Spinner.setVisibility(View.GONE);
+		Bar.setVisibility(View.GONE);
+		Download.setVisibility(View.VISIBLE);
+	}
+
+	public void failure(int code, String detail, int failedRetries)
 	{
 		Activity.runOnUiThread(() -> {
 			if (Failure != null) return;
-			if (Retrying)
-			{
-				++FailedRetries;
-			}
-			Retrying = false;
 			Spinner.setVisibility(View.GONE);
 			Bar.setVisibility(View.GONE);
+			Download.setVisibility(View.GONE);
 			Failure = new AlertDialog.Builder(Activity)
 				.setTitle("Content Update Failed")
-				.setMessage(String.format(Locale.ROOT, "UGP-%04d\n%s\n\nFailed retries: %d", code, detail, FailedRetries))
+				.setMessage(String.format(Locale.ROOT, "UGP-%04d\n%s\n\nFailed retries: %d", code, detail, failedRetries))
 				.setCancelable(false)
 				.setPositiveButton("Retry", (dialog, button) -> {
 					Failure = null;
-					Retrying = true;
-					status("Checking content version...", 0, 0);
 					Retry.run();
 				})
 				.show();
@@ -107,12 +117,18 @@ public final class UGPStartupView
 	public void dismiss()
 	{
 		Activity.runOnUiThread(() -> {
-			if (Failure != null)
-			{
-				Failure.dismiss();
-			}
+			dismissFailure();
 			if (Overlay.getParent() instanceof ViewGroup) { ((ViewGroup) Overlay.getParent()).removeView(Overlay); }
 		});
+	}
+
+	private void dismissFailure()
+	{
+		if (Failure != null)
+		{
+			Failure.dismiss();
+			Failure = null;
+		}
 	}
 
 }

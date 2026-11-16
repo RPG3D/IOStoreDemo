@@ -37,6 +37,7 @@ namespace UnrealGamePatcher
 		LocalTruthFailed = 3002,
 
 		DownloadFailed = 4001,
+		DownloadSourceUnavailable = 4002, // HTTP 404/410 from the CDN
 
 		ApplyFailed = 5001,
 		WriteNoPermission = 5002,
